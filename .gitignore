@@ -1,25 +1,8 @@
 # Build artifacts
 target/
-**/target/
 
-# macOS
-.DS_Store
-
-# Tool caches / indexes
-.repowise/
+# Non-source caches / indexes (kept out of git per project decision)
 .codegraph/
-graphify-out/
-.pkl
-skills-lock.json
-
-# Personal agent configs (not project source)
 .claude/
 .pi/
-.vscode/
-
-# Session/scratch files
-session.md
-
-# Editor / OS noise
-.idea/
-*.swp
+graphify-out/
