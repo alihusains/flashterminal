@@ -140,6 +140,14 @@ pub enum AgentEvent {
     UsageUpdated {
         tokens: u64,
     },
+    /// A normalized activity observation (Phase 2C §4–§5). Coalesced at
+    /// the pump so high-frequency output never floods the UI (§23).
+    Activity {
+        kind: crate::work::ActivityKind,
+        source: crate::work::ActivitySource,
+        confidence: u8,
+        detail: String,
+    },
 }
 
 /// Fine-grained lifecycle states for agent sessions.

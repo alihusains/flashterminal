@@ -61,6 +61,8 @@ impl AgentAdapterImpl for OpenCodeAdapter {
             structured_events: false,
             usage: false,
             cost: false,
+            files_tracked: true,
+            commands_tracked: true,
         }
     }
 

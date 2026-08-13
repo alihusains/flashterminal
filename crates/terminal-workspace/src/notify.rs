@@ -16,7 +16,36 @@ pub enum NotificationKind {
     SessionError { pane_id: PaneId, message: String },
     /// The application failed to persist/restore a workspace.
     PersistenceError { message: String },
-    // Future: AgentComplete, AgentNeedsApproval, RemoteConnectionLost, ...
+    // Phase 2C §21: meaningful agent notifications only (never per-output
+    // or per-state-transition noise).
+    AgentCompleted { agent: String, pane_id: PaneId },
+    AgentFailed { agent: String, code: Option<i32>, pane_id: PaneId },
+    AgentNeedsApproval { agent: String, pane_id: PaneId },
+    AgentNeedsInput { agent: String, pane_id: PaneId },
+    AgentProviderFailure { agent: String, message: String, pane_id: PaneId },
+    /// The application requires the user's attention somewhere.
+    AttentionSummary { needs_you: u32, failed: u32, pane_id: PaneId },
+}
+
+/// Quiet-mode preferences (2c.md §22): workspace-level notification policy.
+/// Default: notify on "needs me" + failures; not on every start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationPrefs {
+    pub on_needs_me: bool,
+    pub on_failure: bool,
+    pub on_completion: bool,
+    pub on_start: bool,
+}
+
+impl Default for NotificationPrefs {
+    fn default() -> Self {
+        Self {
+            on_needs_me: true,
+            on_failure: true,
+            on_completion: false,
+            on_start: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

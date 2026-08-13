@@ -32,13 +32,52 @@ use crate::layout::{LayoutEngine, PaneRect, Rect};
 use crate::model::{
     Pane, PaneId, PersistedState, SplitDirection, Tab, TabId, Workspace, WorkspaceId,
 };
-use crate::notify::{Notification, NotificationCenter, NotificationKind};
+use crate::notify::{Notification, NotificationCenter, NotificationKind, NotificationPrefs};
 use crate::pane_tree::PaneNode;
-use terminal_session::execution::{AgentEvent, ApplicationEvent};
+use serde::{Deserialize, Serialize};
+use terminal_session::agent::AgentSnapshot;
+use terminal_session::execution::{AgentEvent, ApplicationEvent, AgentState};
+use terminal_session::work::AgentFilter;
 
 /// Default cell geometry for sessions spawned before any layout is known.
 pub const DEFAULT_COLS: u16 = 80;
 pub const DEFAULT_ROWS: u16 = 24;
+
+/// Phase 2C: parses a snapshot state string back to an `AgentState`
+/// (snapshots are serde'd as `format!("{:?}", state)`).
+fn agent_state_from_str(s: &str) -> AgentState {
+    match s {
+        "Created" => AgentState::Created,
+        "Starting" => AgentState::Starting,
+        "Working" => AgentState::Working,
+        "Waiting" => AgentState::Waiting,
+        "NeedsApproval" => AgentState::NeedsApproval,
+        "Blocked" => AgentState::Blocked,
+        "Completed" => AgentState::Completed,
+        "Failed" => AgentState::Failed,
+        "Crashed" => AgentState::Crashed,
+        "Stopped" => AgentState::Stopped,
+        "Disconnected" => AgentState::Disconnected,
+        // Unparseable (defensive): treat as disconnected so counts stay sane.
+        _ => AgentState::Disconnected,
+    }
+}
+
+/// Phase 2C §13: dashboard sort rank — attention first, then running,
+/// failed, completed (deterministic tie-break by start time).
+fn sort_rank(s: &AgentSnapshot) -> (u8, Option<i64>) {
+    let state = agent_state_from_str(&s.state);
+    let rank = if terminal_session::work::attention_for(state).is_some() {
+        0
+    } else if state == AgentState::Completed || state == AgentState::Stopped {
+        2
+    } else if state == AgentState::Failed || state == AgentState::Crashed || state == AgentState::Blocked {
+        1
+    } else {
+        0
+    };
+    (rank, s.started_at_ms)
+}
 
 /// Per-frame fairness budgets (§27): background panes are drained with a cap
 /// so a flood in one pane cannot starve the focused pane or others.
@@ -110,6 +149,53 @@ pub struct PaneFrame<'a> {
     pub origin: (f32, f32),
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2C: dashboard / summary / review (§12–§14, §9)
+// ---------------------------------------------------------------------------
+
+/// One dashboard row (§13): the pane owning the agent (when still alive)
+/// plus the snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRow {
+    pub pane_id: Option<PaneId>,
+    pub snapshot: AgentSnapshot,
+}
+
+/// Global agent dashboard (§13) with attention counts (§12).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentDashboard {
+    pub total: usize,
+    pub running: usize,
+    pub needs_you: usize,
+    pub failed: usize,
+    pub completed: usize,
+    pub rows: Vec<AgentRow>,
+}
+
+/// Lightweight per-workspace agent summary (§14).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceAgentSummary {
+    pub agents: usize,
+    pub running: usize,
+    pub needs_you: usize,
+    pub completed: usize,
+    pub failed: usize,
+}
+
+/// One changed file with an optional best-effort git diff (§9).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentFileChange {
+    pub path: String,
+    pub diff: Option<String>,
+}
+
+/// The review surface (§9–§10): files (+diff) and commands.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentReview {
+    pub files: Vec<AgentFileChange>,
+    pub commands: Vec<String>,
+}
+
 pub struct Multiplexer {
     workspaces: Vec<Workspace>,
     active_workspace: usize,
@@ -126,6 +212,9 @@ pub struct Multiplexer {
     pub events: EventBus,
     pub metrics: EngineMetrics,
     pub session_exit_codes: HashMap<ExecutionId, Option<i32>>,
+    /// Phase 2C §21: attention states already notified per agent (one
+    /// notification per state change — never per output/transition).
+    notified_attention: HashMap<ExecutionId, Vec<AgentState>>,
     /// Fired (from reader threads) whenever a session enqueues a batch — the
     /// desktop uses it to wake the UI loop on PTY output.
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -164,6 +253,7 @@ impl Multiplexer {
             events: EventBus::new(),
             metrics: EngineMetrics::default(),
             session_exit_codes: HashMap::new(),
+            notified_attention: HashMap::new(),
             wake: wake_arc,
             first_render: true,
         })
@@ -866,6 +956,9 @@ impl Multiplexer {
                     }
                 }
             }
+            // Phase 2C §21: meaningful attention/completion notifications,
+            // honoring quiet-mode prefs (§22).
+            self.emit_agent_notifications(&eid, &event);
             self.events.publish(ApplicationEvent::AgentEvent {
                 execution_id: eid,
                 event,
@@ -966,6 +1059,215 @@ impl Multiplexer {
         &mut self.agent_runtime
     }
 
+    // ------------------------------------------------------------------
+    // Phase 2C: dashboard / attention / review / prefs (§9–§14, §21–§22)
+    // ------------------------------------------------------------------
+
+    /// Global agent dashboard (§13): counts + sorted rows. Sort order is
+    /// deterministic: needs-you first, then running, failed, completed.
+    pub fn agent_dashboard(&self, filter: AgentFilter) -> AgentDashboard {
+        let mut rows: Vec<AgentRow> = self
+            .agent_runtime
+            .list_sessions()
+            .into_iter()
+            .filter(|s| {
+                let state = agent_state_from_str(&s.state);
+                filter.matches_state(state)
+            })
+            .map(|snapshot| {
+                let pane_id = self.pane_id_for_execution(&ExecutionId(snapshot.execution_id.clone()));
+                AgentRow { pane_id, snapshot }
+            })
+            .collect();
+        rows.sort_by(|a, b| sort_rank(&b.snapshot).cmp(&sort_rank(&a.snapshot)));
+        let mut d = AgentDashboard {
+            rows,
+            ..Default::default()
+        };
+        d.total = d.rows.len();
+        for r in &d.rows {
+            let state = agent_state_from_str(&r.snapshot.state);
+            if terminal_session::work::attention_for(state).is_some() {
+                d.needs_you += 1;
+            } else if state == AgentState::Completed || state == AgentState::Stopped {
+                d.completed += 1;
+            } else if state == AgentState::Failed
+                || state == AgentState::Crashed
+                || state == AgentState::Blocked
+            {
+                d.failed += 1;
+            } else {
+                d.running += 1;
+            }
+        }
+        d
+    }
+
+    /// Per-workspace summary (§14) for the active workspace.
+    pub fn workspace_agent_summary(&self) -> WorkspaceAgentSummary {
+        let mut s = WorkspaceAgentSummary::default();
+        let Some(tab) = self.active_workspace().active_tab() else {
+            return s;
+        };
+        let mut panes = Vec::new();
+        tab.root.panes(&mut panes);
+        for p in panes {
+            if p.execution_kind != ExecutionKind::Agent {
+                continue;
+            }
+            s.agents += 1;
+            let Some(snap) = self.agent_runtime.get_session(&p.execution_id) else {
+                continue;
+            };
+            let state = agent_state_from_str(&snap.state);
+            if terminal_session::work::attention_for(state).is_some() {
+                s.needs_you += 1;
+            } else if state == AgentState::Completed || state == AgentState::Stopped {
+                s.completed += 1;
+            } else if state == AgentState::Failed || state == AgentState::Crashed || state == AgentState::Blocked {
+                s.failed += 1;
+            } else {
+                s.running += 1;
+            }
+        }
+        s
+    }
+
+    /// Review surface (§9–§10): changed files with best-effort git diffs
+    /// (bounded) + the command history.
+    pub fn agent_review(&self, eid: &ExecutionId) -> Option<AgentReview> {
+        let work = self.agent_runtime.get_work(eid)?;
+        let mut review = AgentReview {
+            commands: work.commands.clone(),
+            ..Default::default()
+        };
+        for f in work.files_changed.iter().take(64) {
+            let diff = self.git_diff(&work.session_id, f);
+            review.files.push(AgentFileChange {
+                path: f.clone(),
+                diff,
+            });
+        }
+        Some(review)
+    }
+
+    fn git_diff(&self, cwd: &str, file: &str) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(["-C", cwd, "diff", "--", file])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut lines: Vec<&str> = text.lines().collect();
+        if lines.len() > 200 {
+            lines.truncate(200);
+        }
+        Some(lines.join("\n"))
+    }
+
+    /// Quiet-mode prefs for the active workspace (§22), stored in its
+    /// metadata (never secret-bearing).
+    pub fn notification_prefs(&self) -> NotificationPrefs {
+        self.active_workspace()
+            .metadata
+            .get("notifications")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn set_notification_prefs(&mut self, prefs: &NotificationPrefs) {
+        let ws = self.active_workspace_mut();
+        if !ws.metadata.is_object() {
+            ws.metadata = serde_json::json!({});
+        }
+        let obj = ws.metadata.as_object_mut().expect("metadata is an object");
+        obj.insert(
+            "notifications".into(),
+            serde_json::to_value(prefs).unwrap_or_default(),
+        );
+    }
+
+    /// Phase 2C §21: emits meaningful agent notifications, honoring the
+    /// active workspace's quiet-mode prefs. Called from the drain path.
+    fn emit_agent_notifications(&mut self, eid: &ExecutionId, event: &AgentEvent) {
+        let Some(pane_id) = self.pane_id_for_execution(eid) else {
+            return;
+        };
+        let prefs = self.notification_prefs();
+        let name = self
+            .agent_runtime
+            .get_session(eid)
+            .map(|s| s.display_name)
+            .unwrap_or_else(|| "agent".into());
+        match event {
+            AgentEvent::StateChanged { new_state, .. } => {
+                let reason = terminal_session::work::attention_for(*new_state);
+                if reason.is_none() {
+                    return;
+                }
+                let notified = self
+                    .notified_attention
+                    .entry(eid.clone())
+                    .or_default();
+                if notified.contains(new_state) {
+                    return;
+                }
+                notified.push(*new_state);
+                match reason.unwrap() {
+                    terminal_session::work::AttentionReason::PermissionRequested => {
+                        if prefs.on_needs_me {
+                            self.notifications.emit(Notification::new(
+                                NotificationKind::AgentNeedsApproval {
+                                    agent: name,
+                                    pane_id,
+                                },
+                            ));
+                        }
+                    }
+                    terminal_session::work::AttentionReason::NeedsInput => {
+                        if prefs.on_needs_me {
+                            self.notifications.emit(Notification::new(
+                                NotificationKind::AgentNeedsInput { agent: name, pane_id },
+                            ));
+                        }
+                    }
+                    terminal_session::work::AttentionReason::Ambiguous => {
+                        if prefs.on_needs_me {
+                            self.notifications.emit(Notification::new(
+                                NotificationKind::AttentionSummary {
+                                    needs_you: 1,
+                                    failed: 0,
+                                    pane_id,
+                                },
+                            ));
+                        }
+                    }
+                    terminal_session::work::AttentionReason::ErrorIntervention => {
+                        if prefs.on_failure {
+                            self.notifications.emit(Notification::new(
+                                NotificationKind::AgentFailed {
+                                    agent: name,
+                                    code: None,
+                                    pane_id,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            AgentEvent::Completed => {
+                if prefs.on_completion {
+                    self.notifications.emit(Notification::new(
+                        NotificationKind::AgentCompleted { agent: name, pane_id },
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Serializes the whole domain state (§19, §30).
     pub fn snapshot_state(&self) -> PersistedState {
         let active = self
@@ -979,9 +1281,81 @@ impl Multiplexer {
         }
     }
 
-    /// Persists to disk (atomic write).
+    /// Persists to disk (atomic write). Phase 2C §42: agent pane metadata
+    /// is enriched with the bounded work record (title, last state,
+    /// last activity, recent timeline, provider/model) — never secrets,
+    /// never unbounded logs.
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
-        crate::persist::save(&self.snapshot_state(), path)
+        let mut state = self.snapshot_state();
+        for ws in &mut state.workspaces {
+            for tab in &mut ws.tabs {
+                let mut panes = Vec::new();
+                tab.root.panes(&mut panes);
+                let ids: Vec<PaneId> = panes.iter().map(|p| p.id.clone()).collect();
+                for pid in ids {
+                    let Some(pane) = tab.root.find_pane_mut(&pid) else {
+                        continue;
+                    };
+                    if pane.execution_kind != ExecutionKind::Agent {
+                        continue;
+                    }
+                    let Some(work) = self.agent_runtime.get_work(&pane.execution_id) else {
+                        continue;
+                    };
+                    let agent_obj = if pane.metadata.is_object() {
+                        pane.metadata.as_object_mut().expect("metadata is an object")
+                    } else {
+                        pane.metadata = serde_json::json!({});
+                        pane.metadata.as_object_mut().expect("metadata is an object")
+                    };
+                    let mut timeline = Vec::new();
+                    for e in work.timeline.recent(20) {
+                        timeline.push(serde_json::json!({
+                            "kind": format!("{:?}", e.kind),
+                            "detail": e.detail,
+                            "at": e.at.to_rfc3339(),
+                        }));
+                    }
+                    let last_activity = work
+                        .current_activity()
+                        .map(|a| {
+                            serde_json::json!({
+                                "kind": format!("{:?}", a.kind),
+                                "source": format!("{:?}", a.source),
+                                "confidence": a.confidence,
+                                "detail": a.detail,
+                                "count": a.count,
+                            })
+                        })
+                        .unwrap_or(serde_json::Value::Null);
+                    let last_state = self
+                        .agent_runtime
+                        .get_session(&pane.execution_id)
+                        .map(|s| s.state)
+                        .unwrap_or_else(|| "unknown".into());
+                    agent_obj.insert(
+                        "work".into(),
+                        serde_json::json!({
+                            "work_id": work.id,
+                            "title": work.title,
+                            "status": format!("{:?}", work.status),
+                            "last_state": last_state,
+                            "last_activity": last_activity,
+                            "recent_timeline": timeline,
+                            "started_at": work
+                                .started_at
+                                .map(|t| t.to_rfc3339())
+                                .unwrap_or_default(),
+                            "completed_at": work
+                                .completed_at
+                                .map(|t| t.to_rfc3339())
+                                .unwrap_or_default(),
+                        }),
+                    );
+                }
+            }
+        }
+        crate::persist::save(&state, path)
     }
 
     /// Restores a persisted state: recreates the workspace/tab/pane

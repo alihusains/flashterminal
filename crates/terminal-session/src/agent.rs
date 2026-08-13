@@ -24,7 +24,11 @@ use crate::credential::{CredentialRef, CredentialStore};
 use crate::execution::{
     AgentActivity, AgentEvent, AgentState, ExecutionId, ExecutionMetadata, StateProvenance,
 };
-use crate::launch::AgentLaunchConfig;
+use crate::work::{
+    self, ActivityKind, ActivitySource, AgentActivityState, AgentHealthRow, AgentWork,
+    AttentionReason, ErrorKind, HealthStatus, TimelineKind, WorkError, WorkStatus,
+    attention_for, collect_git_files, now_ms, observe_command, observe_file,
+};use crate::launch::AgentLaunchConfig;
 use crate::provider::ProviderRegistry;
 use crate::redact::Redactor;
 use anyhow::{Context, Result};
@@ -63,6 +67,11 @@ pub struct AgentCapabilities {
     pub structured_events: bool,
     pub usage: bool,
     pub cost: bool,
+    // --- Phase 2C observability (§8, §10) ---
+    /// Files-changed tracking is reliably observable for this agent.
+    pub files_tracked: bool,
+    /// Command execution is reliably observable for this agent.
+    pub commands_tracked: bool,
 }
 
 /// A provider-neutral definition of an agent. Contains no API keys and no
@@ -223,6 +232,48 @@ pub struct AgentSnapshot {
     pub state_confidence: String,
     pub events_emitted: u64,
     pub state_changes: u64,
+    // --- Phase 2C work/activity/attention/cost (§3–§20) ---
+    /// The `AgentWork` id for this session.
+    #[serde(default)]
+    pub work_id: String,
+    #[serde(default)]
+    pub work_status: String,
+    /// Attention reason when the agent needs the user (§12).
+    #[serde(default)]
+    pub attention: Option<AttentionReason>,
+    #[serde(default)]
+    pub activity_kind: String,
+    #[serde(default)]
+    pub activity_source: String,
+    #[serde(default)]
+    pub activity_confidence: u8,
+    #[serde(default)]
+    pub activity_detail: String,
+    #[serde(default)]
+    pub files_changed: u32,
+    #[serde(default)]
+    pub commands_run: u32,
+    #[serde(default)]
+    pub tests_passed: Option<u32>,
+    #[serde(default)]
+    pub usage_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub usage_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub usage_cached_tokens: Option<u64>,
+    /// Estimated cost in cents; `None` when pricing is unknown (§18–§19).
+    #[serde(default)]
+    pub estimated_cost_cents: Option<u64>,
+    #[serde(default)]
+    pub timeline_len: usize,
+    /// Latest activity wall-clock ms (UI "last activity").
+    #[serde(default)]
+    pub last_activity_at_ms: Option<u64>,
+    /// Error classification when failed (§11).
+    #[serde(default)]
+    pub error_kind: Option<String>,
+    #[serde(default)]
+    pub error_message: Option<String>,
 }
 
 /// The Agent Registry: definitions + adapter resolution.
@@ -316,6 +367,11 @@ pub struct AgentRuntime {
     /// drain path never takes a lock the pump may hold while blocked on
     /// the (bounded) event channel (2B.1 §2–3 deadlock fix).
     metrics_by_eid: HashMap<ExecutionId, Arc<AgentMetrics>>,
+    /// Phase 2C: per-session work records (§3) — what the agent is trying
+    /// to accomplish, separate from the process (`AgentSession`).
+    work_by_eid: HashMap<ExecutionId, Arc<Mutex<AgentWork>>>,
+    /// Phase 2C: provider/model pricing table (§19).
+    pricing: crate::work::PricingRegistry,
 }
 
 impl AgentRuntime {
@@ -339,6 +395,8 @@ impl AgentRuntime {
             event_tx,
             event_rx,
             metrics_by_eid: HashMap::new(),
+            work_by_eid: HashMap::new(),
+            pricing: crate::work::PricingRegistry::new(),
         }
     }
 
@@ -510,6 +568,19 @@ impl AgentRuntime {
             stop: Arc::clone(&stop),
         };
 
+        // Phase 2C §3: one AgentWork per session (process ≠ work). Created
+        // before the pump so the pump can record observations into it.
+        let work = Arc::new(Mutex::new(AgentWork::new(eid.0.clone(), def.display_name.clone())));
+        {
+            let mut w = work.lock().unwrap();
+            w.description = def.name.clone();
+            w.files_observable = adapter.capabilities().files_tracked;
+            w.commands_observable = adapter.capabilities().commands_tracked;
+            w.timeline
+                .push(TimelineKind::Started, format!("{} session started", def.display_name));
+        }
+        let pump_work = Arc::clone(&work);
+
         spawn_pump(PumpContext {
             pty: Arc::clone(&self.pty),
             session: Arc::clone(&session),
@@ -517,10 +588,12 @@ impl AgentRuntime {
             event_tx: self.event_tx.clone(),
             eid: eid.clone(),
             agent_session: Arc::clone(&agent_session),
+            work: pump_work,
             adapter: Arc::clone(&adapter),
             stop,
         });
 
+        self.work_by_eid.insert(eid.clone(), work);
         self.sessions.insert(eid.clone(), agent_session);
         self.metrics_by_eid.insert(eid.clone(), session_metrics);
         self.adapters.insert(eid.clone(), adapter);
@@ -625,6 +698,7 @@ impl AgentRuntime {
         self.adapters.remove(eid);
         self.sessions.remove(eid);
         self.metrics_by_eid.remove(eid);
+        self.work_by_eid.remove(eid);
     }
 
     /// Fully removes an agent (pane closed). Kills the process group and
@@ -732,19 +806,35 @@ impl AgentRuntime {
     }
 
     pub fn get_session(&self, eid: &ExecutionId) -> Option<AgentSnapshot> {
-        let s = self.sessions.get(eid)?.lock().unwrap();
-        let adapter = self.adapters.get(eid);
-        let display_name = self
-            .registry
-            .get(&s.definition_id)
-            .map(|d| d.display_name.clone())
-            .unwrap_or_else(|| s.definition_id.clone());
-        Some(snapshot(
-            &s,
-            eid,
-            adapter.map(|a| a.capabilities()).unwrap_or_default(),
-            display_name,
-        ))
+        // Locks are taken sequentially (work first, then session) — never
+        // nested (2B.1 deadlock rule). The pump follows the same order.
+        let work = self.work_by_eid.get(eid).map(|w| w.lock().unwrap().clone());
+        let (mut snap, provider, model) = {
+            let s = self.sessions.get(eid)?.lock().unwrap();
+            let adapter = self.adapters.get(eid);
+            let display_name = self
+                .registry
+                .get(&s.definition_id)
+                .map(|d| d.display_name.clone())
+                .unwrap_or_else(|| s.definition_id.clone());
+            (
+                snapshot(
+                    &s,
+                    eid,
+                    adapter.map(|a| a.capabilities()).unwrap_or_default(),
+                    display_name,
+                    work.as_ref(),
+                ),
+                s.launch.provider_id.clone(),
+                s.launch.model_id.clone(),
+            )
+        };
+        if let (Some(p), Some(m)) = (provider, model) {
+            if let Some(w) = &work {
+                snap.estimated_cost_cents = self.pricing.estimate_cents(&p, &m, &w.usage);
+            }
+        }
+        Some(snap)
     }
 
     pub fn list_sessions(&self) -> Vec<AgentSnapshot> {
@@ -752,18 +842,32 @@ impl AgentRuntime {
         self.sessions
             .iter()
             .map(|(eid, s)| {
-                let s = s.lock().unwrap();
-                let adapter = self.adapters.get(eid);
-                let display_name = registry
-                    .get(&s.definition_id)
-                    .map(|d| d.display_name.clone())
-                    .unwrap_or_else(|| s.definition_id.clone());
-                snapshot(
-                    &s,
-                    eid,
-                    adapter.map(|a| a.capabilities()).unwrap_or_default(),
-                    display_name,
-                )
+                let work = self.work_by_eid.get(eid).map(|w| w.lock().unwrap().clone());
+                let (mut snap, provider, model) = {
+                    let s = s.lock().unwrap();
+                    let adapter = self.adapters.get(eid);
+                    let display_name = registry
+                        .get(&s.definition_id)
+                        .map(|d| d.display_name.clone())
+                        .unwrap_or_else(|| s.definition_id.clone());
+                    (
+                        snapshot(
+                            &s,
+                            eid,
+                            adapter.map(|a| a.capabilities()).unwrap_or_default(),
+                            display_name,
+                            work.as_ref(),
+                        ),
+                        s.launch.provider_id.clone(),
+                        s.launch.model_id.clone(),
+                    )
+                };
+                if let (Some(p), Some(m)) = (provider, model) {
+                    if let Some(w) = &work {
+                        snap.estimated_cost_cents = self.pricing.estimate_cents(&p, &m, &w.usage);
+                    }
+                }
+                snap
             })
             .collect()
     }
@@ -775,6 +879,152 @@ impl AgentRuntime {
     /// All live agent execution ids.
     pub fn execution_ids(&self) -> Vec<ExecutionId> {
         self.sessions.keys().cloned().collect()
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2C: work / attention / health / usage
+    // ------------------------------------------------------------------
+
+    /// The live work record for an execution (Phase 2C §3).
+    pub fn work(&self, eid: &ExecutionId) -> Option<Arc<Mutex<AgentWork>>> {
+        self.work_by_eid.get(eid).cloned()
+    }
+
+    /// Clone of the work record (UI/IPC snapshot).
+    pub fn get_work(&self, eid: &ExecutionId) -> Option<AgentWork> {
+        Some(self.work_by_eid.get(eid)?.lock().unwrap().clone())
+    }
+
+    pub fn list_works(&self) -> Vec<(ExecutionId, AgentWork)> {
+        self.work_by_eid
+            .iter()
+            .map(|(eid, w)| (eid.clone(), w.lock().unwrap().clone()))
+            .collect()
+    }
+
+    /// Computes estimated cost for a session when pricing is known (§18–§19).
+    /// Returns `None` when the provider/model/usage is unknown.
+    ///
+    /// Lock discipline (2B.1 rule): the work and session locks are taken
+    /// SEQUENTIALLY, never nested — the pump holds them one at a time too.
+    pub fn estimated_cost_cents(&self, eid: &ExecutionId) -> Option<u64> {
+        let usage = self.work_by_eid.get(eid)?.lock().unwrap().usage.clone();
+        let (provider, model) = {
+            let s = self.sessions.get(eid)?.lock().unwrap();
+            (s.launch.provider_id.clone(), s.launch.model_id.clone())
+        };
+        let (Some(provider), Some(model)) = (provider, model) else {
+            return None;
+        };
+        self.pricing.estimate_cents(&provider, &model, &usage)
+    }
+
+    /// Phase 2C §28: per-provider credential configuration state (never
+    /// secrets — just presence). Used by the provider screen/UX.
+    pub fn provider_status(&self) -> Vec<(String, bool)> {
+        self.providers
+            .list_providers()
+            .into_iter()
+            .map(|p| (p.id.clone(), self.credential_configured_for(&p.id)))
+            .collect()
+    }
+
+    /// Whether a provider has a usable credential source (local endpoints
+    /// always count — they need no key).
+    fn credential_configured_for(&self, provider_id: &str) -> bool {
+        let Some(p) = self.providers.get_provider(provider_id) else {
+            return false;
+        };
+        p.is_custom
+            || p.base_url
+                .as_deref()
+                .map(|u| {
+                    u.starts_with("http://localhost") || u.starts_with("http://127.0.0.1")
+                })
+                .unwrap_or(false)
+            || self
+                .store
+                .get_api_key(p.id.as_str())
+                .ok()
+                .flatten()
+                .is_some()
+    }
+
+    /// Agent health rows (§30): binary presence + credential state, per
+    /// definition. Never downloads software; never runs auth flows.
+    pub fn health(&self) -> Vec<AgentHealthRow> {
+        use crate::adapters::{find_executable, is_executable};
+        let mut rows = Vec::new();
+        for def in self.registry.list() {
+            let Some(adapter) = self.registry.find_adapter(&def.id) else {
+                continue;
+            };
+            let mut candidates: Vec<&str> = adapter.candidate_binaries().to_vec();
+            if !def.command.is_empty() {
+                candidates.insert(0, def.command.as_str());
+            }
+            let binary = find_executable(&candidates)
+                .filter(|p| is_executable(p))
+                .or_else(|| {
+                    if let Ok(p) = resolve_binary(adapter.as_ref(), def) {
+                        p.is_file().then_some(p)
+                    } else {
+                        None
+                    }
+                });
+            let provider_id = def
+                .name
+                .to_ascii_lowercase()
+                .split(' ')
+                .next()
+                .map(|f| {
+                    if f.starts_with("claude") {
+                        "anthropic".to_string()
+                    } else if f == "codex" || f == "opencode" {
+                        "openai".to_string()
+                    } else if f == "pi" {
+                        "anthropic".to_string()
+                    } else {
+                        f.to_string()
+                    }
+                });
+            let credential_configured = provider_id
+                .as_ref()
+                .map(|p| self.credential_configured_for(p))
+                .unwrap_or(false);
+            let (status, detail) = match &binary {
+                Some(path) if credential_configured => (
+                    HealthStatus::Authenticated,
+                    format!(
+                        "installed at {}; credential configured",
+                        path.to_string_lossy()
+                    ),
+                ),
+                Some(path) => (
+                    HealthStatus::Available,
+                    format!(
+                        "installed at {}; no saved credential (local CLI auth may still work)",
+                        path.to_string_lossy()
+                    ),
+                ),
+                None => (
+                    HealthStatus::Unavailable,
+                    def.install_hint
+                        .clone()
+                        .unwrap_or_else(|| "executable not found on PATH".into()),
+                ),
+            };
+            rows.push(AgentHealthRow {
+                definition_id: def.id.clone(),
+                display_name: def.display_name.clone(),
+                binary_path: binary.as_ref().map(|p| p.to_string_lossy().to_string()),
+                installed: binary.is_some(),
+                status,
+                credential_configured,
+                detail,
+            });
+        }
+        rows
     }
 }
 
@@ -792,7 +1042,14 @@ fn snapshot(
     eid: &ExecutionId,
     caps: AgentCapabilities,
     display_name: String,
+    work: Option<&AgentWork>,
 ) -> AgentSnapshot {
+    let state = s.state;
+    let attention = attention_for(state);
+    let act = work.and_then(|w| w.current_activity().cloned());
+    let error = work
+        .and_then(|w| w.errors.last())
+        .map(|e| (e.kind.label().to_string(), e.message.clone()));
     AgentSnapshot {
         execution_id: eid.0.clone(),
         definition_id: s.definition_id.clone(),
@@ -812,6 +1069,27 @@ fn snapshot(
         state_confidence: format!("{:?}", s.provenance.confidence),
         events_emitted: s.metrics.events_emitted.load(Ordering::Relaxed),
         state_changes: s.metrics.state_changes.load(Ordering::Relaxed),
+        work_id: work.map(|w| w.id.clone()).unwrap_or_default(),
+        work_status: work.map(|w| w.status.label().to_string()).unwrap_or_default(),
+        attention,
+        activity_kind: act.as_ref().map(|a| a.kind.label().to_string()).unwrap_or_default(),
+        activity_source: act
+            .as_ref()
+            .map(|a| a.source.label().to_string())
+            .unwrap_or_default(),
+        activity_confidence: act.as_ref().map(|a| a.confidence).unwrap_or(0),
+        activity_detail: act.as_ref().map(|a| a.detail.clone()).unwrap_or_default(),
+        files_changed: work.map(|w| w.files_changed.len() as u32).unwrap_or(0),
+        commands_run: work.map(|w| w.commands.len() as u32).unwrap_or(0),
+        tests_passed: work.map(|w| w.summary().tests_passed).unwrap_or(None),
+        usage_input_tokens: work.and_then(|w| w.usage.input_tokens),
+        usage_output_tokens: work.and_then(|w| w.usage.output_tokens),
+        usage_cached_tokens: work.and_then(|w| w.usage.cached_tokens),
+        estimated_cost_cents: None, // computed by the runtime (needs pricing)
+        timeline_len: work.map(|w| w.timeline.len()).unwrap_or(0),
+        last_activity_at_ms: act.map(|a| a.at_ms),
+        error_kind: error.as_ref().map(|(k, _)| k.clone()),
+        error_message: error.as_ref().map(|(_, m)| m.clone()),
     }
 }
 
@@ -828,6 +1106,7 @@ struct PumpContext {
     event_tx: Sender<(ExecutionId, AgentEvent)>,
     eid: ExecutionId,
     agent_session: Arc<Mutex<AgentSession>>,
+    work: Arc<Mutex<AgentWork>>,
     adapter: Arc<dyn AgentAdapterImpl>,
     stop: Arc<AtomicBool>,
 }
@@ -841,6 +1120,8 @@ fn spawn_pump(ctx: PumpContext) {
         ))
         .spawn(move || {
             let mut last_state: Option<AgentState> = None;
+            let mut last_activity_emit_ms: u64 = 0;
+            let mut last_kind: Option<ActivityKind> = None;
             let event_tx = &ctx.event_tx;
             let eid = &ctx.eid;
             let agent_session = &ctx.agent_session;
@@ -866,7 +1147,10 @@ fn spawn_pump(ctx: PumpContext) {
                         event_tx,
                         eid,
                         agent_session,
+                        &ctx.work,
                         &mut last_state,
+                        &mut last_kind,
+                        &mut last_activity_emit_ms,
                     );
                 }
                 if ctx.session.has_exited() {
@@ -876,7 +1160,7 @@ fn spawn_pump(ctx: PumpContext) {
                         // `stop()`; just report the exit.
                         let _ = event_tx.send((eid.clone(), AgentEvent::Exited { code }));
                     } else {
-                        finish(event_tx, eid, agent_session, code);
+                        finish(event_tx, eid, agent_session, &ctx.work, code);
                     }
                     break;
                 }
@@ -892,13 +1176,81 @@ fn spawn_pump(ctx: PumpContext) {
         .expect("spawn agent pump thread");
 }
 
+/// Phase 2C §4: line → activity-kind heuristic (fallback layer under any
+/// future structured protocol). Conservative: unknown lines → `Unknown`.
+fn detect_activity_kind(line: &str, hint: Option<crate::adapters::ActivityHint>) -> (ActivityKind, String) {
+    if let Some(h) = hint {
+        return match h {
+            crate::adapters::ActivityHint::NeedsApproval => {
+                (ActivityKind::WaitingForPermission, line.trim().to_string())
+            }
+            crate::adapters::ActivityHint::Waiting => (ActivityKind::WaitingForInput, String::new()),
+            crate::adapters::ActivityHint::Working => (ActivityKind::Unknown, String::new()),
+        };
+    }
+    let l = line.trim();
+    let lower = l.to_ascii_lowercase();
+    if lower.contains("running tests")
+        || lower.contains("test suite")
+        || lower.contains("passing")
+        || lower.contains("failed tests")
+        || lower.contains("npm test")
+        || lower.contains("cargo test")
+    {
+        return (ActivityKind::RunningTests, String::new());
+    }
+    if let Some(cmd) = observe_command(l) {
+        return (ActivityKind::RunningCommand, cmd);
+    }
+    if lower.contains("reading") || lower.contains("scanning") || lower.contains("exploring") {
+        return (ActivityKind::Reading, String::new());
+    }
+    if lower.contains("planning") || lower.contains("designing") {
+        return (ActivityKind::Planning, String::new());
+    }
+    if lower.contains("thinking") {
+        return (ActivityKind::Thinking, String::new());
+    }
+    if lower.contains("reviewing") {
+        return (ActivityKind::Reviewing, String::new());
+    }
+    if lower.contains("finishing") || lower.contains("finalizing") {
+        return (ActivityKind::Finishing, String::new());
+    }
+    if lower.contains("editing")
+        || lower.contains("modifying")
+        || lower.contains("wrote")
+        || lower.contains("updated ")
+        || lower.starts_with("→")
+    {
+        let detail = if let Some(rest) = l
+            .strip_prefix("→")
+            .or_else(|| l.strip_prefix("Wrote "))
+            .or_else(|| l.strip_prefix("Updated "))
+            .or_else(|| l.strip_prefix("Modified "))
+        {
+            rest.split_whitespace().next().unwrap_or("").to_string()
+        } else {
+            String::new()
+        };
+        return (ActivityKind::Editing, detail);
+    }
+    if lower.starts_with("starting") {
+        return (ActivityKind::Starting, String::new());
+    }
+    (ActivityKind::Unknown, String::new())
+}
+
 fn process_chunk(
     chunk: &[u8],
     adapter: &dyn AgentAdapterImpl,
     event_tx: &Sender<(ExecutionId, AgentEvent)>,
     eid: &ExecutionId,
     agent_session: &Arc<Mutex<AgentSession>>,
+    work: &Arc<Mutex<AgentWork>>,
     last_state: &mut Option<AgentState>,
+    last_kind: &mut Option<ActivityKind>,
+    last_activity_emit_ms: &mut u64,
 ) {
     {
         let s = agent_session.lock().unwrap();
@@ -908,19 +1260,37 @@ fn process_chunk(
     }
     // Activity detection (heuristic refinement; output remains authoritative).
     let text = String::from_utf8_lossy(chunk);
+    let cwd = agent_session.lock().unwrap().launch.cwd.clone();
     for line in text.lines() {
-        if let Some(hint) = adapter.detect_activity(line) {
+        let hint = adapter.detect_activity(line);
+        // §4/§12: state + activity-kind refinement.
+        if let Some(hint) = hint {
             let state = hint.to_state();
             if *last_state != Some(state) {
                 *last_state = Some(state);
-                // Heuristic refinement is tagged Medium confidence
-                // (approval detection is the lowest-confidence pattern).
                 let provenance = if state == AgentState::NeedsApproval {
                     StateProvenance::HEURISTIC_APPROVAL
                 } else {
                     StateProvenance::HEURISTIC
                 };
                 let needs_approval = state == AgentState::NeedsApproval;
+                let (kind, detail) = detect_activity_kind(line, Some(hint));
+                {
+                    let mut w = work.lock().unwrap();
+                    w.push_activity(AgentActivityState {
+                        kind,
+                        source: ActivitySource::Heuristic,
+                        confidence: if needs_approval { 25 } else { 60 },
+                        detail: Redactor::redact(&detail),
+                        at_ms: now_ms(),
+                        count: 1,
+                    });
+                    if needs_approval {
+                        w.timeline.push(TimelineKind::Approval, Redactor::redact(line.trim()));
+                    } else {
+                        w.timeline.push(TimelineKind::Activity, kind.label());
+                    }
+                }
                 let ev = {
                     let mut s = agent_session.lock().unwrap();
                     s.metrics.events_emitted.fetch_add(1, Ordering::Relaxed);
@@ -937,6 +1307,55 @@ fn process_chunk(
                             context: Redactor::redact(line.trim()),
                         },
                     ));
+                }
+            }
+        } else {
+            let (kind, detail) = detect_activity_kind(line, None);
+            if kind != ActivityKind::Unknown && *last_kind != Some(kind) {
+                *last_kind = Some(kind);
+                let now = now_ms();
+                {
+                    let mut w = work.lock().unwrap();
+                    w.push_activity(AgentActivityState {
+                        kind,
+                        source: ActivitySource::Heuristic,
+                        confidence: 60,
+                        detail: Redactor::redact(&detail),
+                        at_ms: now,
+                        count: 1,
+                    });
+                    if kind.timeline_worthy() {
+                        w.timeline.push(TimelineKind::Activity, kind.label());
+                    }
+                    if kind == ActivityKind::Editing {
+                        if let Some(f) = observe_file(line, &cwd) {
+                            let f = Redactor::redact(&f);
+                            if w.files_changed.insert(f.clone()) {
+                                w.timeline.push(TimelineKind::File, f);
+                            }
+                        }
+                    }
+                }
+                // Throttled emission (§23): at most one activity event per
+                // coalescing window. Sends happen outside locks.
+                if now.saturating_sub(*last_activity_emit_ms) >= work::ACTIVITY_COALESCE_MS {
+                    *last_activity_emit_ms = now;
+                    let _ = event_tx.send((
+                        eid.clone(),
+                        AgentEvent::Activity {
+                            kind,
+                            source: ActivitySource::Heuristic,
+                            confidence: 60,
+                            detail: Redactor::redact(&detail),
+                        },
+                    ));
+                }
+            } else if let Some(cmd) = observe_command(line) {
+                let cmd = Redactor::redact(&cmd);
+                let mut w = work.lock().unwrap();
+                if w.commands.len() < 512 && w.commands.last().map(|c| c != &cmd).unwrap_or(true) {
+                    w.commands.push(cmd.clone());
+                    w.timeline.push(TimelineKind::Command, cmd);
                 }
             }
         }
@@ -972,6 +1391,7 @@ fn finish(
     event_tx: &Sender<(ExecutionId, AgentEvent)>,
     eid: &ExecutionId,
     agent_session: &Arc<Mutex<AgentSession>>,
+    work: &Arc<Mutex<AgentWork>>,
     code: Option<i32>,
 ) {
     let final_state = match code {
@@ -980,7 +1400,7 @@ fn finish(
         Some(_) => AgentState::Failed,
         None => AgentState::Failed,
     };
-    let ev = {
+    let (ev, cwd) = {
         let mut s = agent_session.lock().unwrap();
         // A user stop already moved the session to Stopped — do not
         // override it with a failure classification.
@@ -998,8 +1418,33 @@ fn finish(
         s.completed_at = Some(chrono::Utc::now());
         s.metrics.events_emitted.fetch_add(1, Ordering::Relaxed);
         s.metrics.events_queued.fetch_add(1, Ordering::Relaxed);
-        ev
+        (ev, s.launch.cwd.clone())
     };
+    // Phase 2C §3/§7/§11: finalize the work record (deterministic summary;
+    // git file snapshot once at completion, never continuously).
+    {
+        let mut w = work.lock().unwrap();
+        match final_state {
+            AgentState::Completed => {
+                w.finish(WorkStatus::Completed);
+                if w.files_observable {
+                    for f in collect_git_files(&cwd) {
+                        w.files_changed.insert(Redactor::redact(&f));
+                    }
+                }
+                w.timeline.push(TimelineKind::Completed, "work complete");
+            }
+            AgentState::Failed | AgentState::Crashed => {
+                w.finish(WorkStatus::Failed);
+                w.push_error(WorkError::new(
+                    ErrorKind::AgentFailure,
+                    format!("agent exited with code {}", code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into())),
+                ));
+                w.timeline.push(TimelineKind::Error, "agent failed");
+            }
+            _ => {}
+        }
+    }
     // Outside the lock: the channel may be full (2B.1 deadlock fix).
     if let Some(ev) = ev {
         let _ = event_tx.send((eid.clone(), ev));

@@ -64,6 +64,8 @@ impl AgentAdapterImpl for ClaudeCodeAdapter {
             structured_events: false,
             usage: false,
             cost: false,
+            files_tracked: true,
+            commands_tracked: true,
         }
     }
 

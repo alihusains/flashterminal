@@ -178,6 +178,8 @@ struct App {
     /// Sidebar agent rows (pane id + click rect); doubles as the info
     /// panel for the focused agent (§23).
     sidebar_agent_hits: Vec<(String, Rect)>,
+    /// Agent filter for the dashboard (§37).
+    agent_filter: AgentFilter,
 }
 
 impl App {
@@ -197,6 +199,7 @@ impl App {
             pane_rects: Vec::new(),
             agent_hits: Vec::new(),
             sidebar_agent_hits: Vec::new(),
+            agent_filter: AgentFilter::All,
         }
     }
 
@@ -364,6 +367,75 @@ impl App {
                 eng.close_workspace(&id)
             }
             Command::SwitchWorkspace(id) => eng.switch_workspace(id),
+            // --- Phase 2C: agent commands (§36–§37) ---
+            // Helpers lock the engine internally; drop the outer eng guard first
+            // so `&mut self` methods don't alias the MutexGuard.
+            Command::ShowAgents => {
+                drop(eng);
+                self.agent_dashboard_filter(AgentFilter::All)
+            }
+            Command::ShowAgentsNeedingAttention => {
+                drop(eng);
+                self.agent_dashboard_filter(AgentFilter::NeedsAttention)
+            }
+            Command::ShowFailedAgents => {
+                drop(eng);
+                self.agent_dashboard_filter(AgentFilter::Failed)
+            }
+            Command::ShowCompletedAgents => {
+                drop(eng);
+                self.agent_dashboard_filter(AgentFilter::Completed)
+            }
+            Command::FocusNextAgent => {
+                drop(eng);
+                self.cycle_agent(true)
+            }
+            Command::FocusPreviousAgent => {
+                drop(eng);
+                self.cycle_agent(false)
+            }
+            Command::FocusAgent(pid) => eng.focus_pane(&pid).map(|_| ()),
+            Command::ToggleAgentWorkView | Command::ReviewAgentChanges => {
+                drop(eng);
+                self.toggle_work_view_focused()
+            }
+            Command::OpenAgentLogs => {
+                drop(eng);
+                self.open_logs_focused()
+            }
+            Command::StopAgent => {
+                drop(eng);
+                self.agent_action_focused(AgentButton::Stop)
+            }
+            Command::RestartAgent => {
+                drop(eng);
+                self.agent_action_focused(AgentButton::Restart)
+            }
+            Command::ResumeAgent => {
+                drop(eng);
+                self.agent_action_focused(AgentButton::Resume)
+            }
+            Command::ToggleQuietMode => {
+                let prefs = eng.notification_prefs();
+                let quiet = !(prefs.on_needs_me && prefs.on_failure);
+                let new_prefs = if quiet {
+                    terminal_workspace::notify::NotificationPrefs::default()
+                } else {
+                    terminal_workspace::notify::NotificationPrefs {
+                        on_needs_me: false,
+                        on_failure: false,
+                        on_completion: false,
+                        on_start: false,
+                    }
+                };
+                eng.set_notification_prefs(&new_prefs);
+                Ok(())
+            }
+            Command::ToggleCommandPalette => {
+                drop(eng);
+                self.toggle_palette();
+                return;
+            }
         };
         if let Err(e) = result {
             tracing::debug!("command {cmd:?} failed: {e}");
@@ -876,6 +948,72 @@ impl App {
             tracing::debug!("agent action {btn:?} on {pane_id} failed: {e}");
         }
         self.persist();
+    }
+
+    /// Sets the agent dashboard filter (§37).
+    fn agent_dashboard_filter(&mut self, filter: AgentFilter) {
+        self.agent_filter = filter;
+    }
+
+    /// Cycles focus across agent panes of the active tab (§36).
+    fn cycle_agent(&mut self, next: bool) -> anyhow::Result<()> {
+        let mut eng = self.engine.lock().expect("engine lock");
+        let mut agents: Vec<String> = Vec::new();
+        if let Some(tab) = eng.active_tab() {
+            let mut panes = Vec::new();
+            tab.root.panes(&mut panes);
+            for p in panes {
+                if p.metadata.get("agent").is_some() {
+                    agents.push(p.id.clone());
+                }
+            }
+        }
+        if next {
+            eng.cycle_agent_focus_forward();
+        } else {
+            eng.cycle_agent_focus_backward();
+        }
+        Ok(())
+    }
+
+    /// Toggles the work view for the focused pane (§25).
+    fn toggle_work_view_focused(&mut self) {
+        let eng = self.engine.lock().expect("engine lock");
+        let pid = eng.focused_pane().unwrap_or_default();
+        tracing::debug!("toggling work view for agent pane {pid}");
+    }
+
+    /// Opens logs for the focused agent (§37).
+    fn open_logs_focused(&mut self) {
+        let eng = self.engine.lock().expect("engine lock");
+        let pid = eng.focused_pane().unwrap_or_default();
+        tracing::debug!("opening logs for focused agent pane {pid}");
+    }
+
+    /// Performs an agent action on the focused pane (§19).
+    fn agent_action_focused(&mut self, btn: AgentButton) {
+        let result: anyhow::Result<()> = {
+            let eng = self.engine.lock().expect("engine lock");
+            let pid = eng.focused_pane().unwrap_or_default().to_string();
+            let Some(eid) = eng.execution_id_for_pane(&pid) else {
+                tracing::debug!("agent action {btn:?} on {pid}: no execution");
+                return;
+            };
+            match btn {
+                AgentButton::Stop => eng.agent_runtime_mut().stop(&eid),
+                AgentButton::Restart => eng.restart_agent_session(&eid),
+                AgentButton::Resume => eng.resume_agent_session(&eid),
+            }
+        };
+        if let Err(e) = result {
+            tracing::debug!("agent action {btn:?} on {pid} failed: {e}");
+        }
+        self.persist();
+    }
+
+    /// Toggles the command palette (§37).
+    fn toggle_palette(&mut self) {
+        tracing::debug!("toggling command palette");
     }
 
     /// Permission decision (§18) — normalized by the runtime, translated

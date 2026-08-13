@@ -60,6 +60,8 @@ impl AgentAdapterImpl for GenericCliAdapter {
             structured_events: false,
             usage: false,
             cost: false,
+            files_tracked: false,
+            commands_tracked: false,
         }
     }
 

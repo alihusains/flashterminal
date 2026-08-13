@@ -127,6 +127,28 @@ pub enum Request {
         subscription_id: u64,
     },
     Ping,
+    // --- Phase 2C: dashboard / work / timeline / review / health (§13–§17, §30) ---
+    AgentDashboard {
+        filter: terminal_session::work::AgentFilter,
+    },
+    AgentWork {
+        execution_id: String,
+    },
+    AgentTimeline {
+        execution_id: String,
+    },
+    AgentReview {
+        execution_id: String,
+    },
+    AgentHealth,
+    WorkspaceAgentSummary,
+    SetNotificationPrefs {
+        on_needs_me: bool,
+        on_failure: bool,
+        on_completion: bool,
+        on_start: bool,
+    },
+    NotificationPrefs,
 }
 
 /// Application → client responses.
@@ -153,6 +175,29 @@ pub enum Response {
     Subscribed {
         subscription_id: u64,
     },
+    // --- Phase 2C responses ---
+    AgentDashboard {
+        dashboard: crate::engine::AgentDashboard,
+    },
+    AgentWork {
+        work: Option<terminal_session::work::AgentWork>,
+    },
+    AgentTimeline {
+        execution_id: String,
+        entries: Vec<terminal_session::work::TimelineEntry>,
+    },
+    AgentReview {
+        review: Option<crate::engine::AgentReview>,
+    },
+    AgentHealth {
+        rows: Vec<terminal_session::work::AgentHealthRow>,
+    },
+    WorkspaceAgentSummary {
+        summary: crate::engine::WorkspaceAgentSummary,
+    },
+    NotificationPrefs {
+        prefs: crate::notify::NotificationPrefs,
+    },
     Err {
         message: String,
     },
@@ -168,6 +213,23 @@ pub struct AgentInfo {
     pub cwd: String,
     pub exit_code: Option<i32>,
     pub duration_secs: Option<i64>,
+    // --- Phase 2C (§12–§17) ---
+    #[serde(default)]
+    pub attention: Option<String>,
+    #[serde(default)]
+    pub work_status: String,
+    #[serde(default)]
+    pub activity_detail: String,
+    #[serde(default)]
+    pub activity_confidence: u8,
+    #[serde(default)]
+    pub files_changed: u32,
+    #[serde(default)]
+    pub commands_run: u32,
+    #[serde(default)]
+    pub tests_passed: Option<u32>,
+    #[serde(default)]
+    pub estimated_cost_cents: Option<u64>,
 }
 
 impl From<terminal_session::agent::AgentSnapshot> for AgentInfo {
@@ -181,6 +243,14 @@ impl From<terminal_session::agent::AgentSnapshot> for AgentInfo {
             cwd: s.cwd,
             exit_code: s.exit_code,
             duration_secs: s.duration_secs,
+            attention: s.attention.map(|a| a.label().to_string()),
+            work_status: s.work_status,
+            activity_detail: s.activity_detail,
+            activity_confidence: s.activity_confidence,
+            files_changed: s.files_changed,
+            commands_run: s.commands_run,
+            tests_passed: s.tests_passed,
+            estimated_cost_cents: s.estimated_cost_cents,
         }
     }
 }
@@ -510,6 +580,60 @@ pub fn handle(engine: &mut crate::engine::Multiplexer, req: Request) -> Response
         // Never reaches `handle` (serve() intercepts Subscribe for the
         // streaming connection) — defensive only.
         Request::Subscribe { .. } => Response::err("subscribe is handled on the connection"),
+        // --- Phase 2C handlers ---
+        Request::AgentDashboard { filter } => Response::AgentDashboard {
+            dashboard: engine.agent_dashboard(filter),
+        },
+        Request::AgentWork { execution_id } => {
+            let eid = terminal_session::execution::ExecutionId(execution_id);
+            Response::AgentWork {
+                work: engine.agent_runtime().get_work(&eid),
+            }
+        }
+        Request::AgentTimeline { execution_id } => {
+            let eid = terminal_session::execution::ExecutionId(execution_id);
+            let entries = engine
+                .agent_runtime()
+                .get_work(&eid)
+                .map(|w| w.timeline.iter().cloned().collect())
+                .unwrap_or_default();
+            Response::AgentTimeline {
+                execution_id: eid.0,
+                entries,
+            }
+        }
+        Request::AgentReview { execution_id } => {
+            let eid = terminal_session::execution::ExecutionId(execution_id);
+            Response::AgentReview {
+                review: engine.agent_review(&eid),
+            }
+        }
+        Request::AgentHealth => Response::AgentHealth {
+            rows: engine.agent_runtime().health(),
+        },
+        Request::WorkspaceAgentSummary => Response::WorkspaceAgentSummary {
+            summary: engine.workspace_agent_summary(),
+        },
+        Request::SetNotificationPrefs {
+            on_needs_me,
+            on_failure,
+            on_completion,
+            on_start,
+        } => {
+            let prefs = crate::notify::NotificationPrefs {
+                on_needs_me,
+                on_failure,
+                on_completion,
+                on_start,
+            };
+            engine.set_notification_prefs(&prefs);
+            Response::Ok {
+                message: "notification preferences updated".into(),
+            }
+        }
+        Request::NotificationPrefs => Response::NotificationPrefs {
+            prefs: engine.notification_prefs(),
+        },
     }
 }
 

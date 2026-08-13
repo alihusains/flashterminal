@@ -105,7 +105,11 @@ fn is_critical(event: &ApplicationEvent) -> bool {
         | ApplicationEvent::SessionExited { .. }
         | ApplicationEvent::WorkspaceChanged => true,
         ApplicationEvent::AgentEvent {
-            event: AgentEvent::Output { .. } | AgentEvent::Started | AgentEvent::UsageUpdated { .. },
+            event:
+                AgentEvent::Output { .. }
+                | AgentEvent::Started
+                | AgentEvent::UsageUpdated { .. }
+                | AgentEvent::Activity { .. },
             ..
         } => false,
     }

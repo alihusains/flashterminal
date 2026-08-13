@@ -111,6 +111,9 @@ fn print_agent_event(
                 AgentEvent::UsageUpdated { tokens } => {
                     println!("[{short}] usage updated ({tokens} tokens)")
                 }
+                AgentEvent::Activity { kind, detail, .. } => {
+                    println!("[{short}] activity: {kind:?} {}", detail)
+                }
             }
         }
         ApplicationEvent::SessionExited { execution_id, code } if matches(&execution_id.0) => {
@@ -143,6 +146,15 @@ fn main() -> Result<()> {
     // Streaming command: `terminal agent watch [execution-id-prefix]`.
     if args[0] == "agent" && args.get(1).map(|s| s.as_str()) == Some("watch") {
         return agent_watch(&socket, args.get(2).map(|s| s.as_str()));
+    }
+
+    // Phase 2C dashboard: `terminal agents [filter]` and
+    // `terminal agent work|timeline|review|health <id>`.
+    if args[0] == "agents" {
+        let request = Request::AgentDashboard {
+            filter: parse_filter(args.get(1).map(|s| s.as_str()))?,
+        };
+        return roundtrip_and_print(&socket, request);
     }
 
     let request = match args[0].as_str() {
@@ -233,6 +245,16 @@ fn agent_cmd(args: &[String]) -> Result<Request> {
         "pause" => Request::AgentPause {
             execution_id: required(args, 1, "pause <execution-id>")?,
         },
+        "work" => Request::AgentWork {
+            execution_id: required(args, 1, "work <execution-id>")?,
+        },
+        "timeline" => Request::AgentTimeline {
+            execution_id: required(args, 1, "timeline <execution-id>")?,
+        },
+        "review" => Request::AgentReview {
+            execution_id: required(args, 1, "review <execution-id>")?,
+        },
+        "health" => Request::AgentHealth,
         other => bail!("unknown agent command `{other}`"),
     })
 }
@@ -315,6 +337,38 @@ fn required(args: &[String], idx: usize, usage: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing argument: {usage}"))
 }
 
+/// Phase 2C: parses `terminal agents [filter]` filters (deterministic
+/// dashboard filters, §13/§15).
+fn parse_filter(f: Option<&str>) -> Result<terminal_workspace::terminal_session::work::AgentFilter> {
+    use terminal_workspace::terminal_session::work::AgentFilter::*;
+    Ok(match f.map(|s| s.to_ascii_lowercase()).as_deref() {
+        None | Some("all") => All,
+        Some("needs-me" | "needs_you" | "attention" | "needing") => NeedsAttention,
+        Some("running") => Running,
+        Some("failed") => Failed,
+        Some("completed" | "done") => Completed,
+        Some("needs-input") => NeedingInput,
+        Some("needs-approval") => NeedingApproval,
+        Some(other) => bail!("unknown filter `{other}` (all|needs-me|running|failed|completed|needs-input|needs-approval)"),
+    })
+}
+
+fn roundtrip_and_print(socket: &PathBuf, request: Request) -> Result<()> {
+    match ipc::roundtrip(socket, &request) {
+        Ok(response) => {
+            print_response(response);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "terminal: cannot reach FlashTerminal at {} — is the app running? ({e})",
+                socket.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 fn print_response(resp: Response) {
     match resp {
         Response::Ok { message } => println!("{message}"),
@@ -365,6 +419,133 @@ fn print_response(resp: Response) {
             if let Some(secs) = agent.duration_secs {
                 println!("  duration: {secs}s");
             }
+            if let Some(atn) = &agent.attention {
+                println!("  attention: {atn}");
+            }
+        }
+        // --- Phase 2C printers (§13–§17, §30) ---
+        Response::AgentDashboard { dashboard } => {
+            println!(
+                "agents: {} total · {} running · {} need you · {} failed · {} completed",
+                dashboard.total,
+                dashboard.running,
+                dashboard.needs_you,
+                dashboard.failed,
+                dashboard.completed
+            );
+            for r in &dashboard.rows {
+                let mark = match &r.snapshot.attention {
+                    Some(a) => format!("▲ {}", a.label()),
+                    None => format!("· {}", r.snapshot.work_status),
+                };
+                println!(
+                    "  {} {} [{}] {}",
+                    mark,
+                    r.snapshot.execution_id,
+                    r.snapshot.display_name,
+                    r.snapshot.activity_detail
+                );
+                if let Some(pid) = &r.pane_id {
+                    println!("    pane {pid}");
+                }
+            }
+        }
+        Response::AgentWork { work } => {
+            let Some(w) = work else {
+                println!("no work record for this execution");
+                return;
+            };
+            println!(
+                "work {} — {} [{}]",
+                w.id,
+                w.title,
+                w.status.label()
+            );
+            if !w.description.is_empty() {
+                println!("  description: {}", w.description);
+            }
+            if let Some(secs) = w.summary().duration_secs {
+                println!("  duration: {secs}s");
+            }
+            if let (Some(inp), Some(out)) = (w.usage.input_tokens, w.usage.output_tokens) {
+                println!("  tokens: {inp} in / {out} out (est. cost ${:.4})", {
+                    w.usage.estimated_cost_cents.map(|c| c as f64 / 100.0).unwrap_or(0.0)
+                });
+            } else {
+                println!("  tokens: unavailable");
+            }
+            let s = w.summary();
+            println!(
+                "  files changed: {} · commands run: {} · tests passed: {}",
+                s.files_changed,
+                s.commands_run,
+                s.tests_passed.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into())
+            );
+            println!("  files: {}", w.files_changed.iter().cloned().collect::<Vec<_>>().join(", "));
+            let current = w
+                .current_activity()
+                .map(|a| a.display())
+                .unwrap_or_else(|| "—".into());
+            println!("  activity: {current}");
+        }
+        Response::AgentTimeline {
+            execution_id,
+            entries,
+        } => {
+            println!("timeline for {execution_id}:");
+            for e in entries {
+                println!("  {} {} — {}", e.at.format("%H:%M:%S"), e.kind.label(), e.detail);
+            }
+        }
+        Response::AgentReview { review } => {
+            let Some(r) = review else {
+                println!("no review available for this execution");
+                return;
+            };
+            println!("files changed ({}):", r.files.len());
+            for f in &r.files {
+                println!("  {}", f.path);
+                if let Some(diff) = &f.diff {
+                    if !diff.is_empty() {
+                        println!("{}", diff.lines().take(12).map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n"));
+                    }
+                }
+            }
+            println!("commands ({}):", r.commands.len());
+            for c in &r.commands {
+                println!("  $ {c}");
+            }
+        }
+        Response::AgentHealth { rows } => {
+            println!("agent health:");
+            for h in &rows {
+                println!(
+                    "  {} {} — {} ({} at {}, credential {})",
+                    h.status.symbol(),
+                    h.display_name,
+                    h.status.label(),
+                    h.definition_id,
+                    h.binary_path.clone().unwrap_or_else(|| "not found".into()),
+                    if h.credential_configured { "configured" } else { "not configured" }
+                );
+            }
+        }
+        Response::WorkspaceAgentSummary { summary } => {
+            println!(
+                "workspace agents: {} total · {} running · {} need you · {} failed · {} completed",
+                summary.agents,
+                summary.running,
+                summary.needs_you,
+                summary.failed,
+                summary.completed
+            );
+        }
+        Response::NotificationPrefs { prefs } => {
+            println!(
+                "notifications: needs-me {}{}",
+                if prefs.on_needs_me { "on" } else { "off" },
+                if !prefs.on_failure { " · failures off" } else { "" }
+            );
         }
         Response::Subscribed { .. } => {
             // Only reachable through the streaming path; handled in

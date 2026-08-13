@@ -26,6 +26,7 @@ pub mod execution;
 pub mod launch;
 pub mod provider;
 pub mod redact;
+pub mod work;
 
 use crossbeam_channel::{bounded, Receiver};
 use pty::{PtyManager, ReadResult};

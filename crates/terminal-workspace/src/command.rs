@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{PaneId, SplitDirection, WorkspaceId};
 
-/// Phase 1 commands (terminal/workspace actions only — no agent commands).
+/// FlashTerminal commands. Phase 1 covers terminal/workspace actions;
+/// Phase 2C (§37) adds the agent command palette + keyboard actions (§36).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     SplitHorizontal,
@@ -26,6 +27,24 @@ pub enum Command {
     NewWorkspace,
     SwitchWorkspace(WorkspaceId),
     CloseWorkspace,
+    // --- Phase 2C: agent commands (§36–§37) ---
+    ShowAgents,
+    ShowAgentsNeedingAttention,
+    ShowFailedAgents,
+    ShowCompletedAgents,
+    FocusNextAgent,
+    FocusPreviousAgent,
+    FocusAgent(PaneId),
+    ToggleAgentWorkView,
+    ReviewAgentChanges,
+    OpenAgentLogs,
+    StopAgent,
+    RestartAgent,
+    ResumeAgent,
+    Approve,
+    Deny,
+    ToggleQuietMode,
+    ToggleCommandPalette,
 }
 
 /// A key chord: optional modifiers + a printable key name (e.g. "d", "w",
@@ -72,6 +91,14 @@ impl KeyChord {
             key: key.to_string(),
         }
     }
+    pub fn ctrl_alt(key: &str) -> Self {
+        Self {
+            ctrl: true,
+            alt: true,
+            shift: false,
+            key: key.to_string(),
+        }
+    }
 }
 
 /// Default Phase 1 bindings (macOS-style: Cmd = ctrl here since winit on
@@ -93,6 +120,16 @@ pub fn default_bindings() -> Vec<(KeyChord, Command)> {
         (KeyChord::alt("ArrowRight"), Command::ResizePaneRight),
         (KeyChord::alt("ArrowUp"), Command::ResizePaneUp),
         (KeyChord::alt("ArrowDown"), Command::ResizePaneDown),
+        // --- Phase 2C: agent keyboard actions (§36) ---
+        (KeyChord::ctrl_alt("a"), Command::FocusNextAgent),
+        (KeyChord::ctrl_alt("b"), Command::FocusPreviousAgent),
+        (KeyChord::ctrl_alt("v"), Command::ToggleAgentWorkView),
+        (KeyChord::ctrl_alt("y"), Command::Approve),
+        (KeyChord::ctrl_alt("n"), Command::Deny),
+        (KeyChord::ctrl_alt("s"), Command::StopAgent),
+        (KeyChord::ctrl_alt("r"), Command::RestartAgent),
+        (KeyChord::ctrl_alt("q"), Command::ToggleQuietMode),
+        (KeyChord::ctrl("k"), Command::ToggleCommandPalette),
     ]
 }
 
