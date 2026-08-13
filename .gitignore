@@ -1,8 +1,2 @@
 # Build artifacts
 target/
-
-# Non-source caches / indexes (kept out of git per project decision)
-.codegraph/
-.claude/
-.pi/
-graphify-out/

@@ -1,0 +1,357 @@
+{
+  "apps/cli/src/main.rs": {
+    "mtime": 1786560169.894765,
+    "ast_hash": "6accfb3265de4651236b9a2880bd5384",
+    "semantic_hash": "6accfb3265de4651236b9a2880bd5384"
+  },
+  "apps/desktop/src/main.rs": {
+    "mtime": 1786560647.823139,
+    "ast_hash": "e8961a3f6b63c00b1db378a96a83da55",
+    "semantic_hash": "e8961a3f6b63c00b1db378a96a83da55"
+  },
+  "benchmarks/baseline.json": {
+    "mtime": 1786534146.8530245,
+    "ast_hash": "53a53229be4915acfdffc03c63ae92db",
+    "semantic_hash": "53a53229be4915acfdffc03c63ae92db"
+  },
+  "benchmarks/benches/pipeline.rs": {
+    "mtime": 1786534084.2623289,
+    "ast_hash": "e356dee43950453918394e94b44f6465",
+    "semantic_hash": "e356dee43950453918394e94b44f6465"
+  },
+  "benchmarks/benches/terminal_benchmarks.rs": {
+    "mtime": 1786534084.2644324,
+    "ast_hash": "c5e585c2a0b7c0cc50c3c47ffe8d4e78",
+    "semantic_hash": "c5e585c2a0b7c0cc50c3c47ffe8d4e78"
+  },
+  "benchmarks/phase051-report.json": {
+    "mtime": 1786555444.31702,
+    "ast_hash": "f36c80e1e2c94fd2cd46ece644b3a2da",
+    "semantic_hash": "f36c80e1e2c94fd2cd46ece644b3a2da"
+  },
+  "benchmarks/src/bin/alloc_profiler.rs": {
+    "mtime": 1786540436.2831976,
+    "ast_hash": "3b35e6f643f13b99cadec08a30ad158b",
+    "semantic_hash": "3b35e6f643f13b99cadec08a30ad158b"
+  },
+  "benchmarks/src/bin/multiplex_bench.rs": {
+    "mtime": 1786560169.9119434,
+    "ast_hash": "5cf5d0ccd8a37a36845d7b0473a2362c",
+    "semantic_hash": "5cf5d0ccd8a37a36845d7b0473a2362c"
+  },
+  "benchmarks/src/bin/paste_bench.rs": {
+    "mtime": 1786555944.5114117,
+    "ast_hash": "c0af96509c4c39c8e10d0e88376ebaf4",
+    "semantic_hash": "c0af96509c4c39c8e10d0e88376ebaf4"
+  },
+  "benchmarks/src/bin/plateau.rs": {
+    "mtime": 1786555982.4939837,
+    "ast_hash": "4f6b0027b6aa20b2cfde4c174cea2340",
+    "semantic_hash": "4f6b0027b6aa20b2cfde4c174cea2340"
+  },
+  "benchmarks/src/bin/raw_throughput.rs": {
+    "mtime": 1786555944.513524,
+    "ast_hash": "31c40dcb962593bb5ba6c7e8ea7208aa",
+    "semantic_hash": "31c40dcb962593bb5ba6c7e8ea7208aa"
+  },
+  "benchmarks/src/bin/scrollback_bench.rs": {
+    "mtime": 1786556160.2839494,
+    "ast_hash": "27c10ebd662f80bf24c8b1894874fe25",
+    "semantic_hash": "27c10ebd662f80bf24c8b1894874fe25"
+  },
+  "benchmarks/src/bin/soak.rs": {
+    "mtime": 1786556686.9041657,
+    "ast_hash": "39609d738403d3e800931881f9da0008",
+    "semantic_hash": "39609d738403d3e800931881f9da0008"
+  },
+  "benchmarks/src/bin/validate.rs": {
+    "mtime": 1786556156.1333132,
+    "ast_hash": "352ff9b80d08a1dc1b031d3b7fc3b4a1",
+    "semantic_hash": "352ff9b80d08a1dc1b031d3b7fc3b4a1"
+  },
+  "benchmarks/src/main.rs": {
+    "mtime": 1786534084.2675774,
+    "ast_hash": "8a22af532ce910e92d8e2547a1465a23",
+    "semantic_hash": "8a22af532ce910e92d8e2547a1465a23"
+  },
+  "crates/pty/src/lib.rs": {
+    "mtime": 1786555302.7439075,
+    "ast_hash": "0f6dea9af55c83477b6599fc069a9379",
+    "semantic_hash": "0f6dea9af55c83477b6599fc069a9379"
+  },
+  "crates/terminal-core/src/lib.rs": {
+    "mtime": 1786555944.537998,
+    "ast_hash": "ec36fe9cf207cd2efc629bb1e1b014cf",
+    "semantic_hash": "ec36fe9cf207cd2efc629bb1e1b014cf"
+  },
+  "crates/terminal-core/src/scrollback.rs": {
+    "mtime": 1786555944.5391853,
+    "ast_hash": "0dbaaded73da72044da0f2136bd8199b",
+    "semantic_hash": "0dbaaded73da72044da0f2136bd8199b"
+  },
+  "crates/terminal-core/tests/unicode.rs": {
+    "mtime": 1786555944.5412529,
+    "ast_hash": "7806e720cfa9019b7c55d34162106c6c",
+    "semantic_hash": "7806e720cfa9019b7c55d34162106c6c"
+  },
+  "crates/terminal-parser/src/lib.rs": {
+    "mtime": 1786534084.2788324,
+    "ast_hash": "393231cfc3b13ea7ff77070e5ebaa0b4",
+    "semantic_hash": "393231cfc3b13ea7ff77070e5ebaa0b4"
+  },
+  "crates/terminal-renderer/src/lib.rs": {
+    "mtime": 1786560202.6255977,
+    "ast_hash": "597e03110e56a24b55ed1176e5beccd4",
+    "semantic_hash": "597e03110e56a24b55ed1176e5beccd4"
+  },
+  "crates/terminal-session/src/lib.rs": {
+    "mtime": 1786555944.5502908,
+    "ast_hash": "c8e23c08eb6d22daa624f0bc838dd213",
+    "semantic_hash": "c8e23c08eb6d22daa624f0bc838dd213"
+  },
+  "crates/terminal-session/tests/integration.rs": {
+    "mtime": 1786534084.287567,
+    "ast_hash": "7e5b51a7b1e417617a7fe0228a36fd29",
+    "semantic_hash": "7e5b51a7b1e417617a7fe0228a36fd29"
+  },
+  "crates/terminal-session/tests/phase051.rs": {
+    "mtime": 1786555944.554264,
+    "ast_hash": "924e30d9d2b09b356977d8e4d80ba363",
+    "semantic_hash": "924e30d9d2b09b356977d8e4d80ba363"
+  },
+  "crates/terminal-text/src/lib.rs": {
+    "mtime": 1786540114.6089694,
+    "ast_hash": "b4b01096670bc4fa43c00f4a930fb5a6",
+    "semantic_hash": "b4b01096670bc4fa43c00f4a930fb5a6"
+  },
+  "crates/terminal-workspace/src/command.rs": {
+    "mtime": 1786560169.9747984,
+    "ast_hash": "5b72d4ea3d93bc07f50f9135b6448ac8",
+    "semantic_hash": "5b72d4ea3d93bc07f50f9135b6448ac8"
+  },
+  "crates/terminal-workspace/src/engine.rs": {
+    "mtime": 1786560657.5115385,
+    "ast_hash": "54312f30eceb81433fc693f656e694a3",
+    "semantic_hash": "54312f30eceb81433fc693f656e694a3"
+  },
+  "crates/terminal-workspace/src/ipc.rs": {
+    "mtime": 1786560169.9884431,
+    "ast_hash": "fc93af005935c8a595770e0e7fe332c1",
+    "semantic_hash": "fc93af005935c8a595770e0e7fe332c1"
+  },
+  "crates/terminal-workspace/src/layout.rs": {
+    "mtime": 1786560169.9901903,
+    "ast_hash": "e6adc7d61096d334f284002927b085d1",
+    "semantic_hash": "e6adc7d61096d334f284002927b085d1"
+  },
+  "crates/terminal-workspace/src/lib.rs": {
+    "mtime": 1786558582.137279,
+    "ast_hash": "cae6a2292ab3701f600d1b6b4254ea81",
+    "semantic_hash": "cae6a2292ab3701f600d1b6b4254ea81"
+  },
+  "crates/terminal-workspace/src/model.rs": {
+    "mtime": 1786558737.1500478,
+    "ast_hash": "8e2aa4b6c142c61e5a02b31815e69027",
+    "semantic_hash": "8e2aa4b6c142c61e5a02b31815e69027"
+  },
+  "crates/terminal-workspace/src/notify.rs": {
+    "mtime": 1786558646.3663015,
+    "ast_hash": "15097e369b599a7652fec9d0664e1728",
+    "semantic_hash": "15097e369b599a7652fec9d0664e1728"
+  },
+  "crates/terminal-workspace/src/pane_tree.rs": {
+    "mtime": 1786560169.9919472,
+    "ast_hash": "705f25db6fdde52ac3a90e56b1a0f36a",
+    "semantic_hash": "705f25db6fdde52ac3a90e56b1a0f36a"
+  },
+  "crates/terminal-workspace/src/persist.rs": {
+    "mtime": 1786560169.9927478,
+    "ast_hash": "0d818b36dcd5714305403c43e7d24969",
+    "semantic_hash": "0d818b36dcd5714305403c43e7d24969"
+  },
+  "docs/diagrams/flashterminal.architecture.json": {
+    "mtime": 1786533762.3981168,
+    "ast_hash": "d49b488f082d1f3694846f87a73bd60d",
+    "semantic_hash": "d49b488f082d1f3694846f87a73bd60d"
+  },
+  "scripts/run_benchmarks.sh": {
+    "mtime": 1786527199.4841483,
+    "ast_hash": "040ff6a16521297a48a5fef36c84868b",
+    "semantic_hash": "040ff6a16521297a48a5fef36c84868b"
+  },
+  "skills-lock.json": {
+    "mtime": 1786557460.8814943,
+    "ast_hash": "6fbdaba63f188ad3d5c7ea5a12e858fe",
+    "semantic_hash": "6fbdaba63f188ad3d5c7ea5a12e858fe"
+  },
+  ".github/workflows/ci.yml": {
+    "mtime": 1786533384.4724576,
+    "ast_hash": "137c7dac4200547b1b5c16a887566f9f",
+    "semantic_hash": "137c7dac4200547b1b5c16a887566f9f"
+  },
+  ".pi/skills/pi-cli-workspace/SKILL.md": {
+    "mtime": 1786557460.8631692,
+    "ast_hash": "35d0bf88d0902a6cf12bd93e14d4d669",
+    "semantic_hash": "35d0bf88d0902a6cf12bd93e14d4d669"
+  },
+  ".pi/skills/pi-cli-workspace/references/CORPUS.md": {
+    "mtime": 1786557460.8633206,
+    "ast_hash": "82fe81791ed5a41fac6c02e4a31a722a",
+    "semantic_hash": "82fe81791ed5a41fac6c02e4a31a722a"
+  },
+  ".pi/skills/pi-customization/SKILL.md": {
+    "mtime": 1786557460.8645866,
+    "ast_hash": "383adb8e0eb371d050f8fe4ca8ee90d9",
+    "semantic_hash": "383adb8e0eb371d050f8fe4ca8ee90d9"
+  },
+  ".pi/skills/pi-customization/references/CORPUS.md": {
+    "mtime": 1786557460.8647273,
+    "ast_hash": "d3fd0af5a1ebc33483e4ec002255a39d",
+    "semantic_hash": "d3fd0af5a1ebc33483e4ec002255a39d"
+  },
+  ".pi/skills/pi-extension-authoring/SKILL.md": {
+    "mtime": 1786557460.8662155,
+    "ast_hash": "7f6c521a7d06e5987214ff48e1af21cf",
+    "semantic_hash": "7f6c521a7d06e5987214ff48e1af21cf"
+  },
+  ".pi/skills/pi-extension-authoring/references/CORPUS.md": {
+    "mtime": 1786557460.8662698,
+    "ast_hash": "573eb58957d15d0d34a812cfeb1b88c4",
+    "semantic_hash": "573eb58957d15d0d34a812cfeb1b88c4"
+  },
+  ".pi/skills/pi-package-authoring/SKILL.md": {
+    "mtime": 1786557460.8674169,
+    "ast_hash": "ca0346ad55abec15f1fdbb6ed548ccae",
+    "semantic_hash": "ca0346ad55abec15f1fdbb6ed548ccae"
+  },
+  ".pi/skills/pi-package-authoring/references/CORPUS.md": {
+    "mtime": 1786557460.8677084,
+    "ast_hash": "83a20bf5d6fbd4ae79cedbdf172b8ab7",
+    "semantic_hash": "83a20bf5d6fbd4ae79cedbdf172b8ab7"
+  },
+  ".pi/skills/pi-rpc-sdk/SKILL.md": {
+    "mtime": 1786557460.8687954,
+    "ast_hash": "310bbb1930340943e5c5ead4749c820b",
+    "semantic_hash": "310bbb1930340943e5c5ead4749c820b"
+  },
+  ".pi/skills/pi-rpc-sdk/references/CORPUS.md": {
+    "mtime": 1786557460.8690147,
+    "ast_hash": "afafd04cf086f4644baa554ab2eccd12",
+    "semantic_hash": "afafd04cf086f4644baa554ab2eccd12"
+  },
+  "0.5.1.md": {
+    "mtime": 1786530142.4770243,
+    "ast_hash": "8470d416e8a5b29e2ba190733ce849b1",
+    "semantic_hash": "8470d416e8a5b29e2ba190733ce849b1"
+  },
+  "0.5.2.md": {
+    "mtime": 1786552857.589306,
+    "ast_hash": "c6f5c501f5e5bdb2b69b6c59c3dd06dd",
+    "semantic_hash": "c6f5c501f5e5bdb2b69b6c59c3dd06dd"
+  },
+  "1.0.md": {
+    "mtime": 1786558195.6470895,
+    "ast_hash": "861b3b1d73229b0441ab1cfb8b5afd53",
+    "semantic_hash": "861b3b1d73229b0441ab1cfb8b5afd53"
+  },
+  "Build Phase 0_ Terminal Foundation Bootstrap Prompt.md": {
+    "mtime": 1786526747.0179448,
+    "ast_hash": "c04f2ae68d92d5fc01435d2c011ac731",
+    "semantic_hash": "c04f2ae68d92d5fc01435d2c011ac731"
+  },
+  "Master Build Prompt_ AI-Native High-Performance Terminal.md": {
+    "mtime": 1786524363.0795445,
+    "ast_hash": "9d28ad136773dc38087dc865002603b8",
+    "semantic_hash": "9d28ad136773dc38087dc865002603b8"
+  },
+  "README.md": {
+    "mtime": 1786525106.3837383,
+    "ast_hash": "4671efaf1d71771b472a452f3c3caca6",
+    "semantic_hash": "4671efaf1d71771b472a452f3c3caca6"
+  },
+  "docs/adr/0001-initial-architecture.md": {
+    "mtime": 1786527189.922576,
+    "ast_hash": "d6ee17933c5c33a5a051540618bf115b",
+    "semantic_hash": "d6ee17933c5c33a5a051540618bf115b"
+  },
+  "docs/adr/0001-technology-stack.md": {
+    "mtime": 1786524861.3094556,
+    "ast_hash": "991c7b2e99998a48066a6fcae35afd4f",
+    "semantic_hash": "991c7b2e99998a48066a6fcae35afd4f"
+  },
+  "docs/adr/0002-threading-model.md": {
+    "mtime": 1786527627.6492195,
+    "ast_hash": "bfe2a8e51ee422f80f17b0faa8cfb9d6",
+    "semantic_hash": "bfe2a8e51ee422f80f17b0faa8cfb9d6"
+  },
+  "docs/adr/0003-session-snapshot-text.md": {
+    "mtime": 1786533600.1373165,
+    "ast_hash": "5e668baba18d12e3625cc7e4c3bbd134",
+    "semantic_hash": "5e668baba18d12e3625cc7e4c3bbd134"
+  },
+  "docs/adr/0004-scrollback-tiering.md": {
+    "mtime": 1786556349.350111,
+    "ast_hash": "d53f2f45c165f4c8868f897d898a75fb",
+    "semantic_hash": "d53f2f45c165f4c8868f897d898a75fb"
+  },
+  "docs/architecture-current.md": {
+    "mtime": 1786560530.3834252,
+    "ast_hash": "acc86df30ea270fe76d14e747263f671",
+    "semantic_hash": "acc86df30ea270fe76d14e747263f671"
+  },
+  "docs/architecture.md": {
+    "mtime": 1786524748.1531599,
+    "ast_hash": "00654ad3234355eca5e22fb6df076cd8",
+    "semantic_hash": "00654ad3234355eca5e22fb6df076cd8"
+  },
+  "docs/development.md": {
+    "mtime": 1786527172.1194458,
+    "ast_hash": "c727c5f2f0d8174739f287a21b64cd3d",
+    "semantic_hash": "c727c5f2f0d8174739f287a21b64cd3d"
+  },
+  "docs/diagrams/flashterminal-architecture.html": {
+    "mtime": 1786533771.0041986,
+    "ast_hash": "35b6e9cf0be38d71044e4a6dde133799",
+    "semantic_hash": "35b6e9cf0be38d71044e4a6dde133799"
+  },
+  "docs/performance-phase-0.5.1.md": {
+    "mtime": 1786555444.317364,
+    "ast_hash": "733c322d31bd5e66f8318d44e5a5aee5",
+    "semantic_hash": "733c322d31bd5e66f8318d44e5a5aee5"
+  },
+  "docs/performance-report.md": {
+    "mtime": 1786534146.8529274,
+    "ast_hash": "758f3e0dedca36f09dcc026fa7d53a28",
+    "semantic_hash": "758f3e0dedca36f09dcc026fa7d53a28"
+  },
+  "docs/performance.md": {
+    "mtime": 1786556368.1215525,
+    "ast_hash": "6dd353eaf994f2c89e5906a504a785ea",
+    "semantic_hash": "6dd353eaf994f2c89e5906a504a785ea"
+  },
+  "docs/phase051-manual.md": {
+    "mtime": 1786556396.9546611,
+    "ast_hash": "abfdcfbed7b801948c613fd7248d431e",
+    "semantic_hash": "abfdcfbed7b801948c613fd7248d431e"
+  },
+  "docs/phase1-multiplexer.md": {
+    "mtime": 1786560510.133414,
+    "ast_hash": "712b62408aad514eccbeaa87aae49fcb",
+    "semantic_hash": "712b62408aad514eccbeaa87aae49fcb"
+  },
+  "docs/scrollback.md": {
+    "mtime": 1786556332.3435652,
+    "ast_hash": "18f99a9635bf37d7fb5de72276b2d2fc",
+    "semantic_hash": "18f99a9635bf37d7fb5de72276b2d2fc"
+  },
+  "docs/ux-specification.md": {
+    "mtime": 1786525045.2453306,
+    "ast_hash": "8f352837c1378c5585a1974ee1a1872b",
+    "semantic_hash": "8f352837c1378c5585a1974ee1a1872b"
+  },
+  "summary.md": {
+    "mtime": 1786560545.9354765,
+    "ast_hash": "8ef4c414f8771da8c01f11c8461de578",
+    "semantic_hash": "8ef4c414f8771da8c01f11c8461de578"
+  }
+}
