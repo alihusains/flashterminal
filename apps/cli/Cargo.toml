@@ -1,0 +1,15 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "terminal"
+path = "src/main.rs"
+
+[dependencies]
+terminal-workspace = { path = "../../crates/terminal-workspace" }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "terminal-renderer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wgpu = { workspace = true }
+winit = { workspace = true }
+terminal-core = { path = "../terminal-core" }
+terminal-text = { path = "../terminal-text" }
+fontdue = { workspace = true }
+tracing = { workspace = true }
+bytemuck = { version = "1.14", features = ["derive"] }

@@ -1,0 +1,11 @@
+[package]
+name = "terminal-parser"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+vte = { workspace = true }
+terminal-core = { path = "../terminal-core" }
+tracing = { workspace = true }

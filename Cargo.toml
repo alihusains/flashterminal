@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/desktop",
+    "apps/cli",
+    "crates/terminal-core",
+    "crates/terminal-parser",
+    "crates/terminal-renderer",
+    "crates/terminal-session",
+    "crates/terminal-text",
+    "crates/terminal-workspace",
+    "crates/pty",
+    "crates/fake-agent",
+    "benchmarks",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["FlashTerminal Team"]
+license = "MIT"
+repository = "https://github.com/flashterminal/flashterminal"
+
+[workspace.dependencies]
+# Async & Concurrency
+tokio = { version = "1.35", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Terminal & PTY
+vte = "0.11"
+portable-pty = "0.8"
+unicode-width = "0.1"
+
+# GPU & UI
+wgpu = "0.19"
+winit = "0.29"
+taffy = "0.3"
+# egui = "0.24" # Considered for rapid prototyping of UI chrome
+
+# Text rendering
+fontdue = "0.9"
+swash = "0.2"
+arboard = "3.4"
+
+# Compression (cold scrollback blocks)
+flate2 = "1.0"
+
+# Persistence & Security
+rusqlite = { version = "0.30", features = ["bundled"] }
+keyring = "2.3"
+
+# SSH
+russh = "0.40"
+
+# Utilities
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+pollster = "0.3"
+bytemuck = "1.14"
+chrono = { version = "0.4", features = ["serde"] }
+crossbeam-channel = "0.5"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

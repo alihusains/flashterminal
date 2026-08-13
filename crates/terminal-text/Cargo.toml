@@ -1,0 +1,11 @@
+[package]
+name = "terminal-text"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+fontdue = { workspace = true }
+unicode-width = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,25 @@
+# Build artifacts
+target/
+**/target/
+
+# macOS
+.DS_Store
+
+# Tool caches / indexes
+.repowise/
+.codegraph/
+graphify-out/
+.pkl
+skills-lock.json
+
+# Personal agent configs (not project source)
+.claude/
+.pi/
+.vscode/
+
+# Session/scratch files
+session.md
+
+# Editor / OS noise
+.idea/
+*.swp

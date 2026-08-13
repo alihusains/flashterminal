@@ -1,0 +1,169 @@
+{
+  "date": "2026-08-12 17:24:04 UTC",
+  "latency_idle": [
+    3.77825,
+    3.798167,
+    3.8005,
+    3.8005,
+    3.716518700000001
+  ],
+  "latency_normal": [
+    3.7715829999999997,
+    3.795416,
+    3.7985,
+    3.7985,
+    3.708262499999999
+  ],
+  "latency_heavy": [
+    3.770167,
+    3.788792,
+    3.800125,
+    3.800125,
+    3.7007489999999996
+  ],
+  "latency_burst": [
+    2.48820417,
+    2.48820417,
+    2.48820417,
+    2.48820417,
+    2.48820417
+  ],
+  "backpressure": {
+    "completed": true,
+    "bytes_drained": 4689768,
+    "channel_peak_depth": 0,
+    "child_stalled": false
+  },
+  "memory": [
+    {
+      "panes": 1,
+      "app_rss_mb": 45.53125,
+      "tree_rss_mb": 64.5625,
+      "child_rss_mb": 19.03125,
+      "cpu_pct": 2.85714285714286
+    },
+    {
+      "panes": 5,
+      "app_rss_mb": 46.640625,
+      "tree_rss_mb": 79.1875,
+      "child_rss_mb": 32.546875,
+      "cpu_pct": 4.285714285714258
+    },
+    {
+      "panes": 10,
+      "app_rss_mb": 47.5625,
+      "tree_rss_mb": 97.234375,
+      "child_rss_mb": 49.671875,
+      "cpu_pct": 7.1428571428571175
+    },
+    {
+      "panes": 20,
+      "app_rss_mb": 49.28125,
+      "tree_rss_mb": 133.046875,
+      "child_rss_mb": 83.765625,
+      "cpu_pct": 17.14285714285716
+    },
+    {
+      "panes": 50,
+      "app_rss_mb": 54.953125,
+      "tree_rss_mb": 241.0,
+      "child_rss_mb": 186.046875,
+      "cpu_pct": 47.14285714285716
+    }
+  ],
+  "stress": [
+    {
+      "test": "A_idle_10",
+      "panes": 10,
+      "tree_rss_mb": 104.59375,
+      "cpu_pct": 10.163934426229496,
+      "input_p50_ms": 1.276375,
+      "input_p95_ms": 1.3095830000000002,
+      "input_p99_ms": 1.3095830000000002,
+      "input_max_ms": 1.3095830000000002,
+      "render_p95_ms": null,
+      "channel_peak_depth": 0,
+      "pty_throughput_mbps": 0.0
+    },
+    {
+      "test": "B_moderate_10",
+      "panes": 10,
+      "tree_rss_mb": 117.734375,
+      "cpu_pct": 10.163934426229496,
+      "input_p50_ms": 1.249917,
+      "input_p95_ms": 1.287375,
+      "input_p99_ms": 1.287375,
+      "input_max_ms": 1.287375,
+      "render_p95_ms": 0.012792000000000001,
+      "channel_peak_depth": 1,
+      "pty_throughput_mbps": 0.007121086120605469
+    },
+    {
+      "test": "C_heavy_10",
+      "panes": 10,
+      "tree_rss_mb": 430.65625,
+      "cpu_pct": 74.09836065573772,
+      "input_p50_ms": 0.7362920000000001,
+      "input_p95_ms": 1.284208,
+      "input_p99_ms": 1.284208,
+      "input_max_ms": 1.284208,
+      "render_p95_ms": 0.008083,
+      "channel_peak_depth": 998,
+      "pty_throughput_mbps": 36.34639930725098
+    },
+    {
+      "test": "D_heavy_20",
+      "panes": 20,
+      "tree_rss_mb": 828.03125,
+      "cpu_pct": 119.34426229508199,
+      "input_p50_ms": 0.658458,
+      "input_p95_ms": 1.290041,
+      "input_p99_ms": 1.290041,
+      "input_max_ms": 1.290041,
+      "render_p95_ms": 0.008166,
+      "channel_peak_depth": 1024,
+      "pty_throughput_mbps": 53.39975102742513
+    },
+    {
+      "test": "E_mixed_20",
+      "panes": 20,
+      "tree_rss_mb": 814.765625,
+      "cpu_pct": 42.29508196721315,
+      "input_p50_ms": 0.74325,
+      "input_p95_ms": 1.265125,
+      "input_p99_ms": 1.265125,
+      "input_max_ms": 1.265125,
+      "render_p95_ms": 0.007417,
+      "channel_peak_depth": 359,
+      "pty_throughput_mbps": 15.112466176350912
+    }
+  ],
+  "coalescing": {
+    "events": 7889283,
+    "batches": 37439,
+    "wakes": 4657,
+    "renders": 4656,
+    "events_per_frame": 1694.4336340206185,
+    "throughput_mbps": 0.8168856499054165
+  },
+  "glyph": {
+    "unique_chars": 167,
+    "cache_hits": 3340,
+    "cache_misses": 0,
+    "hit_rate": 1.0,
+    "cold_raster_ms": 0.262208,
+    "warm_pass_ms": 0.359041,
+    "retained_bytes": 10394,
+    "cache_len": 148,
+    "worst_single_raster_us": 5.25,
+    "fallback_fonts_used": 3
+  },
+  "alloc": {
+    "frames": 200,
+    "allocs_per_frame": 0.0,
+    "bytes_per_frame": 0.0,
+    "note": "state snapshot + dirty consume are stack-only (0 heap allocs/frame); worst frame 0.020 ms. GPU-side per-frame allocations (instance Vec in the renderer) are counted by the alloc_profiler bin."
+  },
+  "input_p95_under_load_ms": 1.3095830000000002,
+  "render_p95_under_load_ms": 0.012792000000000001
+}

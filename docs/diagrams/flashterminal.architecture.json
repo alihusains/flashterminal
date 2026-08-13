@@ -1,0 +1,398 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "FlashTerminal — Phase 0.5 Architecture",
+    "subtitle": "PTY → parser → single-owner state → batched GPU renderer",
+    "output": "flashterminal-architecture.html",
+    "quality_profile": "standard",
+    "views": [
+      {
+        "id": "pty-to-pixels",
+        "label": "Output path",
+        "focus": [
+          "shell",
+          "pty",
+          "reader",
+          "parser",
+          "channel",
+          "state",
+          "renderer",
+          "gpu"
+        ],
+        "note": "Follow the byte stream from the shell all the way to a presented frame."
+      },
+      {
+        "id": "glyph-pipeline",
+        "label": "Glyph pipeline",
+        "focus": [
+          "renderer",
+          "fonts",
+          "gpu"
+        ],
+        "note": "Rasterization and atlas upload feed the batched glyph pass."
+      },
+      {
+        "id": "input-commands",
+        "label": "Input path",
+        "focus": [
+          "input",
+          "pty",
+          "shell"
+        ],
+        "note": "Keys, resize, scroll, and selection flow back into the PTY."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "shell",
+      "type": "external",
+      "label": "Shell / TUI",
+      "sublabel": "child process",
+      "pos": [
+        40,
+        300
+      ],
+      "size": [
+        120,
+        60
+      ],
+      "tag": "zsh · bash · neovim"
+    },
+    {
+      "id": "pty",
+      "type": "backend",
+      "label": "PTY Manager",
+      "sublabel": "master fd · sessions",
+      "pos": [
+        220,
+        300
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "tag": "crates/pty · portable-pty"
+    },
+    {
+      "id": "reader",
+      "type": "backend",
+      "label": "IO Reader",
+      "sublabel": "reader + parser thread",
+      "pos": [
+        410,
+        300
+      ],
+      "size": [
+        130,
+        60
+      ],
+      "tag": "reader thread"
+    },
+    {
+      "id": "parser",
+      "type": "backend",
+      "label": "VT Parser",
+      "sublabel": "bytes → TerminalEvents",
+      "pos": [
+        590,
+        300
+      ],
+      "size": [
+        130,
+        60
+      ],
+      "tag": "crates/terminal-parser · vte"
+    },
+    {
+      "id": "channel",
+      "type": "messagebus",
+      "label": "Bounded Channel",
+      "sublabel": "event batches",
+      "pos": [
+        770,
+        300
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "tag": "crossbeam · cap 1024"
+    },
+    {
+      "id": "state",
+      "type": "backend",
+      "label": "Terminal State Owner",
+      "sublabel": "grid · snapshot · selection",
+      "pos": [
+        960,
+        300
+      ],
+      "size": [
+        150,
+        60
+      ],
+      "tag": "crates/terminal-core · 16 B cells"
+    },
+    {
+      "id": "renderer",
+      "type": "frontend",
+      "label": "Renderer",
+      "sublabel": "glyph atlas · instanced quads",
+      "pos": [
+        1150,
+        300
+      ],
+      "size": [
+        150,
+        60
+      ],
+      "tag": "crates/terminal-renderer · wgpu"
+    },
+    {
+      "id": "gpu",
+      "type": "external",
+      "label": "Window / GPU",
+      "sublabel": "winit surface",
+      "pos": [
+        1365,
+        300
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "tag": "Metal · compositor"
+    },
+    {
+      "id": "input",
+      "type": "frontend",
+      "label": "Input & Selection",
+      "sublabel": "keys · mouse · clipboard",
+      "pos": [
+        220,
+        470
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "tag": "winit · arboard"
+    },
+    {
+      "id": "fonts",
+      "type": "backend",
+      "label": "Font Stack",
+      "sublabel": "discovery · fallback · cache",
+      "pos": [
+        1150,
+        470
+      ],
+      "size": [
+        150,
+        60
+      ],
+      "tag": "crates/terminal-text · fontdue"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "FlashTerminal app",
+      "wraps": [
+        "pty",
+        "reader",
+        "parser",
+        "channel",
+        "state",
+        "renderer",
+        "input",
+        "fonts"
+      ],
+      "pad": 24
+    },
+    {
+      "kind": "security-group",
+      "label": "IO thread · terminal-session",
+      "wraps": [
+        "pty",
+        "reader",
+        "parser"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "UI thread · single state owner",
+      "wraps": [
+        "channel",
+        "state",
+        "renderer",
+        "input",
+        "fonts"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "shell-to-pty",
+      "from": "shell",
+      "to": "pty",
+      "label": "raw VT output",
+      "variant": "emphasis",
+      "labelDy": -38
+    },
+    {
+      "id": "pty-to-reader",
+      "from": "pty",
+      "to": "reader",
+      "label": "read(2)",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "reader-to-parser",
+      "from": "reader",
+      "to": "parser",
+      "label": "byte batches",
+      "labelDy": -38,
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "parser-to-channel",
+      "from": "parser",
+      "to": "channel",
+      "label": "TerminalEvent batches",
+      "variant": "emphasis",
+      "labelDy": -38,
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "channel-to-state",
+      "from": "channel",
+      "to": "state",
+      "label": "apply · backpressure",
+      "labelDy": -38,
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "state-to-renderer",
+      "from": "state",
+      "to": "renderer",
+      "label": "dirty rows + snapshot",
+      "variant": "emphasis",
+      "labelAt": [
+        1130,
+        384
+      ],
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "renderer-to-gpu",
+      "from": "renderer",
+      "to": "gpu",
+      "label": "present()",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "renderer-to-fonts",
+      "from": "renderer",
+      "to": "fonts",
+      "label": "glyph lookup / raster",
+      "labelAt": [
+        1260,
+        415
+      ],
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          1260,
+          360
+        ],
+        [
+          1260,
+          470
+        ]
+      ]
+    },
+    {
+      "id": "fonts-to-renderer",
+      "from": "fonts",
+      "to": "renderer",
+      "label": "raster → atlas bitmap",
+      "variant": "dashed",
+      "labelAt": [
+        1190,
+        415
+      ],
+      "fromSide": "top",
+      "toSide": "bottom",
+      "via": [
+        [
+          1190,
+          470
+        ],
+        [
+          1190,
+          360
+        ]
+      ]
+    },
+    {
+      "id": "input-to-pty",
+      "from": "input",
+      "to": "pty",
+      "label": "write() fast path (keys · resize · scroll)",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "via": [
+        [
+          290,
+          430
+        ],
+        [
+          290,
+          368
+        ]
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Threading & ownership",
+      "items": [
+        "UI thread exclusively owns TerminalState and the Renderer",
+        "Reader thread parses into compact events; no shared mutable grid",
+        "Bounded channel: backpressure instead of unbounded queues",
+        "Renderer reads RenderSnapshot + dirty rows; never mutates state"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Crates",
+      "items": [
+        "terminal-core: packed 16 B cells, Unicode clusters, snapshot + selection",
+        "terminal-parser (vte) · pty (portable-pty)",
+        "terminal-text (fontdue) → LRU glyph cache",
+        "terminal-renderer (wgpu) · terminal-session hub · desktop (winit)"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Target budgets",
+      "items": [
+        "Input latency p95 < 8 ms",
+        "Render latency p95 < 16 ms",
+        "Idle RAM < 40 MB · startup < 250 ms"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+[package]
+name = "desktop"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+terminal-core = { path = "../../crates/terminal-core" }
+terminal-session = { path = "../../crates/terminal-session" }
+terminal-workspace = { path = "../../crates/terminal-workspace" }
+terminal-renderer = { path = "../../crates/terminal-renderer" }
+terminal-text = { path = "../../crates/terminal-text" }
+pty = { path = "../../crates/pty" }
+winit = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+arboard = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

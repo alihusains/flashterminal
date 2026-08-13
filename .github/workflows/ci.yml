@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cargo check
+        run: cargo check --workspace
+
+  test:
+    name: Test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Run tests
+        run: cargo test --workspace --all-features
+
+  fmt:
+    name: Rustfmt
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  performance:
+    name: Performance Check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build release benchmark
+        run: cargo build --release -p benchmarks
+      - name: Run performance benchmarks
+        id: perf
+        run: |
+          cargo run --release -p benchmarks 2>&1 | tee /tmp/perf_report.txt
+      - name: Comment PR with performance results
+        if: github.event_name == 'pull_request' && always() && steps.perf.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('/tmp/perf_report.txt', 'utf8');
+            const json = report.match(/\{[\s\S]*?\n\}/);
+            let table = '';
+            if (json) {
+              const m = JSON.parse(json[0]);
+              table = [
+                '| Metric | Value | Budget |',
+                '|--------|-------|--------|',
+                `| Idle RAM | ${m.idle_ram_mb.toFixed(1)} MB | < 40 MB |`,
+                `| Input latency p95 (apply) | ${m.input_latency_apply_p95_ms.toFixed(2)} ms | < 8 ms |`,
+                `| Parse+apply 1M lines | ${m.parse_1m_lines_ms.toFixed(0)} ms | — |`,
+                `| Parse+apply 10M lines | ${m.parse_10m_lines_ms.toFixed(0)} ms | — |`,
+                `| Snapshot frame (200×60) | ${m.snapshot_frame_us.toFixed(2)} µs | — |`,
+                `| Render prep 10K rows | ${m.render_prep_10k_rows_ms.toFixed(2)} ms | — |`,
+                `| Glyph rasterize | ${m.glyph_raster_us_per_glyph.toFixed(3)} µs | — |`,
+                `| Grid 10M cells | ${m.grid_10m_cells_mb.toFixed(1)} MB | — |`,
+                `| Cell size | ${m.cell_bytes} B | ≤ 16 B |`,
+              ].join('\n');
+            } else {
+              table = '```\n' + report.slice(-2000) + '\n```';
+            }
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Performance Check\n${table}\n\nSee the full report in \`docs/performance-report.md\`.`
+            })
