@@ -115,6 +115,11 @@ pub enum ApplicationEvent {
     TaskEvent {
         event: crate::orchestration::TaskEvent,
     },
+    /// Phase 3B: planning lifecycle events (3b.md §24 — published on the
+    /// same ApplicationEvent bus).
+    PlannerEvent {
+        event: crate::planning::PlannerEvent,
+    },
 }
 
 /// Semantic events specific to agent sessions.

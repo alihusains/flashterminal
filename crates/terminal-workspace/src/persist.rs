@@ -105,6 +105,7 @@ mod tests {
             workspaces: vec![ws],
             active_workspace: Some(ws_id),
             tasks: None,
+            worktrees: None,
         }
     }
 

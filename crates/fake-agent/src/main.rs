@@ -11,8 +11,13 @@
 //! - `--scenario auth-failure` : Prints auth error and exits 2
 //! - `--scenario flaky` : Fails with exit 3 on attempt 1, succeeds on
 //!   `--attempt N` whenever N > 1 (deterministic retry fixture)
+//! - `--scenario modify` : Phase 3C worktree fixture — writes files listed
+//!   via `--write-file <relpath>` (content = `--set-content <text>` or a
+//!   deterministic default), then exits 0. Runs in the agent's cwd, so in
+//!   an isolated worktree it only ever touches that worktree.
 
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,6 +39,26 @@ fn main() {
         .position(|a| a == "--duration")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok());
+    // Phase 3C: files to write under the agent cwd (relative paths only).
+    let write_files: Vec<String> = args
+        .iter()
+        .position(|a| a == "--write-file")
+        .map(|start| {
+            let mut v = Vec::new();
+            let mut i = start + 1;
+            while i < args.len() && args[i] != "--set-content" && args[i] != "--duration" {
+                v.push(args[i].clone());
+                i += 1;
+            }
+            v
+        })
+        .unwrap_or_default();
+    let content: String = args
+        .iter()
+        .position(|a| a == "--set-content")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "change from fake-agent\n".to_string());
     // `--echo <text>` prints the given text first (secret-safety tests use
     // this to prove redaction works end-to-end: the agent emits a sentinel
     // and the pipeline must mask it everywhere).
@@ -111,6 +136,52 @@ fn main() {
                 std::process::exit(3);
             }
             println!("Task completed successfully (attempt {attempt}).");
+            std::process::exit(0);
+        }
+        "modify" => {
+            for rel in &write_files {
+                let path = Path::new(rel);
+                // Refuse absolute/escaping paths (worktree fixture safety).
+                if path.is_absolute() || rel.contains("..") || rel.contains("\\") {
+                    eprintln!("refusing unsafe path {rel}");
+                    std::process::exit(1);
+                }
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let mut f = std::fs::File::create(path).expect("write file");
+                use std::io::Write as _;
+                f.write_all(content.as_bytes()).expect("write content");
+                println!("Modified {rel}");
+            }
+            // Phase 3C: a real coding agent commits its work to its feature
+            // branch — the artifact the review/merge lifecycle consumes.
+            // Commit in the agent's cwd (the worktree) so the branch
+            // actually diverges from the base (§22 merge needs a commit).
+            let _ = std::process::Command::new("git")
+                .args(["add", "-A"])
+                .status();
+            let _ = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=fake-agent",
+                    "-c",
+                    "user.email=fake-agent@flashterminal.local",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "fake-agent: apply task changes",
+                ])
+                .status();
+            println!("Task completed successfully.");
+            // `--duration <secs>` keeps the modified worktree alive (the
+            // cancellation fixture, 3c.md §42 — cancel while working).
+            if let Some(secs) = duration_secs {
+                let deadline = Instant::now() + Duration::from_secs(secs);
+                while Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
             std::process::exit(0);
         }
         "crash" => {

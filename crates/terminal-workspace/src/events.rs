@@ -60,6 +60,9 @@ pub struct EventFilter {
     pub notification: bool,
     #[serde(default)]
     pub task: bool,
+    /// Phase 3B: planner lifecycle events (3b.md §24).
+    #[serde(default)]
+    pub planner: bool,
 }
 
 impl EventFilter {
@@ -71,6 +74,7 @@ impl EventFilter {
             agent: true,
             notification: true,
             task: true,
+            planner: true,
         }
     }
 
@@ -88,6 +92,7 @@ impl EventFilter {
             ApplicationEvent::SessionExited { .. } => self.terminal || self.agent,
             ApplicationEvent::AgentEvent { .. } => self.agent,
             ApplicationEvent::TaskEvent { .. } => self.task,
+            ApplicationEvent::PlannerEvent { .. } => self.planner,
         }
     }
 }
@@ -122,6 +127,9 @@ fn is_critical(event: &ApplicationEvent) -> bool {
             event: TaskEvent::TaskArtifactCreated { .. },
         } => false,
         ApplicationEvent::TaskEvent { .. } => true,
+        // Planner events are low-frequency lifecycle transitions (approval
+        // gates, execution start) — never dropped for a live subscriber.
+        ApplicationEvent::PlannerEvent { .. } => true,
     }
 }
 

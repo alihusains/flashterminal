@@ -1,0 +1,36 @@
+{
+  "goal": "Fix the failing tests",
+  "tasks": [
+    {
+      "id": "investigate",
+      "title": "Investigate test failures",
+      "description": "Run the suite and capture the failing test names and stack traces.",
+      "agent": "fake-agent",
+      "depends_on": [],
+      "reason": "grounding step",
+      "confidence": 0.9
+    },
+    {
+      "id": "fix",
+      "title": "Implement fixes",
+      "description": "Fix the root causes identified during investigation.",
+      "agent": "fake-agent",
+      "depends_on": ["investigate"],
+      "reason": "implementation step",
+      "confidence": 0.8
+    },
+    {
+      "id": "verify",
+      "title": "Run the tests again",
+      "description": "Re-run the suite and confirm the previously failing tests pass.",
+      "agent": "fake-agent",
+      "depends_on": ["fix"],
+      "reason": "verification step",
+      "confidence": 0.85
+    }
+  ],
+  "reasoning_summary": "Investigate first, fix the root cause, then verify the whole suite.",
+  "estimated_cost_cents": 95,
+  "estimated_duration_min": 18,
+  "warnings": []
+}

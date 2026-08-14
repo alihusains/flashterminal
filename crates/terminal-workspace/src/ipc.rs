@@ -185,6 +185,54 @@ pub enum Request {
     WorkflowValidate,
     /// `scheduler.status()` — full orchestration snapshot.
     SchedulerStatus,
+    // --- Phase 3B: planner surface (3b.md §43–§44, §16–§19, §23, §26) ---
+    /// Routes a natural-language request through the planner. Simple
+    /// intents are bypassed deterministically (see §43–§44).
+    PlanCreate {
+        intent: String,
+    },
+    PlanStatus,
+    PlanApprove,
+    PlanReject {
+        reason: String,
+    },
+    PlanEdit {
+        change: terminal_session::planning::PlanEditChange,
+    },
+    PlanValidate,
+    PlanExecute,
+    PlanResume,
+    PlanCancel,
+    PlannerMetrics,
+    // --- Phase 3C: worktree surface (3c.md §44, §52) ---
+    WorktreeList,
+    WorktreeInspect {
+        worktree_id: String,
+    },
+    WorktreeDiff {
+        worktree_id: String,
+    },
+    /// §22 explicit merge (only from Approved; never automatic).
+    WorktreeMerge {
+        worktree_id: String,
+        target_branch: String,
+    },
+    /// §30 explicit discard — never automatic.
+    WorktreeDiscard {
+        worktree_id: String,
+    },
+    /// §30 configured-cleanup sweep.
+    WorktreeCleanup,
+    /// §31 orphans (never auto-deleted — surfaced for review).
+    WorktreeOrphans,
+    /// §29 execution-environment preview for a task.
+    TaskEnvironmentPreview {
+        task_id: TaskId,
+    },
+    WorktreeBudget,
+    SetWorktreeBudget {
+        max_worktrees: usize,
+    },
 }
 
 /// Application → client responses.
@@ -239,7 +287,10 @@ pub enum Response {
         tasks: Vec<Task>,
     },
     TaskStatus {
-        task: Task,
+        /// Boxed: `Task` carries the full result (incl. worktree diff
+        /// provenance) and `Response` rides the socket — keep the enum
+        /// small by value (clippy::large_enum_variant).
+        task: Box<Task>,
     },
     TaskPolicy {
         policy: TaskPolicy,
@@ -249,6 +300,35 @@ pub enum Response {
     },
     WorkflowValidation {
         issues: Vec<String>,
+    },
+    // --- Phase 3B: planner responses ---
+    PlanStatus {
+        status: terminal_session::planning::PlannerStatus,
+    },
+    PlannerMetrics {
+        metrics: terminal_session::planning::PlannerMetrics,
+    },
+    // --- Phase 3C: worktree responses ---
+    Worktrees {
+        worktrees: Vec<terminal_session::worktrees::WorktreeRecord>,
+    },
+    WorktreeInspection {
+        inspection: terminal_session::worktrees::WorktreeInspection,
+    },
+    WorktreeDiff {
+        diff: terminal_session::worktrees::DiffSummary,
+    },
+    WorktreeMerge {
+        outcome: terminal_session::worktrees::MergeOutcome,
+    },
+    WorktreeOrphans {
+        worktrees: Vec<terminal_session::worktrees::WorktreeRecord>,
+    },
+    TaskEnvironmentPreview {
+        environment: Option<terminal_session::worktrees::ExecutionEnvironment>,
+    },
+    WorktreeBudget {
+        budget: terminal_session::worktrees::WorktreeBudget,
     },
     Err {
         message: String,
@@ -711,7 +791,9 @@ pub fn handle(engine: &mut crate::engine::Multiplexer, req: Request) -> Response
             tasks: engine.task_list().into_iter().cloned().collect(),
         },
         Request::TaskStatus { task_id } => match engine.task_get(&task_id) {
-            Some(task) => Response::TaskStatus { task: task.clone() },
+            Some(task) => Response::TaskStatus {
+                task: Box::new(task.clone()),
+            },
             None => Response::err(format!("unknown task {task_id}")),
         },
         Request::TaskRun => {
@@ -769,6 +851,112 @@ pub fn handle(engine: &mut crate::engine::Multiplexer, req: Request) -> Response
         Request::SchedulerStatus => Response::SchedulerStatus {
             status: engine.scheduler_status(),
         },
+        // --- Phase 3B: planner dispatch (3b.md §43–§44, §16–§19, §23, §26) ---
+        Request::PlanCreate { intent } => match engine.plan_request(&intent) {
+            Ok(()) => Response::PlanStatus {
+                status: engine.planner_status(),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::PlanStatus => Response::PlanStatus {
+            status: engine.planner_status(),
+        },
+        Request::PlanApprove => match engine.plan_approve() {
+            Ok(()) => Response::Ok {
+                message: "plan approved".into(),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::PlanReject { reason } => match engine.plan_reject(&reason) {
+            Ok(()) => Response::Ok {
+                message: "plan rejected".into(),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::PlanEdit { change } => match engine.plan_edit(&change) {
+            Ok(()) => Response::Ok {
+                message: "plan edited".into(),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::PlanValidate => match engine.plan_validate() {
+            Ok(()) => Response::Ok {
+                message: "plan valid".into(),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::PlanExecute => match engine.plan_execute() {
+            Ok(ids) => Response::Ok {
+                message: format!("plan execution started ({} task(s))", ids.len()),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::PlanResume => match engine.plan_resume() {
+            Ok(ids) => Response::Ok {
+                message: format!("plan resumed ({} task(s))", ids.len()),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::PlanCancel => {
+            engine.plan_cancel();
+            Response::Ok {
+                message: "plan cancelled".into(),
+            }
+        }
+        Request::PlannerMetrics => Response::PlannerMetrics {
+            metrics: engine.planner_metrics(),
+        },
+        Request::WorktreeList => Response::Worktrees {
+            worktrees: engine.worktree_list(),
+        },
+        Request::WorktreeInspect { worktree_id } => match engine.worktree_inspect(&worktree_id) {
+            Ok(inspection) => Response::WorktreeInspection { inspection },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::WorktreeDiff { worktree_id } => match engine.worktree_diff(&worktree_id) {
+            Ok(diff) => Response::WorktreeDiff { diff },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::WorktreeMerge {
+            worktree_id,
+            target_branch,
+        } => match engine.worktree_merge(&worktree_id, &target_branch) {
+            Ok(outcome) => Response::WorktreeMerge { outcome },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::WorktreeDiscard { worktree_id } => match engine.worktree_discard(&worktree_id) {
+            Ok(()) => Response::Ok {
+                message: "worktree discarded".into(),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::WorktreeCleanup => {
+            let errors = engine.worktree_cleanup();
+            if errors.is_empty() {
+                Response::Ok {
+                    message: "cleanup complete".into(),
+                }
+            } else {
+                Response::err(errors.join("; "))
+            }
+        }
+        Request::WorktreeOrphans => Response::WorktreeOrphans {
+            worktrees: engine.worktree_orphans(),
+        },
+        Request::TaskEnvironmentPreview { task_id } => Response::TaskEnvironmentPreview {
+            environment: engine.task_environment_preview(&task_id),
+        },
+        Request::WorktreeBudget => Response::WorktreeBudget {
+            budget: engine.worktree_budget(),
+        },
+        Request::SetWorktreeBudget { max_worktrees } => {
+            let mut budget = engine.worktree_budget();
+            budget.max_worktrees = max_worktrees;
+            engine.set_worktree_budget(budget);
+            Response::Ok {
+                message: "worktree budget updated".into(),
+            }
+        }
     }
 }
 
@@ -911,6 +1099,36 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Phase 3B: plan create → status → approve → execute over the socket
+    /// (a real provider is not required — the mock lives in tests/phase3b;
+    /// here we verify the request/response surface and the approval gate).
+    #[test]
+    fn socket_plan_approval_gate() {
+        let engine = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::engine::Multiplexer::new().unwrap(),
+        ));
+        let path = std::env::temp_dir().join(format!("ft-ipc-plan-{}.sock", std::process::id()));
+        serve(engine, &path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // No provider configured → planning unavailable, terminal keeps
+        // working (§46).
+        let r = roundtrip(
+            &path,
+            &Request::PlanCreate {
+                intent: "build auth".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(r, Response::Err { .. }));
+        let r = roundtrip(&path, &Request::PlanStatus).unwrap();
+        assert!(matches!(r, Response::PlanStatus { .. }));
+        let r = roundtrip(&path, &Request::PlanApprove).unwrap();
+        assert!(matches!(r, Response::Err { .. }));
+        let r = roundtrip(&path, &Request::PlannerMetrics).unwrap();
+        assert!(matches!(r, Response::PlannerMetrics { .. }));
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn socket_task_lifecycle_and_scheduler() {
         let engine = std::sync::Arc::new(std::sync::Mutex::new(
@@ -993,6 +1211,61 @@ mod tests {
         // Cancel a task that never ran.
         let cancel = roundtrip(&path, &Request::TaskCancel { task_id }).unwrap();
         assert!(matches!(cancel, Response::Ok { .. }));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phase 3C: worktree surface round-trips (3c.md §44, §52). No git
+    /// repository is needed — the engine degrades gracefully; the surface
+    /// itself must be correct and typed.
+    #[test]
+    fn socket_worktree_surface() {
+        let engine = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::engine::Multiplexer::new().unwrap(),
+        ));
+        let path = std::env::temp_dir().join(format!("ft-ipc-wt-{}.sock", std::process::id()));
+        serve(engine, &path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let list = roundtrip(&path, &Request::WorktreeList).unwrap();
+        assert!(matches!(list, Response::Worktrees { worktrees } if worktrees.is_empty()));
+        let orphans = roundtrip(&path, &Request::WorktreeOrphans).unwrap();
+        assert!(matches!(orphans, Response::WorktreeOrphans { worktrees } if worktrees.is_empty()));
+        let budget = roundtrip(&path, &Request::WorktreeBudget).unwrap();
+        let Response::WorktreeBudget { budget } = budget else {
+            panic!("expected budget response");
+        };
+        assert!(budget.max_worktrees > 0);
+        let set = roundtrip(&path, &Request::SetWorktreeBudget { max_worktrees: 4 }).unwrap();
+        assert!(matches!(set, Response::Ok { .. }));
+        // Unknown worktree ids fail with typed errors, never panics.
+        let inspect = roundtrip(
+            &path,
+            &Request::WorktreeInspect {
+                worktree_id: "wt-nope".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(inspect, Response::Err { .. }));
+        let merge = roundtrip(
+            &path,
+            &Request::WorktreeMerge {
+                worktree_id: "wt-nope".into(),
+                target_branch: "main".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(merge, Response::Err { .. }));
+        let discard = roundtrip(
+            &path,
+            &Request::WorktreeDiscard {
+                worktree_id: "wt-nope".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(discard, Response::Err { .. }));
+        // Cleanup over an empty manager reports success.
+        let cleanup = roundtrip(&path, &Request::WorktreeCleanup).unwrap();
+        assert!(matches!(cleanup, Response::Ok { .. }));
         let _ = std::fs::remove_file(&path);
     }
 }

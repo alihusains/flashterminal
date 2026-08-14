@@ -25,9 +25,11 @@ pub mod credential;
 pub mod execution;
 pub mod launch;
 pub mod orchestration;
+pub mod planning;
 pub mod provider;
 pub mod redact;
 pub mod work;
+pub mod worktrees;
 
 use crossbeam_channel::{bounded, Receiver};
 use pty::{PtyManager, ReadResult};

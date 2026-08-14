@@ -21,6 +21,7 @@
 
 use crate::execution::{AgentState, ExecutionId};
 use crate::work::{now_ms, AgentWork, ErrorKind, WorkError};
+use crate::worktrees::{DiffSummary, DirtyPolicy, IsolationMode, RetryWorktreePolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
@@ -357,6 +358,25 @@ pub struct TaskResult {
     pub agent_execution_id: Option<ExecutionId>,
     pub attempt_count: u32,
     pub estimated_cost_cents: Option<u64>,
+    // --- Phase 3C (3c.md §17): worktree provenance of this execution ---
+    /// Base commit the isolated worktree was created from (§8).
+    #[serde(default)]
+    pub base_revision: Option<String>,
+    /// Worktree HEAD when the agent finished (§17).
+    #[serde(default)]
+    pub result_revision: Option<String>,
+    /// Feature branch the worktree ran on.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Worktree path the agent ran in.
+    #[serde(default)]
+    pub worktree: Option<String>,
+    /// Deterministic diff vs the base revision (§18 — never the agent's
+    /// own summary). Boxed: the summary is large and this value rides in
+    /// `TaskEvent`/`ApplicationEvent`, which must stay small by value
+    /// (clippy::large_enum_variant).
+    #[serde(default)]
+    pub diff_summary: Option<Box<DiffSummary>>,
 }
 
 impl TaskResult {
@@ -380,6 +400,11 @@ impl Default for TaskResult {
             agent_execution_id: None,
             attempt_count: 0,
             estimated_cost_cents: None,
+            base_revision: None,
+            result_revision: None,
+            branch: None,
+            worktree: None,
+            diff_summary: None,
         }
     }
 }
@@ -412,6 +437,20 @@ pub struct Task {
     pub arguments: Vec<String>,
     pub environment: Vec<(String, String)>,
     pub review_required: bool,
+    // --- Phase 3C (3c.md §2, §4, §10, §28, §45) ---
+    /// Execution isolation mode. Coding tasks default to GitWorktree.
+    #[serde(default)]
+    pub isolation: IsolationMode,
+    /// Explicit opt-in for shared-workspace execution (§28) — never the
+    /// default for coding tasks.
+    #[serde(default)]
+    pub requires_shared_workspace: bool,
+    /// The worktree this task currently owns (at most one active, §10).
+    #[serde(default)]
+    pub worktree_id: Option<String>,
+    /// Slug used for the deterministic branch name (§7).
+    #[serde(default)]
+    pub slug: String,
     pub attempt_count: u32,
     pub created_at_ms: u64,
     pub started_at_ms: Option<u64>,
@@ -461,6 +500,10 @@ impl Task {
             arguments: Vec::new(),
             environment: Vec::new(),
             review_required: false,
+            isolation: IsolationMode::default(),
+            requires_shared_workspace: false,
+            worktree_id: None,
+            slug: String::new(),
             attempt_count: 0,
             created_at_ms: now_ms(),
             started_at_ms: None,
@@ -979,6 +1022,20 @@ pub struct TaskPolicy {
     /// knows the remaining budget is exhausted it blocks further starts
     /// (§37 — never overspend automatically).
     pub max_cost_cents: Option<u64>,
+    // --- Phase 3C (3c.md §10, §14, §47) ---
+    /// Retry worktree policy: fresh or reused on retry (explicit choice).
+    #[serde(default)]
+    pub retry_worktree: RetryWorktreePolicy,
+    /// Dirty-workspace policy for isolated work (never discards user work).
+    #[serde(default)]
+    pub dirty: DirtyPolicy,
+    /// Hard cap on worktrees the engine may create.
+    #[serde(default = "default_max_worktrees")]
+    pub max_worktrees: usize,
+}
+
+fn default_max_worktrees() -> usize {
+    32
 }
 
 impl Default for TaskPolicy {
@@ -990,6 +1047,9 @@ impl Default for TaskPolicy {
             review_required: false,
             retry: RetryPolicy::default(),
             max_cost_cents: None,
+            retry_worktree: RetryWorktreePolicy::Fresh,
+            dirty: DirtyPolicy::default(),
+            max_worktrees: default_max_worktrees(),
         }
     }
 }
@@ -1072,7 +1132,12 @@ pub enum TaskEvent {
     },
     TaskCompleted {
         task_id: TaskId,
-        result: TaskResult,
+        /// Boxed: `TaskResult` carries the worktree diff provenance and
+        /// this event rides the `ApplicationEvent` bus, which must stay
+        /// small by value (clippy::large_enum_variant). No consumer
+        /// destructures the result from the event — the engine reads it
+        /// from the task graph.
+        result: Box<TaskResult>,
     },
     TaskFailed {
         task_id: TaskId,
@@ -1476,6 +1541,14 @@ impl TaskScheduler {
                 agent_execution_id: Some(eid.clone()),
                 attempt_count: task.attempt_count,
                 estimated_cost_cents: agent.estimated_cost_cents,
+                // Phase 3C: worktree provenance is patched by the engine's
+                // environment layer after completion (§17) — the scheduler
+                // stays pure (no git).
+                base_revision: None,
+                result_revision: None,
+                branch: None,
+                worktree: None,
+                diff_summary: None,
             };
             task.result = Some(result.clone());
             (needs_review, result, artifact_events)
@@ -1514,7 +1587,7 @@ impl TaskScheduler {
             self.completed_count += 1;
             self.emit(TaskEvent::TaskCompleted {
                 task_id: task_id.clone(),
-                result,
+                result: Box::new(result),
             });
         }
     }
@@ -1706,7 +1779,7 @@ impl TaskScheduler {
             self.completed_count += 1;
             self.emit(TaskEvent::TaskCompleted {
                 task_id: task_id.clone(),
-                result,
+                result: Box::new(result),
             });
         } else {
             let err = TaskError::new(

@@ -831,6 +831,22 @@ impl AgentRuntime {
         self.registry.find_adapter(id)
     }
 
+    /// The agent registry (3b.md §5 — planner context building and §14
+    /// plan validation consult the engine's authoritative registry).
+    pub fn registry(&self) -> &AgentRegistry {
+        &self.registry
+    }
+
+    /// Provider ids the user may select for the planner (3b.md §35 — the
+    /// planner reuses the existing ProviderRegistry, never a second one).
+    pub fn provider_ids(&self) -> Vec<String> {
+        self.providers
+            .list_providers()
+            .iter()
+            .map(|p| p.id.clone())
+            .collect()
+    }
+
     pub fn get_session(&self, eid: &ExecutionId) -> Option<AgentSnapshot> {
         // Locks are taken sequentially (work first, then session) — never
         // nested (2B.1 deadlock rule). The pump follows the same order.

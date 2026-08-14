@@ -170,6 +170,10 @@ fn main() -> Result<()> {
         "agent" => agent_cmd(&args[1..])?,
         "task" => task_cmd(&args[1..])?,
         "tasks" => Request::TaskList,
+        // Phase 3B: `terminal plan create|status|approve|reject|edit|validate|execute|resume|cancel|metrics`.
+        "plan" => plan_cmd(&args[1..])?,
+        // Phase 3C: `terminal worktree list|inspect|diff|merge|discard|cleanup|orphans|budget`.
+        "worktree" | "worktrees" => worktree_cmd(&args[1..])?,
         // §42 workflow commands: list = task list, validate = graph check.
         "workflow" => match args.get(1).map(|s| s.as_str()) {
             Some("list") => Request::TaskList,
@@ -350,7 +354,7 @@ fn pane_cmd(args: &[String]) -> Result<Request> {
 fn task_cmd(args: &[String]) -> Result<Request> {
     let Some(cmd) = args.first() else {
         bail!(
-            "usage: terminal task create|list|status|run|cancel|retry|review|attach|validate|policy|scheduler"
+            "usage: terminal task create|list|status|run|cancel|retry|review|attach|environment|validate|policy|scheduler"
         );
     };
     Ok(match cmd.as_str() {
@@ -410,10 +414,92 @@ fn task_cmd(args: &[String]) -> Result<Request> {
         "attach" => Request::TaskAttachPane {
             task_id: required(args, 1, "attach <task-id>")?,
         },
+        // Phase 3C §29: execution-environment preview for a task.
+        "environment" | "env" => Request::TaskEnvironmentPreview {
+            task_id: required(args, 1, "environment <task-id>")?,
+        },
         "validate" => Request::WorkflowValidate,
         "policy" => Request::TaskPolicy,
         "scheduler" => Request::SchedulerStatus,
         other => bail!("unknown task command `{other}`"),
+    })
+}
+
+/// Phase 3B (3b.md §16–§19, §23, §26, §43–§44): `terminal plan
+/// create|status|approve|reject|edit|validate|execute|resume|cancel|metrics`.
+/// Phase 3C: `terminal worktree ...` — worktree management surface
+/// (3c.md §44, §52). Git operations run in the engine, never here.
+fn worktree_cmd(args: &[String]) -> Result<Request> {
+    let Some(cmd) = args.first() else {
+        bail!("usage: terminal worktree list|inspect|diff|merge|discard|cleanup|orphans|budget");
+    };
+    Ok(match cmd.as_str() {
+        "list" | "ls" => Request::WorktreeList,
+        "inspect" | "status" => Request::WorktreeInspect {
+            worktree_id: required(args, 1, "inspect <worktree-id>")?,
+        },
+        "diff" => Request::WorktreeDiff {
+            worktree_id: required(args, 1, "diff <worktree-id>")?,
+        },
+        // terminal worktree merge <worktree-id> [target-branch]
+        "merge" => Request::WorktreeMerge {
+            worktree_id: required(args, 1, "merge <worktree-id> [target-branch]")?,
+            target_branch: args.get(2).cloned().unwrap_or_else(|| "main".into()),
+        },
+        "discard" => Request::WorktreeDiscard {
+            worktree_id: required(args, 1, "discard <worktree-id>")?,
+        },
+        "cleanup" => Request::WorktreeCleanup,
+        "orphans" => Request::WorktreeOrphans,
+        "budget" => Request::WorktreeBudget,
+        other => bail!("unknown worktree command `{other}`"),
+    })
+}
+
+fn plan_cmd(args: &[String]) -> Result<Request> {
+    let Some(cmd) = args.first() else {
+        bail!(
+            "usage: terminal plan create|status|approve|reject|edit|validate|execute|resume|cancel|metrics"
+        );
+    };
+    Ok(match cmd.as_str() {
+        "create" => Request::PlanCreate {
+            intent: args.get(1).cloned().unwrap_or_else(|| "".into()),
+        },
+        "status" | "show" => Request::PlanStatus,
+        "approve" => Request::PlanApprove,
+        "reject" => Request::PlanReject {
+            reason: args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "rejected via CLI".into()),
+        },
+        // terminal plan edit <set-agent|set-deps> <step-id> [value]
+        "edit" => {
+            let kind = required(args, 1, "edit <set-agent|set-deps> <step-id> [value]")?;
+            let step_id = required(args, 2, "edit <set-agent|set-deps> <step-id> [value]")?;
+            match kind.as_str() {
+                "set-agent" => Request::PlanEdit {
+                    change: terminal_workspace::terminal_session::planning::PlanEditChange::SetAgent {
+                        step_id,
+                        agent: required(args, 3, "edit set-agent <step-id> <agent>")?,
+                    },
+                },
+                "set-deps" => Request::PlanEdit {
+                    change: terminal_workspace::terminal_session::planning::PlanEditChange::SetDependencies {
+                        step_id,
+                        dependencies: args[3..].to_vec(),
+                    },
+                },
+                other => bail!("unknown plan edit kind `{other}`"),
+            }
+        }
+        "validate" => Request::PlanValidate,
+        "execute" | "run" => Request::PlanExecute,
+        "resume" => Request::PlanResume,
+        "cancel" => Request::PlanCancel,
+        "metrics" => Request::PlannerMetrics,
+        other => bail!("unknown plan command `{other}`"),
     })
 }
 
@@ -768,6 +854,162 @@ fn print_response(resp: Response) {
                 }
             }
         }
+        // --- Phase 3B printers (§42 plan preview, §39 metrics) ---
+        Response::PlanStatus { status } => {
+            println!("plan: {:?}", status.phase);
+            if let Some(intent) = &status.intent {
+                println!("  intent: {intent}");
+            }
+            if let Some(err) = &status.last_error {
+                println!("  error: {err}");
+            }
+            if let Some(plan) = &status.plan {
+                println!("  goal: {}", plan.goal);
+                for s in &status.steps {
+                    let agent = s
+                        .step
+                        .agent_recommendation
+                        .as_ref()
+                        .map(|r| r.agent_definition_id.as_str())
+                        .unwrap_or("(unassigned)");
+                    println!(
+                        "  [{}] {} — {} ({agent})",
+                        s.status.symbol(),
+                        s.step.id,
+                        s.step.title
+                    );
+                    if !s.step.depends_on.is_empty() {
+                        println!("       depends on: {}", s.step.depends_on.join(", "));
+                    }
+                }
+                if let Some(cost) = plan.estimated_cost_cents {
+                    println!("  estimated: ${}.{:02}", cost / 100, cost % 100);
+                }
+                if let Some(min) = plan.estimated_duration_min {
+                    println!("  duration: ~{min} min");
+                }
+            }
+            if status.edited {
+                println!("  edited: yes");
+            }
+            println!("  parallelism: {}", status.parallelism);
+        }
+        Response::PlannerMetrics { metrics } => {
+            println!(
+                "planner: generated {} · valid {} · invalid {} · unknown-agent {} · cycles {} · budget-violations {} · parallelism-violations {} · human edits {} · rejections {} · executions {} ok / {} failed · bypassed {}",
+                metrics.plans_generated,
+                metrics.plans_valid,
+                metrics.plans_invalid,
+                metrics.unknown_agent_count,
+                metrics.cycle_count,
+                metrics.budget_violation_count,
+                metrics.parallelism_violation_count,
+                metrics.human_edits,
+                metrics.human_rejections,
+                metrics.executions_succeeded,
+                metrics.executions_failed,
+                metrics.bypassed_intents,
+            );
+        }
+        // --- Phase 3C worktree printers (3c.md §52, §29) ---
+        Response::Worktrees { worktrees } => {
+            if worktrees.is_empty() {
+                println!("no worktrees");
+            }
+            for w in &worktrees {
+                let owner = w.task_id.as_deref().unwrap_or("<orphan>");
+                let orphan = if w.orphaned { " (orphaned)" } else { "" };
+                println!(
+                    "{} [{}] {} — {} · task {owner}{orphan}",
+                    w.id,
+                    w.state.label(),
+                    w.branch,
+                    w.path
+                );
+            }
+        }
+        Response::WorktreeInspection { inspection } => {
+            println!(
+                "{} — {} [{}] @ {}",
+                inspection.id,
+                inspection.path,
+                inspection.branch.unwrap_or_default(),
+                inspection.head
+            );
+            if !inspection.exists {
+                println!("  (directory missing)");
+            }
+        }
+        Response::WorktreeDiff { diff } => {
+            println!(
+                "{} file(s) changed · +{} −{} ({} created, {} deleted)",
+                diff.files_total(),
+                diff.insertions,
+                diff.deletions,
+                diff.files_created.len(),
+                diff.files_deleted.len()
+            );
+            for f in &diff.files_changed {
+                println!("  ~ {f}");
+            }
+            for f in &diff.files_created {
+                println!("  + {f}");
+            }
+            for f in &diff.files_deleted {
+                println!("  - {f}");
+            }
+            if let Some(base) = &diff.base_revision {
+                println!("  base: {base}");
+            }
+            if let Some(res) = &diff.result_revision {
+                println!("  result: {res}");
+            }
+        }
+        Response::WorktreeMerge { outcome } => match outcome {
+            terminal_workspace::terminal_session::worktrees::MergeOutcome::Merged { commit } => {
+                println!("merged: {commit}");
+            }
+            terminal_workspace::terminal_session::worktrees::MergeOutcome::Conflict(c) => {
+                println!("merge conflict — no changes were made:");
+                for f in &c.files {
+                    println!("  ! {f}");
+                }
+            }
+        },
+        Response::WorktreeOrphans { worktrees } => {
+            if worktrees.is_empty() {
+                println!("no orphaned worktrees");
+            } else {
+                println!(
+                    "{} orphaned worktree(s) — review, never auto-deleted:",
+                    worktrees.len()
+                );
+                for w in &worktrees {
+                    println!("  {} — {} [{}]", w.id, w.branch, w.state.label());
+                }
+            }
+        }
+        Response::TaskEnvironmentPreview { environment } => match environment {
+            Some(e) => {
+                println!("Execution Environment");
+                println!("  Repository:    {}", e.repository);
+                println!(
+                    "  Base:          {}",
+                    e.base_branch.as_deref().unwrap_or("").to_owned()
+                        + &e.base_revision
+                            .as_ref()
+                            .map(|r| format!(" @ {r}"))
+                            .unwrap_or_default()
+                );
+                println!("  Isolation:     {}", e.isolation.label());
+                println!("  Branch:        {}", e.branch.as_deref().unwrap_or(""));
+                println!("  Working dir:   {}", e.working_directory);
+            }
+            None => println!("no environment (task not scheduled yet)"),
+        },
+        Response::WorktreeBudget { budget } => {
+            println!("max_worktrees: {}", budget.max_worktrees);
+        }
         Response::Subscribed { .. } => {
             // Only reachable through the streaming path; handled in
             // `agent_watch` before any roundtrip.
@@ -821,6 +1063,15 @@ fn print_help() {
          terminal task set-policy <max-parallel|max-agents|max-cost-cents|max-retries> <value>\n\
          terminal task scheduler\n\
          terminal task validate\n\
-         terminal workflow list|validate"
+         terminal workflow list|validate\n\
+         terminal plan create <intent>          # LLM-planned workflow (validated, needs approval)\n\
+         terminal plan status\n\
+         terminal plan approve|reject\n\
+         terminal plan edit <set-agent|set-deps> <step-id> [value]\n\
+         terminal plan validate|execute|resume|cancel\n\
+         terminal plan metrics\n\
+         terminal worktree list|orphans|cleanup|budget\n\
+         terminal worktree inspect|diff|merge|discard <worktree-id>\n\
+         terminal task environment <task-id>     # execution-environment preview"
     );
 }

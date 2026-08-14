@@ -189,6 +189,50 @@ all routed through one `run_command` dispatch. CLI adds
 <id>`. Full surface: `docs/agent-observability.md`; verification truth
 table: `docs/phase2c-verification.md`.
 
+## Planner + Worktree Isolation (Phase 3B / 3C)
+
+Phase 3B (`planning.rs`) adds a planner whose only output is a *proposal*:
+`classify_intent` deterministically bypasses simple commands, and every
+plan passes the schema parser, `PlanValidator`, and compiler before the
+scheduler (authoritative) executes it. Engine surfaces: `plan_request /
+validate / approve / reject / edit / execute / resume / cancel`, planner
+events on the bus (`EventFilter.planner`), IPC + CLI `terminal plan …`.
+Docs: `docs/phase3b.md`.
+
+Phase 3C (`worktrees.rs`) isolates every coding task in its own `git
+worktree`:
+
+```text
+task_spawn ──► resolve_execution_environment ──► WorktreeManager
+                 ├─ git worktree add -b flash/task/<id>-<slug> (base revision)
+                 └─ ExecutionEnvironment ──► launch cwd = worktree path
+                     (wrong-cwd guard before spawn, 3c.md §12)
+completion ──► git-generated DiffSummary + TaskResult provenance
+                 └─ NeedsReview → Approved/Rejected → explicit Merge
+                     (merge-tree conflicts surfaced, never auto-resolved)
+```
+
+- **`WorktreeManager`** (`terminal-session::worktrees`): deterministic
+  branches/ids per (task, attempt), dirty-workspace policy
+  (`RequireClean` refuses rather than discard user work), retry worktree
+  policy (fresh/reuse), budget, `merge()` from `Approved` only, policy
+  cleanup, restart `scan()` with ownership reconnect, orphans surfaced
+  (never deleted).
+- **Engine glue** (`terminal-workspace`): `resolve_execution_environment`
+  in the spawn path, completion diff/review capture, review state sync,
+  worktree API (list/inspect/diff/merge/discard/cleanup/orphans/budget),
+  `TaskEnvironmentPreview`, `PersistedState.worktrees` (versioned,
+  secret-free) with restart reconnection.
+- **Surfaces**: IPC worktree request/response set + CLI
+  `terminal worktree list|inspect|diff|merge|discard|cleanup|orphans|
+  budget` and `terminal task environment <task-id>`.
+- **Validation**: `tests/phase3c` (11 tests: parallel isolation ×5,
+  cross-contamination, review gate, merge, conflict, cancellation, retry,
+  persistence/orphans, traversal, secret safety) + IPC socket test.
+  Docs: `docs/phase3c.md`, `docs/worktrees.md`,
+  `docs/execution-environments.md`, `docs/review-and-merge.md`, ADRs
+  0012/0013.
+
 ## Verified Budgets (Phase 0.5 + Phase 1)
 
 Measured by the validation harness, scrollback suite, and `multiplex_bench`

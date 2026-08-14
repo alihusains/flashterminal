@@ -1,0 +1,45 @@
+{
+  "goal": "Implement Google + GitHub authentication",
+  "tasks": [
+    {
+      "id": "inspect",
+      "title": "Inspect existing auth architecture",
+      "description": "Read the auth module and identify the current session flow.",
+      "agent": "fake-agent",
+      "depends_on": [],
+      "reason": "grounding step",
+      "confidence": 0.9
+    },
+    {
+      "id": "implement",
+      "title": "Implement Google + GitHub OAuth providers",
+      "description": "Add provider adapters and wire the login routes.",
+      "agent": "fake-agent",
+      "depends_on": ["inspect"],
+      "reason": "implementation step",
+      "confidence": 0.8
+    },
+    {
+      "id": "tests",
+      "title": "Write OAuth unit tests",
+      "description": "Cover token exchange, callback validation and error paths.",
+      "agent": "fake-agent",
+      "depends_on": ["implement"],
+      "reason": "verification step",
+      "confidence": 0.75
+    },
+    {
+      "id": "review",
+      "title": "Security review",
+      "description": "Check redirect-uri validation, state parameter and token storage.",
+      "agent": "fake-agent",
+      "depends_on": ["tests"],
+      "reason": "guardrail step",
+      "confidence": 0.7
+    }
+  ],
+  "reasoning_summary": "Ground on the existing auth flow, implement providers, verify with tests, then review security.",
+  "estimated_cost_cents": 142,
+  "estimated_duration_min": 25,
+  "warnings": ["OAuth token storage must follow the project secret policy"]
+}

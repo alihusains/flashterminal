@@ -1,0 +1,36 @@
+{
+  "goal": "Refactor the API",
+  "tasks": [
+    {
+      "id": "map",
+      "title": "Map current API surface",
+      "description": "Inventory endpoints, handlers and shared types.",
+      "agent": "fake-agent",
+      "depends_on": [],
+      "reason": "grounding step",
+      "confidence": 0.9
+    },
+    {
+      "id": "extract",
+      "title": "Extract shared services",
+      "description": "Move duplicated logic into service modules.",
+      "agent": "fake-agent",
+      "depends_on": ["map"],
+      "reason": "implementation step",
+      "confidence": 0.8
+    },
+    {
+      "id": "verify",
+      "title": "Verify behavior unchanged",
+      "description": "Run the contract tests and confirm the public surface is identical.",
+      "agent": "fake-agent",
+      "depends_on": ["extract"],
+      "reason": "verification step",
+      "confidence": 0.8
+    }
+  ],
+  "reasoning_summary": "Map the surface, extract services, verify no behavior change.",
+  "estimated_cost_cents": 120,
+  "estimated_duration_min": 30,
+  "warnings": ["Keep the public API backward compatible"]
+}

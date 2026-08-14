@@ -25,10 +25,22 @@ use terminal_session::credential::CredentialStore;
 use terminal_session::execution::{ExecutionId, ExecutionKind};
 use terminal_session::launch::AgentLaunchConfig;
 use terminal_session::orchestration::{
-    RuntimeAgentView, SchedulerCommand, SchedulerView, Task, TaskContext, TaskGraph,
-    TaskGraphError, TaskId, TaskPolicy, TaskScheduler,
+    RuntimeAgentView, SchedulerCommand, SchedulerView, Task, TaskContext, TaskEvent, TaskGraph,
+    TaskGraphError, TaskId, TaskPolicy, TaskScheduler, TaskStatus,
+};
+use terminal_session::planning::{
+    classify_intent, normalize_intent, AgentAvailability, AgentSummary, IntentDisposition,
+    PersistedPlanState, PlanEditChange, PlanStepStatus, PlanValidator, PlannerAuditRecord,
+    PlannerConfig, PlannerConstraints, PlannerContext, PlannerContextBuilder, PlannerContextInput,
+    PlannerError, PlannerEvent, PlannerMetrics, PlannerPhase, PlannerProvider, PlannerRequest,
+    PlannerState, PlannerStatus, TaskSummary,
 };
 use terminal_session::provider::ProviderRegistry;
+use terminal_session::worktrees::{
+    git_available, CleanupPolicy, DiffSummary, DirtyPolicy, ExecutionEnvironment, IsolationMode,
+    MergeOutcome, WorktreeBudget, WorktreeError, WorktreeInspection, WorktreeManager,
+    WorktreeRecord, WorktreeState,
+};
 use terminal_session::Session;
 
 use crate::events::EventBus;
@@ -46,6 +58,27 @@ use terminal_session::work::AgentFilter;
 /// Default cell geometry for sessions spawned before any layout is known.
 pub const DEFAULT_COLS: u16 = 80;
 pub const DEFAULT_ROWS: u16 = 24;
+
+/// Phase 3B: maps an authoritative scheduler event to the task status the
+/// plan's step-status view mirrors (§23 — the planner observes the
+/// scheduler, it never decides transitions). Artifact events carry no
+/// status change.
+fn task_status_of_event(event: &TaskEvent) -> Option<TaskStatus> {
+    match event {
+        TaskEvent::TaskCreated { .. } => Some(TaskStatus::Pending),
+        TaskEvent::TaskReady { .. } => Some(TaskStatus::Ready),
+        TaskEvent::TaskStarted { .. } => Some(TaskStatus::Running),
+        TaskEvent::TaskBlocked { .. } => Some(TaskStatus::Blocked),
+        TaskEvent::TaskWaiting { .. } => Some(TaskStatus::Waiting),
+        TaskEvent::TaskNeedsReview { .. } => Some(TaskStatus::NeedsReview),
+        TaskEvent::TaskCompleted { .. } => Some(TaskStatus::Completed),
+        TaskEvent::TaskFailed { .. } => Some(TaskStatus::Failed),
+        TaskEvent::TaskCancelled { .. } => Some(TaskStatus::Cancelled),
+        TaskEvent::TaskRetrying { .. } => Some(TaskStatus::Ready),
+        TaskEvent::TaskInterrupted { .. } => Some(TaskStatus::Interrupted),
+        TaskEvent::TaskArtifactCreated { .. } => None,
+    }
+}
 
 /// Phase 2C: parses a snapshot state string back to an `AgentState`
 /// (snapshots are serde'd as `format!("{:?}", state)`).
@@ -216,6 +249,22 @@ pub struct Multiplexer {
     agent_runtime: AgentRuntime,
     /// Phase 3A: deterministic task orchestration engine (§10–§12, §43).
     tasks: TaskScheduler,
+    /// Phase 3B: planner state machine (3b.md §17–§26). The LLM is a
+    /// *planner* — it proposes; only the deterministic validator, compiler
+    /// and scheduler execute (§2, §33).
+    planner: PlannerState,
+    /// Planner configuration (provider/model/profile/approval — §8, §35).
+    planner_config: PlannerConfig,
+    /// The planner provider boundary (§7). Tests inject deterministic
+    /// mocks; no real LLM is required in standard CI (§47).
+    planner_provider: Option<Box<dyn PlannerProvider>>,
+    /// Task ids the current plan owns in the scheduler (execute/resume
+    /// bookkeeping — resume replaces the plan's own tasks, never others).
+    plan_task_ids: Vec<TaskId>,
+    /// Phase 3C: worktree isolation manager (3c.md §5) — the only git
+    /// caller for worktree operations. The planner never touches git; the
+    /// scheduler never creates worktrees (§44–§45).
+    worktrees: WorktreeManager,
     layout: LayoutEngine,
     pub notifications: NotificationCenter,
     pub events: EventBus,
@@ -258,6 +307,11 @@ impl Multiplexer {
             terminal_states: HashMap::new(),
             agent_runtime,
             tasks: TaskScheduler::new(TaskGraph::new(), TaskPolicy::default()),
+            planner: PlannerState::new(),
+            planner_config: PlannerConfig::default(),
+            planner_provider: None,
+            plan_task_ids: Vec::new(),
+            worktrees: WorktreeManager::new(),
             layout: LayoutEngine::new(),
             notifications: NotificationCenter::new(),
             events: EventBus::new(),
@@ -1239,20 +1293,147 @@ impl Multiplexer {
         self.tasks.policy().clone()
     }
 
+    /// Sets the authoritative scheduler policy and syncs its Phase 3C
+    /// knobs (dirty policy, worktree budget) into the worktree manager —
+    /// the TaskPolicy is the single source of truth for both (§10, §14,
+    /// §47).
     pub fn set_task_policy(&mut self, policy: TaskPolicy) {
+        self.worktrees.set_dirty_policy(policy.dirty);
+        let mut budget = self.worktrees.budget().clone();
+        budget.max_worktrees = policy.max_worktrees;
+        self.worktrees.set_budget(budget);
         self.tasks.set_policy(policy);
     }
 
-    /// §29 human review boundary: approve/reject a NeedsReview task.
+    /// §29 human review boundary: approve/reject a NeedsReview task. The
+    /// worktree lifecycle follows the review (§21): approval accepts the
+    /// result as a valid artifact (merge stays a separate explicit step,
+    /// §54); rejection keeps the worktree available for rework (§24).
     pub fn resolve_task_review(
         &mut self,
         task_id: &TaskId,
         approve: bool,
     ) -> Result<(), TaskGraphError> {
         self.tasks.resolve_review(task_id, approve)?;
+        let worktree_id = self
+            .tasks
+            .graph()
+            .get_task(task_id)
+            .and_then(|t| t.worktree_id.clone());
+        if let Some(wt) = worktree_id {
+            let state = if approve {
+                WorktreeState::Approved
+            } else {
+                WorktreeState::Rejected
+            };
+            let _ = self.worktrees.set_state(&wt, state);
+        }
         self.step_tasks();
         self.publish_task_events();
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3C: worktree management (3c.md §5, §30–§32, §44) — the
+    // engine's public worktree surface. All git operations stay inside
+    // `WorktreeManager`; the engine only mediates task/worktree policy.
+    // ------------------------------------------------------------------
+
+    /// Worktree metadata (versioned, secret-free — §35, §49).
+    pub fn worktree_list(&self) -> Vec<WorktreeRecord> {
+        self.worktrees.list().into_iter().cloned().collect()
+    }
+
+    pub fn worktree_get(&self, id: &str) -> Option<WorktreeRecord> {
+        self.worktrees.get(id).cloned()
+    }
+
+    /// §5 `inspect` — live disk truth (path/branch/HEAD).
+    pub fn worktree_inspect(&self, id: &str) -> Result<WorktreeInspection, WorktreeError> {
+        self.worktrees.inspect(id)
+    }
+
+    /// §18 deterministic diff vs the base revision (secret-free paths).
+    pub fn worktree_diff(&self, id: &str) -> Result<DiffSummary, WorktreeError> {
+        self.worktrees.diff(id)
+    }
+
+    /// §22 explicit merge — only ever from `Approved`; conflicts surface as
+    /// [`MergeOutcome::Conflict`] without data loss (§23). Never automatic.
+    pub fn worktree_merge(
+        &mut self,
+        id: &str,
+        target_branch: &str,
+    ) -> Result<MergeOutcome, WorktreeError> {
+        self.worktrees.merge(id, target_branch)
+    }
+
+    /// §30 discard (explicit user action — never automatic).
+    pub fn worktree_discard(&mut self, id: &str) -> Result<(), WorktreeError> {
+        self.worktrees.remove(id)
+    }
+
+    /// §30 configured cleanup policy sweep.
+    pub fn worktree_cleanup(&mut self) -> Vec<String> {
+        self.worktrees
+            .cleanup()
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
+    /// §31 orphaned worktrees (never auto-deleted — surfaced for review).
+    pub fn worktree_orphans(&self) -> Vec<WorktreeRecord> {
+        self.worktrees.orphans().into_iter().cloned().collect()
+    }
+
+    pub fn worktree_budget(&self) -> WorktreeBudget {
+        self.worktrees.budget().clone()
+    }
+
+    pub fn set_worktree_budget(&mut self, budget: WorktreeBudget) {
+        self.worktrees.set_budget(budget);
+    }
+
+    pub fn worktree_dirty_policy(&self) -> DirtyPolicy {
+        self.worktrees.dirty_policy()
+    }
+
+    pub fn set_worktree_dirty_policy(&mut self, p: DirtyPolicy) {
+        self.worktrees.set_dirty_policy(p);
+    }
+
+    pub fn worktree_cleanup_policy(&self) -> CleanupPolicy {
+        self.worktrees.cleanup_policy()
+    }
+
+    pub fn set_worktree_cleanup_policy(&mut self, p: CleanupPolicy) {
+        self.worktrees.set_cleanup_policy(p);
+    }
+
+    /// §29: the execution-environment preview for a task — repository,
+    /// base, isolation, branch, working directory, agent (3c.md §29).
+    pub fn task_environment_preview(&self, task_id: &TaskId) -> Option<ExecutionEnvironment> {
+        let task = self.tasks.graph().get_task(task_id)?;
+        let workspace = self.workspace(&task.workspace_id)?;
+        let wt = task
+            .worktree_id
+            .as_ref()
+            .and_then(|w| self.worktrees.get(w));
+        let worktree_id = wt.map(|r| r.id.clone());
+        Some(ExecutionEnvironment {
+            repository: workspace.project_root.clone(),
+            base_revision: wt.and_then(|r| r.base_revision.clone()),
+            base_branch: wt.and_then(|r| r.base_branch.clone()),
+            base_timestamp_ms: wt.map(|r| r.base_timestamp_ms).unwrap_or(0),
+            working_directory: wt
+                .map(|r| r.path.clone())
+                .unwrap_or_else(|| workspace.project_root.clone()),
+            worktree_id,
+            branch: wt.map(|r| r.branch.clone()),
+            isolation: task.isolation,
+            environment_variables: Vec::new(),
+        })
     }
 
     /// §40 "Open Agent": attaches a live pane to an existing task agent
@@ -1361,14 +1542,473 @@ impl Multiplexer {
 
     fn publish_task_events(&mut self) {
         for event in self.tasks.take_events() {
+            // Phase 3B: mirror authoritative scheduler transitions into the
+            // plan's step status map — the planner observes, never mutates
+            // task state directly (§23, §33).
+            if self.planner.phase() == PlannerPhase::Executing {
+                if let Some(status) = task_status_of_event(&event) {
+                    self.planner.on_step_status(event.task_id(), status);
+                    if matches!(event, TaskEvent::TaskCompleted { .. }) {
+                        self.publish_planner_event(PlannerEvent::PlanStepCompleted {
+                            plan_id: self.planner.plan_id().unwrap_or_default().to_string(),
+                            step_id: event.task_id().clone(),
+                        });
+                    }
+                }
+            }
+            // Phase 3C: completion → deterministic diff + review state for
+            // isolated tasks (§18–§19); failure/cancellation preserves the
+            // worktree and its changes (§30, §42).
+            match &event {
+                TaskEvent::TaskCompleted { task_id, .. }
+                | TaskEvent::TaskNeedsReview { task_id } => {
+                    self.capture_worktree_result(task_id);
+                }
+                TaskEvent::TaskFailed { task_id, .. } | TaskEvent::TaskCancelled { task_id } => {
+                    self.preserve_worktree(task_id);
+                }
+                _ => {}
+            }
             self.events.publish(ApplicationEvent::TaskEvent { event });
         }
+        self.maybe_finish_plan();
+    }
+
+    /// Detects plan completion from the authoritative scheduler state
+    /// (never from the planner itself) and advances the plan state machine
+    /// (§23 — completion is observed, not decided by the planner).
+    fn maybe_finish_plan(&mut self) {
+        if self.planner.phase() != PlannerPhase::Executing {
+            return;
+        }
+        let steps = self.planner.status().steps;
+        let all_terminal = !steps.is_empty()
+            && steps.iter().all(|s| {
+                matches!(
+                    s.status,
+                    PlanStepStatus::Completed
+                        | PlanStepStatus::Failed
+                        | PlanStepStatus::Cancelled
+                        | PlanStepStatus::Skipped
+                )
+            });
+        if !all_terminal {
+            return;
+        }
+        let all_completed = steps.iter().all(|s| s.status == PlanStepStatus::Completed);
+        self.planner.finish_execution(all_completed);
+        if all_completed {
+            self.planner.metrics_mut().executions_succeeded += 1;
+        } else {
+            self.planner.metrics_mut().executions_failed += 1;
+        }
+    }
+
+    fn publish_planner_event(&mut self, event: PlannerEvent) {
+        self.events
+            .publish(ApplicationEvent::PlannerEvent { event });
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3B: planner (3b.md §1–§34) — the LLM is a planner, never an
+    // orchestrator. Everything here ends in the deterministic validator,
+    // compiler, or scheduler; the planner never spawns processes, changes
+    // policy, or mutates task state directly.
+    // ------------------------------------------------------------------
+
+    /// Injects the planner provider (§7). Tests inject deterministic
+    /// mocks; no real LLM is required in standard CI (§47).
+    pub fn set_planner_provider(&mut self, provider: Box<dyn PlannerProvider>) {
+        self.planner_provider = Some(provider);
+    }
+
+    pub fn planner_config(&self) -> &PlannerConfig {
+        &self.planner_config
+    }
+
+    pub fn set_planner_config(&mut self, config: PlannerConfig) {
+        self.planner_config = config;
+    }
+
+    pub fn planner_status(&self) -> PlannerStatus {
+        self.planner.status()
+    }
+
+    pub fn planner_metrics(&self) -> PlannerMetrics {
+        self.planner.metrics().clone()
+    }
+
+    pub fn planner_audit(&self) -> Vec<PlannerAuditRecord> {
+        self.planner.audit().to_vec()
+    }
+
+    pub fn planner_last_error(&self) -> Option<String> {
+        self.planner.last_error().map(|e| e.to_string())
+    }
+
+    /// §43–§44: deterministic disposition of a natural-language request —
+    /// simple commands bypass the planner, multi-step work routes to it.
+    pub fn classify_request(&self, intent: &str) -> IntentDisposition {
+        classify_intent(intent)
+    }
+
+    /// The provider id bound to the planner (or `None` when no provider is
+    /// configured — §46: offline terminals keep working, planning is the
+    /// only thing unavailable).
+    pub fn planner_provider_id(&self) -> Option<String> {
+        self.planner_provider
+            .as_ref()
+            .map(|p| p.provider_id().to_string())
+    }
+
+    /// §5: the bounded, allowlisted context the planner would receive.
+    /// Public so the context is inspectable/auditable (§5 — never an
+    /// unrestricted dump).
+    pub fn planner_context(&self) -> PlannerContext {
+        PlannerContextBuilder::new(self.planner_context_input()).build()
+    }
+
+    /// The constraints snapshot handed to the planner (§4, §12): budget
+    /// and parallelism come from the authoritative scheduler policy, so a
+    /// plan can never raise them (§33).
+    fn planner_constraints(&self) -> PlannerConstraints {
+        let policy = self.tasks.policy();
+        PlannerConstraints {
+            budget_cents: policy.max_cost_cents,
+            max_parallel_tasks: policy.max_parallel_tasks,
+            approval: self.planner_config.approval,
+            user_preferences: Vec::new(),
+            max_worktrees: policy.max_worktrees,
+        }
+    }
+
+    /// Bounded, allowlisted context input from the engine's own state
+    /// (§5): workspace, agents, tasks, providers, constraints — never
+    /// secrets, never the filesystem dump (§27).
+    fn planner_context_input(&self) -> PlannerContextInput {
+        let ws = self.active_workspace();
+        let available_agents = self
+            .agent_runtime
+            .registry()
+            .list()
+            .iter()
+            .map(|def| AgentSummary {
+                id: def.id.clone(),
+                display_name: def.display_name.clone(),
+                capabilities: self
+                    .agent_runtime
+                    .find_adapter(&def.id)
+                    .map(|a| a.capabilities())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let to_summary = |t: &Task| TaskSummary {
+            id: t.id.clone(),
+            title: t.title.clone(),
+            status: format!("{:?}", t.status),
+        };
+        let all: Vec<&Task> = self.task_list();
+        let active_tasks: Vec<TaskSummary> = all
+            .iter()
+            .filter(|t| !t.status.is_terminal())
+            .map(|t| to_summary(t))
+            .take(12)
+            .collect();
+        let recent_tasks: Vec<TaskSummary> = all
+            .iter()
+            .filter(|t| t.status.is_terminal())
+            .rev()
+            .map(|t| to_summary(t))
+            .take(12)
+            .collect();
+        PlannerContextInput {
+            workspace_id: ws.id.clone(),
+            workspace_name: ws.name.clone(),
+            project_root: ws.project_root.clone(),
+            available_agents,
+            active_tasks,
+            recent_tasks,
+            provider_ids: self.agent_runtime.provider_ids(),
+            constraints: self.planner_constraints(),
+        }
+    }
+
+    /// §6, §20–§21, §43–§44: routes a request through the planner. Simple
+    /// intents are bypassed deterministically. A plan reaches
+    /// `NeedsApproval` only after schema parse (§9) and policy validation
+    /// (§14) pass; no task starts until then (§21).
+    pub fn plan_request(&mut self, intent: &str) -> Result<(), PlannerError> {
+        match classify_intent(intent) {
+            IntentDisposition::Bypass { reason } => {
+                self.planner.metrics_mut().bypassed_intents += 1;
+                return Err(PlannerError::Bypassed { reason });
+            }
+            IntentDisposition::Plan => {}
+        }
+        if self.planner_provider.is_none() {
+            return Err(PlannerError::NoProvider);
+        }
+        let normalized = normalize_intent(intent);
+        let ws = self.active_workspace();
+        let request = PlannerRequest {
+            request_id: format!("plan-req-{}", terminal_session::planning::now_ms()),
+            intent: normalized.objective,
+            workspace_id: ws.id.clone(),
+            context: PlannerContextBuilder::new(self.planner_context_input()).build(),
+            constraints: self.planner_constraints(),
+        };
+        self.planner.begin_request(
+            &request.request_id,
+            &request.intent,
+            &self.planner_config.provider,
+            &self.planner_config.model,
+        )?;
+        self.publish_planner_event(PlannerEvent::PlanningStarted {
+            request_id: request.request_id.clone(),
+            intent: request.intent.clone(),
+        });
+        let provider = self.planner_provider.as_ref().unwrap();
+        let t0 = std::time::Instant::now();
+        let result = provider.generate(&request, &self.planner_config);
+        let latency_ms = t0.elapsed().as_millis() as u64;
+        for event in self.planner.on_provider_result(result, latency_ms) {
+            self.publish_planner_event(event);
+        }
+        match self.planner.phase() {
+            PlannerPhase::NeedsApproval => self.plan_validate()?,
+            PlannerPhase::Failed => {
+                return Err(self.planner.last_error().cloned().unwrap_or(
+                    PlannerError::NotAllowed {
+                        reason: "planning failed".to_string(),
+                    },
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// §14: validates the current plan against the engine's authoritative
+    /// registry and scheduler policy (agents, dependencies, cycles,
+    /// budget, parallelism). Unavailable agents are reported — never
+    /// silently substituted (§12).
+    pub fn plan_validate(&mut self) -> Result<(), PlannerError> {
+        let Some(plan) = self.planner.plan().cloned() else {
+            return Err(PlannerError::NotAllowed {
+                reason: "no plan to validate".to_string(),
+            });
+        };
+        let constraints = self.planner_constraints();
+        let registry = self.agent_runtime.registry();
+        let mut availability = std::collections::HashMap::new();
+        for def in registry.list() {
+            availability.insert(def.id.clone(), self.planner_agent_availability(&def.id));
+        }
+        let check = |id: &str| {
+            availability
+                .get(id)
+                .copied()
+                .unwrap_or(AgentAvailability::Unknown)
+        };
+        let validator = PlanValidator::with_availability(registry, &check);
+        match self.planner.validate_plan(&validator, &constraints) {
+            Ok(()) => {
+                self.publish_planner_event(PlannerEvent::PlanValidated {
+                    request_id: self.planner.request_id().unwrap_or_default().to_string(),
+                    plan_hash: self.planner.status().plan_hash,
+                    warnings: plan.warnings,
+                });
+                Ok(())
+            }
+            Err(e) => {
+                self.publish_planner_event(PlannerEvent::PlanningFailed {
+                    request_id: self.planner.request_id().unwrap_or_default().to_string(),
+                    error: e.clone(),
+                    retries: 0,
+                });
+                Err(e)
+            }
+        }
+    }
+
+    /// §12: deterministic agent availability — registered AND
+    /// binary-resolvable through the adapter boundary. The planner never
+    /// probes executables itself, and the check mirrors the runtime's own
+    /// spawn resolution exactly (fake-agent has its own binary lookup).
+    fn planner_agent_availability(&self, id: &str) -> AgentAvailability {
+        let Some(def) = self.agent_runtime.registry().get(id) else {
+            return AgentAvailability::Unknown;
+        };
+        let Some(adapter) = self.agent_runtime.find_adapter(id) else {
+            return AgentAvailability::Unknown;
+        };
+        let resolved = if id == "fake-agent" {
+            terminal_session::adapters::fake::FakeAgentAdapter::resolve_binary()
+        } else {
+            terminal_session::adapters::resolve_binary(adapter.as_ref(), def)
+        };
+        match resolved {
+            Ok(_) => AgentAvailability::Available,
+            Err(_) => AgentAvailability::Unavailable,
+        }
+    }
+
+    pub fn plan_approve(&mut self) -> Result<(), PlannerError> {
+        self.planner.approve()?;
+        self.publish_planner_event(PlannerEvent::PlanApproved {
+            plan_id: self.planner.plan_id().unwrap_or_default().to_string(),
+            plan_hash: self.planner.status().plan_hash,
+        });
+        Ok(())
+    }
+
+    pub fn plan_reject(&mut self, reason: &str) -> Result<(), PlannerError> {
+        let plan_hash = self.planner.status().plan_hash;
+        self.planner.reject(reason)?;
+        self.publish_planner_event(PlannerEvent::PlanRejected {
+            plan_id: self.planner.plan_id().unwrap_or_default().to_string(),
+            plan_hash,
+            reason: reason.to_string(),
+        });
+        Ok(())
+    }
+
+    /// §18–§19: a human edit. Applied locally, never silently replaces the
+    /// plan; the engine re-validates before execution.
+    pub fn plan_edit(&mut self, change: &PlanEditChange) -> Result<(), PlannerError> {
+        self.planner.edit(change)?;
+        self.publish_planner_event(PlannerEvent::PlanEdited {
+            plan_id: self.planner.plan_id().unwrap_or_default().to_string(),
+            plan_hash: self.planner.status().plan_hash,
+            change: format!("{change:?}"),
+        });
+        Ok(())
+    }
+
+    /// §18: user-set parallel batch cap (clamped by the state machine; the
+    /// scheduler's own policy remains the ceiling — §33).
+    pub fn plan_set_parallelism(&mut self, n: usize) {
+        self.planner.set_parallelism(n);
+    }
+
+    pub fn plan_cancel(&mut self) {
+        self.planner.cancel();
+        self.publish_planner_event(PlannerEvent::PlanCancelled {
+            plan_id: self.planner.plan_id().unwrap_or_default().to_string(),
+        });
+    }
+
+    /// §23: compiles the approved plan and hands it to the authoritative
+    /// scheduler. The planner is out of control from here; the scheduler's
+    /// own policy (budget, concurrency) governs execution (§33).
+    pub fn plan_execute(&mut self) -> Result<Vec<TaskId>, PlannerError> {
+        // §19: edited plans are re-validated before execution — a human
+        // edit never silently skips the deterministic gates.
+        if self.planner.status().edited {
+            self.plan_validate()?;
+        }
+        let ws_id = self.active_workspace().id.clone();
+        let (graph, _policy) = self.planner.compile_for_execution(&ws_id)?;
+        let ids = self.import_plan_graph(&graph)?;
+        self.tasks.submit_all();
+        self.step_tasks();
+        self.publish_planner_event(PlannerEvent::PlanExecutionStarted {
+            plan_id: self.planner.plan_id().unwrap_or_default().to_string(),
+            task_ids: ids.clone(),
+        });
+        Ok(ids)
+    }
+
+    /// Imports a compiled plan graph into the scheduler. Rejects id
+    /// collisions (never silently overwrites unrelated tasks). The
+    /// compiled policy is NOT applied — the scheduler policy stays
+    /// authoritative (§33).
+    fn import_plan_graph(&mut self, graph: &TaskGraph) -> Result<Vec<TaskId>, PlannerError> {
+        let ids = graph.list_task_ids();
+        for id in &ids {
+            if self.tasks.graph().get_task(id).is_some() {
+                return Err(PlannerError::NotAllowed {
+                    reason: format!("task id {id} already exists in the scheduler"),
+                });
+            }
+        }
+        for task in graph.list_tasks() {
+            let mut t = task.clone();
+            t.id = task.id.clone();
+            // Edges are registered below via `add_dependency`; the cloned
+            // task's dependency list is cleared so the authoritative graph
+            // owns the edges (§33).
+            t.dependencies.clear();
+            self.tasks
+                .graph_mut()
+                .add_task(t)
+                .map_err(|e| PlannerError::NotAllowed {
+                    reason: e.to_string(),
+                })?;
+        }
+        for id in &ids {
+            for dep in graph.dependencies_of(id) {
+                self.tasks
+                    .graph_mut()
+                    .add_dependency(id, &dep)
+                    .map_err(|e| PlannerError::NotAllowed {
+                        reason: e.to_string(),
+                    })?;
+            }
+        }
+        self.plan_task_ids = ids.clone();
+        Ok(ids)
+    }
+
+    /// §26: explicit resume after interruption. Removes the plan's own
+    /// previously-scheduled tasks (never anyone else's), re-imports the
+    /// remaining steps, and re-submits. Never resumes silently.
+    pub fn plan_resume(&mut self) -> Result<Vec<TaskId>, PlannerError> {
+        let ws_id = self.active_workspace().id.clone();
+        let (graph, _policy) = self.planner.resume(&ws_id)?;
+        for id in &self.plan_task_ids {
+            let _ = self.tasks.graph_mut().remove_task(id);
+        }
+        self.plan_task_ids.clear();
+        let ids = self.import_plan_graph(&graph)?;
+        self.tasks.submit_all();
+        self.step_tasks();
+        self.publish_planner_event(PlannerEvent::PlanResumed {
+            plan_id: self.planner.plan_id().unwrap_or_default().to_string(),
+            completed: self.planner.status().completed_count,
+            remaining: ids.len(),
+        });
+        Ok(ids)
+    }
+
+    /// §26: interrupt execution (restart path). Resume is always explicit.
+    pub fn plan_interrupt(&mut self, reason: &str) {
+        self.planner.interrupt(reason);
+    }
+
+    /// §25: persisted plan slice (never credentials or private reasoning).
+    pub fn plan_export_persisted(&self) -> Option<PersistedPlanState> {
+        self.planner.export_persisted()
+    }
+
+    /// §26: restore an interrupted plan after restart. The plan stays in
+    /// `Interrupted` — nothing resumes silently.
+    pub fn plan_restore(&mut self, state: PersistedPlanState) {
+        self.planner = PlannerState::import_persisted(state);
+        self.plan_task_ids.clear();
     }
 
     /// Builds the launch for a task through the adapter boundary (§20):
     /// `prepare_task` produces the vendor instruction; explicit task
-    /// arguments/environment are appended as deterministic overrides.
+    /// arguments/environment are appended as deterministic overrides. The
+    /// execution environment (worktree etc.) is resolved *before* the
+    /// adapter — the scheduler/environment layer decides where the agent
+    /// runs, never the adapter (3c.md §11, §44).
     fn spawn_task_agent(&mut self, task_id: &TaskId) -> Result<ExecutionId> {
+        // Phase 3C §44: request the execution environment first. Isolated
+        // tasks get a dedicated worktree; the launch cwd is the env's
+        // working directory.
+        let env = self.resolve_execution_environment(task_id)?;
         let launch = {
             let graph = self.tasks.graph();
             let task = graph
@@ -1377,6 +2017,10 @@ impl Multiplexer {
             let workspace = self
                 .workspace(&task.workspace_id)
                 .ok_or_else(|| anyhow::anyhow!("unknown workspace"))?;
+            let cwd = env
+                .as_ref()
+                .map(|e| e.working_directory.clone())
+                .unwrap_or_else(|| workspace.project_root.clone());
             // The attempt number is deterministic scheduling info the adapter
             // may need (fixtures like `flaky`), so it is part of the context.
             let mut context_env = task.environment.clone();
@@ -1403,28 +2047,221 @@ impl Multiplexer {
             let prepared = adapter.prepare_task(&ctx);
             let mut args = prepared.arguments;
             args.extend(task.arguments.iter().cloned());
-            let mut env = prepared.environment;
-            env.extend(task.environment.iter().cloned());
-            env.push((
+            let mut env_pairs = prepared.environment;
+            env_pairs.extend(task.environment.iter().cloned());
+            env_pairs.push((
                 "FAKE_AGENT_ATTEMPT".to_string(),
                 task.attempt_count.to_string(),
             ));
             AgentLaunchConfig {
                 definition_id: task.assigned_agent.clone(),
-                cwd: workspace.project_root.clone(),
+                cwd,
                 arguments: args,
                 provider_id: None,
                 model_id: None,
                 credential_ref: None,
                 resume_id: None,
-                environment: env,
+                environment: env_pairs,
             }
         };
+        // §12: hard wrong-cwd guard — the agent must run exactly where the
+        // worktree says. The launch cwd was built from the environment, so
+        // this is a defense-in-depth verification against any launch-level
+        // tampering.
+        if let Some(e) = &env {
+            if let Some(wt) = &e.worktree_id {
+                self.worktrees.assert_cwd(wt, &launch.cwd)?;
+            }
+        }
+        // Isolated coding tasks always land in review — completed never
+        // means merged (§19, §54).
+        if env.as_ref().map(|e| e.isolation) == Some(IsolationMode::GitWorktree) {
+            if let Some(task) = self.tasks.graph_mut().get_task_mut(task_id) {
+                task.review_required = true;
+            }
+        }
         let r = self.spawn_agent_session(launch, DEFAULT_COLS, DEFAULT_ROWS);
         if let Err(e) = &r {
             tracing::warn!("task {task_id}: spawn failed: {e:#}");
         }
         r
+    }
+
+    /// §44: resolves the execution environment for a task attempt — the
+    /// only place worktrees are created (never in the adapter, never in the
+    /// planner). Reuses the task's worktree on attempt 1 and per the
+    /// explicit retry policy (§10, §43). Non-git workspaces degrade
+    /// gracefully to the shared root with a warning (no isolation possible).
+    fn resolve_execution_environment(
+        &mut self,
+        task_id: &TaskId,
+    ) -> Result<Option<ExecutionEnvironment>> {
+        let (repo, isolation, shared, slug, worktree_id, attempt) = {
+            let graph = self.tasks.graph();
+            let task = graph
+                .get_task(task_id)
+                .ok_or_else(|| anyhow::anyhow!("unknown task {task_id}"))?;
+            let workspace = self
+                .workspace(&task.workspace_id)
+                .ok_or_else(|| anyhow::anyhow!("unknown workspace"))?;
+            (
+                workspace.project_root.clone(),
+                task.isolation,
+                task.requires_shared_workspace,
+                task.slug.clone(),
+                task.worktree_id.clone(),
+                task.attempt_count,
+            )
+        };
+        match isolation {
+            IsolationMode::SharedWorkspace => {
+                if !shared {
+                    tracing::warn!(
+                        "task {task_id}: shared-workspace isolation without requires_shared_workspace"
+                    );
+                }
+                Ok(Some(ExecutionEnvironment {
+                    repository: repo.clone(),
+                    base_revision: None,
+                    base_branch: None,
+                    base_timestamp_ms: 0,
+                    working_directory: repo,
+                    worktree_id: None,
+                    branch: None,
+                    isolation: IsolationMode::SharedWorkspace,
+                    environment_variables: Vec::new(),
+                }))
+            }
+            IsolationMode::GitWorktree => {
+                // Graceful degradation: no git binary or not a repository →
+                // run in the shared root (documented, warn-level). Real
+                // isolation requires a real repository (§13).
+                if !git_available() || self.worktrees.repository_ok(&repo, None).is_err() {
+                    tracing::warn!("task {task_id}: workspace is not a git repository — running in the shared workspace without isolation");
+                    return Ok(Some(ExecutionEnvironment {
+                        repository: repo.clone(),
+                        base_revision: None,
+                        base_branch: None,
+                        base_timestamp_ms: 0,
+                        working_directory: repo,
+                        worktree_id: None,
+                        branch: None,
+                        isolation: IsolationMode::SharedWorkspace,
+                        environment_variables: Vec::new(),
+                    }));
+                }
+                let base = self.worktrees.head_revision(&repo).ok();
+                let slug = if slug.is_empty() { "task" } else { &slug };
+                let retry = self.tasks.policy().retry_worktree;
+                let env = self.worktrees.environment_for_task(
+                    &repo,
+                    task_id,
+                    slug,
+                    worktree_id.as_deref(),
+                    base.as_deref(),
+                    attempt,
+                    retry,
+                )?;
+                // §10: at most one active worktree per task — record the
+                // owner so completion can capture diff/provenance.
+                if let Some(wt) = &env.worktree_id {
+                    if let Some(task) = self.tasks.graph_mut().get_task_mut(task_id) {
+                        task.worktree_id = Some(wt.clone());
+                    }
+                }
+                Ok(Some(env))
+            }
+            IsolationMode::TemporaryDirectory => {
+                // Throwaway directory — no git operations, nothing persisted.
+                let dir = std::env::temp_dir().join(format!("flash-task-{task_id}-{attempt}"));
+                let _ = std::fs::create_dir_all(&dir);
+                Ok(Some(ExecutionEnvironment {
+                    repository: repo,
+                    base_revision: None,
+                    base_branch: None,
+                    base_timestamp_ms: 0,
+                    working_directory: dir.to_string_lossy().to_string(),
+                    worktree_id: None,
+                    branch: None,
+                    isolation: IsolationMode::TemporaryDirectory,
+                    environment_variables: Vec::new(),
+                }))
+            }
+        }
+    }
+
+    /// §17–§18: captures deterministic diff + worktree provenance into the
+    /// scheduler's TaskResult at completion (the scheduler stays pure — no
+    /// git) and moves the worktree to `NeedsReview`. The diff is generated
+    /// from git against the base revision, never from the agent's own
+    /// summary (§18).
+    fn capture_worktree_result(&mut self, task_id: &TaskId) {
+        let Some(worktree_id) = self
+            .tasks
+            .graph()
+            .get_task(task_id)
+            .and_then(|t| t.worktree_id.clone())
+        else {
+            return;
+        };
+        let diff = match self.worktrees.diff(&worktree_id) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("task {task_id}: worktree diff failed: {e:#}");
+                return;
+            }
+        };
+        let record = self.worktrees.get(&worktree_id).cloned();
+        let (base_revision, branch, worktree_path) = match &record {
+            Some(r) => (
+                r.base_revision.clone(),
+                Some(r.branch.clone()),
+                Some(r.path.clone()),
+            ),
+            None => (diff.base_revision.clone(), None, None),
+        };
+        // The agent just finished → NeedsReview. But this can also fire
+        // when review was already resolved (approval re-emits TaskCompleted
+        // through the scheduler), so never downgrade an explicit
+        // Approved/Rejected/Merged state (§21).
+        let state = self.worktrees.get(&worktree_id).map(|r| r.state);
+        if matches!(
+            state,
+            Some(WorktreeState::Created | WorktreeState::Active | WorktreeState::Completed)
+        ) {
+            let _ = self
+                .worktrees
+                .set_state(&worktree_id, WorktreeState::NeedsReview);
+        }
+        if let Some(task) = self.tasks.graph_mut().get_task_mut(task_id) {
+            if let Some(result) = task.result.as_mut() {
+                result.base_revision = base_revision;
+                result.result_revision = diff.result_revision.clone();
+                result.branch = branch;
+                result.worktree = worktree_path;
+                result.diff_summary = Some(Box::new(diff.clone()));
+                if !result.files_changed.is_empty() {
+                    result.files_changed = diff.files_changed.clone();
+                }
+            }
+        }
+    }
+
+    /// §30/§42: a failed/cancelled isolated task keeps its worktree and
+    /// changes (never deleted automatically) — the record moves to
+    /// `Completed` so the user can review/reopen/discard.
+    fn preserve_worktree(&mut self, task_id: &TaskId) {
+        let Some(worktree_id) = self
+            .tasks
+            .graph()
+            .get_task(task_id)
+            .and_then(|t| t.worktree_id.clone())
+        else {
+            return;
+        };
+        let _ = self
+            .worktrees
+            .set_state(&worktree_id, WorktreeState::Completed);
     }
 
     // ------------------------------------------------------------------
@@ -1659,6 +2496,7 @@ impl Multiplexer {
             workspaces: self.workspaces.clone(),
             active_workspace: active,
             tasks: Some(self.tasks.export_persisted()),
+            worktrees: Some(self.worktree_list()),
         }
     }
 
@@ -1828,6 +2666,21 @@ impl Multiplexer {
             for event in self.tasks.take_events() {
                 self.events.publish(ApplicationEvent::TaskEvent { event });
             }
+        }
+        // Phase 3C §49–§50: rebuild the worktree manager from disk and
+        // reconnect ownership through the restored scheduler's task ids.
+        // Worktrees with no live owner are marked orphaned (never
+        // deleted — surfaced for review, §31).
+        if let Some(records) = state.worktrees {
+            self.worktrees = WorktreeManager::from_records(records);
+            let ownership: HashMap<String, String> = self
+                .tasks
+                .graph()
+                .list_tasks()
+                .iter()
+                .filter_map(|t| t.worktree_id.as_ref().map(|w| (w.clone(), t.id.clone())))
+                .collect();
+            self.worktrees.scan(&ownership);
         }
         failed
     }

@@ -134,4 +134,9 @@ pub struct PersistedState {
     /// Phase 3A §52: versioned orchestration state (bounded, no secrets).
     #[serde(default)]
     pub tasks: Option<terminal_session::orchestration::PersistedSchedulerState>,
+    /// Phase 3C §49: worktree records (id, path, branch, base revision,
+    /// task, state — never credentials). Reconnected to tasks on restore
+    /// through the scheduler's task ids (§50).
+    #[serde(default)]
+    pub worktrees: Option<Vec<terminal_session::worktrees::WorktreeRecord>>,
 }
