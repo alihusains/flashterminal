@@ -24,6 +24,7 @@ pub mod agent;
 pub mod credential;
 pub mod execution;
 pub mod launch;
+pub mod orchestration;
 pub mod provider;
 pub mod redact;
 pub mod work;

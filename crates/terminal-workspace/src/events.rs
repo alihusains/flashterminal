@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use terminal_session::execution::{AgentEvent, ApplicationEvent, ExecutionId};
+use terminal_session::orchestration::TaskEvent;
 
 /// Maximum events buffered per subscriber before the slow-client policy
 /// kicks in (output coalescing + drops + disconnect).
@@ -57,6 +58,8 @@ pub struct EventFilter {
     pub agent: bool,
     #[serde(default)]
     pub notification: bool,
+    #[serde(default)]
+    pub task: bool,
 }
 
 impl EventFilter {
@@ -67,6 +70,7 @@ impl EventFilter {
             terminal: true,
             agent: true,
             notification: true,
+            task: true,
         }
     }
 
@@ -83,6 +87,7 @@ impl EventFilter {
             ApplicationEvent::PaneCreated { .. } | ApplicationEvent::PaneClosed { .. } => self.pane,
             ApplicationEvent::SessionExited { .. } => self.terminal || self.agent,
             ApplicationEvent::AgentEvent { .. } => self.agent,
+            ApplicationEvent::TaskEvent { .. } => self.task,
         }
     }
 }
@@ -112,6 +117,11 @@ fn is_critical(event: &ApplicationEvent) -> bool {
                 | AgentEvent::Activity { .. },
             ..
         } => false,
+        // Task lifecycle events are state changes — never dropped.
+        ApplicationEvent::TaskEvent {
+            event: TaskEvent::TaskArtifactCreated { .. },
+        } => false,
+        ApplicationEvent::TaskEvent { .. } => true,
     }
 }
 

@@ -24,13 +24,14 @@ use crate::credential::{CredentialRef, CredentialStore};
 use crate::execution::{
     AgentActivity, AgentEvent, AgentState, ExecutionId, ExecutionMetadata, StateProvenance,
 };
-use crate::work::{
-    self, ActivityKind, ActivitySource, AgentActivityState, AgentHealthRow, AgentWork,
-    AttentionReason, ErrorKind, HealthStatus, TimelineKind, WorkError, WorkStatus,
-    attention_for, collect_git_files, now_ms, observe_command, observe_file,
-};use crate::launch::AgentLaunchConfig;
+use crate::launch::AgentLaunchConfig;
 use crate::provider::ProviderRegistry;
 use crate::redact::Redactor;
+use crate::work::{
+    self, attention_for, collect_git_files, now_ms, observe_command, observe_file, ActivityKind,
+    ActivitySource, AgentActivityState, AgentHealthRow, AgentWork, AttentionReason, ErrorKind,
+    HealthStatus, TimelineKind, WorkError, WorkStatus,
+};
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use pty::PtyManager;
@@ -570,14 +571,19 @@ impl AgentRuntime {
 
         // Phase 2C §3: one AgentWork per session (process ≠ work). Created
         // before the pump so the pump can record observations into it.
-        let work = Arc::new(Mutex::new(AgentWork::new(eid.0.clone(), def.display_name.clone())));
+        let work = Arc::new(Mutex::new(AgentWork::new(
+            eid.0.clone(),
+            def.display_name.clone(),
+        )));
         {
             let mut w = work.lock().unwrap();
             w.description = def.name.clone();
             w.files_observable = adapter.capabilities().files_tracked;
             w.commands_observable = adapter.capabilities().commands_tracked;
-            w.timeline
-                .push(TimelineKind::Started, format!("{} session started", def.display_name));
+            w.timeline.push(
+                TimelineKind::Started,
+                format!("{} session started", def.display_name),
+            );
         }
         let pump_work = Arc::clone(&work);
 
@@ -805,6 +811,26 @@ impl AgentRuntime {
         !self.event_rx.is_empty()
     }
 
+    /// Raw lifecycle state for an execution (Phase 3A scheduler view — the
+    /// scheduler decides from the enum, not display strings).
+    pub fn raw_state(&self, eid: &ExecutionId) -> Option<AgentState> {
+        self.sessions
+            .get(eid)
+            .and_then(|s| s.lock().ok())
+            .map(|s| s.state)
+    }
+
+    /// Whether an agent definition is registered (task-create validation,
+    /// 3a.md §8: unknown agent references are typed errors).
+    pub fn definition_exists(&self, id: &str) -> bool {
+        self.registry.get(id).is_some()
+    }
+
+    /// Adapter lookup for task launches (3a.md §20 — scheduler → adapter).
+    pub fn find_adapter(&self, id: &str) -> Option<Arc<dyn crate::adapters::AgentAdapterImpl>> {
+        self.registry.find_adapter(id)
+    }
+
     pub fn get_session(&self, eid: &ExecutionId) -> Option<AgentSnapshot> {
         // Locks are taken sequentially (work first, then session) — never
         // nested (2B.1 deadlock rule). The pump follows the same order.
@@ -938,9 +964,7 @@ impl AgentRuntime {
         p.is_custom
             || p.base_url
                 .as_deref()
-                .map(|u| {
-                    u.starts_with("http://localhost") || u.starts_with("http://127.0.0.1")
-                })
+                .map(|u| u.starts_with("http://localhost") || u.starts_with("http://127.0.0.1"))
                 .unwrap_or(false)
             || self
                 .store
@@ -972,22 +996,17 @@ impl AgentRuntime {
                         None
                     }
                 });
-            let provider_id = def
-                .name
-                .to_ascii_lowercase()
-                .split(' ')
-                .next()
-                .map(|f| {
-                    if f.starts_with("claude") {
-                        "anthropic".to_string()
-                    } else if f == "codex" || f == "opencode" {
-                        "openai".to_string()
-                    } else if f == "pi" {
-                        "anthropic".to_string()
-                    } else {
-                        f.to_string()
-                    }
-                });
+            let provider_id = def.name.to_ascii_lowercase().split(' ').next().map(|f| {
+                if f.starts_with("claude") {
+                    "anthropic".to_string()
+                } else if f == "codex" || f == "opencode" {
+                    "openai".to_string()
+                } else if f == "pi" {
+                    "anthropic".to_string()
+                } else {
+                    f.to_string()
+                }
+            });
             let credential_configured = provider_id
                 .as_ref()
                 .map(|p| self.credential_configured_for(p))
@@ -1070,9 +1089,14 @@ fn snapshot(
         events_emitted: s.metrics.events_emitted.load(Ordering::Relaxed),
         state_changes: s.metrics.state_changes.load(Ordering::Relaxed),
         work_id: work.map(|w| w.id.clone()).unwrap_or_default(),
-        work_status: work.map(|w| w.status.label().to_string()).unwrap_or_default(),
+        work_status: work
+            .map(|w| w.status.label().to_string())
+            .unwrap_or_default(),
         attention,
-        activity_kind: act.as_ref().map(|a| a.kind.label().to_string()).unwrap_or_default(),
+        activity_kind: act
+            .as_ref()
+            .map(|a| a.kind.label().to_string())
+            .unwrap_or_default(),
         activity_source: act
             .as_ref()
             .map(|a| a.source.label().to_string())
@@ -1119,9 +1143,11 @@ fn spawn_pump(ctx: PumpContext) {
             &session_id[..session_id.len().min(8)]
         ))
         .spawn(move || {
-            let mut last_state: Option<AgentState> = None;
-            let mut last_activity_emit_ms: u64 = 0;
-            let mut last_kind: Option<ActivityKind> = None;
+            let mut tracker = PumpTracker {
+                last_state: None,
+                last_kind: None,
+                last_activity_emit_ms: 0,
+            };
             let event_tx = &ctx.event_tx;
             let eid = &ctx.eid;
             let agent_session = &ctx.agent_session;
@@ -1148,9 +1174,7 @@ fn spawn_pump(ctx: PumpContext) {
                         eid,
                         agent_session,
                         &ctx.work,
-                        &mut last_state,
-                        &mut last_kind,
-                        &mut last_activity_emit_ms,
+                        &mut tracker,
                     );
                 }
                 if ctx.session.has_exited() {
@@ -1178,13 +1202,18 @@ fn spawn_pump(ctx: PumpContext) {
 
 /// Phase 2C §4: line → activity-kind heuristic (fallback layer under any
 /// future structured protocol). Conservative: unknown lines → `Unknown`.
-fn detect_activity_kind(line: &str, hint: Option<crate::adapters::ActivityHint>) -> (ActivityKind, String) {
+fn detect_activity_kind(
+    line: &str,
+    hint: Option<crate::adapters::ActivityHint>,
+) -> (ActivityKind, String) {
     if let Some(h) = hint {
         return match h {
             crate::adapters::ActivityHint::NeedsApproval => {
                 (ActivityKind::WaitingForPermission, line.trim().to_string())
             }
-            crate::adapters::ActivityHint::Waiting => (ActivityKind::WaitingForInput, String::new()),
+            crate::adapters::ActivityHint::Waiting => {
+                (ActivityKind::WaitingForInput, String::new())
+            }
             crate::adapters::ActivityHint::Working => (ActivityKind::Unknown, String::new()),
         };
     }
@@ -1241,6 +1270,14 @@ fn detect_activity_kind(line: &str, hint: Option<crate::adapters::ActivityHint>)
     (ActivityKind::Unknown, String::new())
 }
 
+/// Per-pump heuristic tracking: last state/kind/emission time, so chunk
+/// processing stays stateless apart from this one mutable unit.
+struct PumpTracker {
+    last_state: Option<AgentState>,
+    last_kind: Option<ActivityKind>,
+    last_activity_emit_ms: u64,
+}
+
 fn process_chunk(
     chunk: &[u8],
     adapter: &dyn AgentAdapterImpl,
@@ -1248,9 +1285,7 @@ fn process_chunk(
     eid: &ExecutionId,
     agent_session: &Arc<Mutex<AgentSession>>,
     work: &Arc<Mutex<AgentWork>>,
-    last_state: &mut Option<AgentState>,
-    last_kind: &mut Option<ActivityKind>,
-    last_activity_emit_ms: &mut u64,
+    tracker: &mut PumpTracker,
 ) {
     {
         let s = agent_session.lock().unwrap();
@@ -1266,8 +1301,8 @@ fn process_chunk(
         // §4/§12: state + activity-kind refinement.
         if let Some(hint) = hint {
             let state = hint.to_state();
-            if *last_state != Some(state) {
-                *last_state = Some(state);
+            if tracker.last_state != Some(state) {
+                tracker.last_state = Some(state);
                 let provenance = if state == AgentState::NeedsApproval {
                     StateProvenance::HEURISTIC_APPROVAL
                 } else {
@@ -1286,7 +1321,8 @@ fn process_chunk(
                         count: 1,
                     });
                     if needs_approval {
-                        w.timeline.push(TimelineKind::Approval, Redactor::redact(line.trim()));
+                        w.timeline
+                            .push(TimelineKind::Approval, Redactor::redact(line.trim()));
                     } else {
                         w.timeline.push(TimelineKind::Activity, kind.label());
                     }
@@ -1311,8 +1347,8 @@ fn process_chunk(
             }
         } else {
             let (kind, detail) = detect_activity_kind(line, None);
-            if kind != ActivityKind::Unknown && *last_kind != Some(kind) {
-                *last_kind = Some(kind);
+            if kind != ActivityKind::Unknown && tracker.last_kind != Some(kind) {
+                tracker.last_kind = Some(kind);
                 let now = now_ms();
                 {
                     let mut w = work.lock().unwrap();
@@ -1338,8 +1374,8 @@ fn process_chunk(
                 }
                 // Throttled emission (§23): at most one activity event per
                 // coalescing window. Sends happen outside locks.
-                if now.saturating_sub(*last_activity_emit_ms) >= work::ACTIVITY_COALESCE_MS {
-                    *last_activity_emit_ms = now;
+                if now.saturating_sub(tracker.last_activity_emit_ms) >= work::ACTIVITY_COALESCE_MS {
+                    tracker.last_activity_emit_ms = now;
                     let _ = event_tx.send((
                         eid.clone(),
                         AgentEvent::Activity {
@@ -1438,7 +1474,11 @@ fn finish(
                 w.finish(WorkStatus::Failed);
                 w.push_error(WorkError::new(
                     ErrorKind::AgentFailure,
-                    format!("agent exited with code {}", code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into())),
+                    format!(
+                        "agent exited with code {}",
+                        code.map(|c| c.to_string())
+                            .unwrap_or_else(|| "unknown".into())
+                    ),
                 ));
                 w.timeline.push(TimelineKind::Error, "agent failed");
             }

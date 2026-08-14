@@ -24,6 +24,10 @@ use terminal_session::agent::{AgentRegistry, AgentRuntime};
 use terminal_session::credential::CredentialStore;
 use terminal_session::execution::{ExecutionId, ExecutionKind};
 use terminal_session::launch::AgentLaunchConfig;
+use terminal_session::orchestration::{
+    RuntimeAgentView, SchedulerCommand, SchedulerView, Task, TaskContext, TaskGraph,
+    TaskGraphError, TaskId, TaskPolicy, TaskScheduler,
+};
 use terminal_session::provider::ProviderRegistry;
 use terminal_session::Session;
 
@@ -36,7 +40,7 @@ use crate::notify::{Notification, NotificationCenter, NotificationKind, Notifica
 use crate::pane_tree::PaneNode;
 use serde::{Deserialize, Serialize};
 use terminal_session::agent::AgentSnapshot;
-use terminal_session::execution::{AgentEvent, ApplicationEvent, AgentState};
+use terminal_session::execution::{AgentEvent, AgentState, ApplicationEvent};
 use terminal_session::work::AgentFilter;
 
 /// Default cell geometry for sessions spawned before any layout is known.
@@ -71,7 +75,10 @@ fn sort_rank(s: &AgentSnapshot) -> (u8, Option<i64>) {
         0
     } else if state == AgentState::Completed || state == AgentState::Stopped {
         2
-    } else if state == AgentState::Failed || state == AgentState::Crashed || state == AgentState::Blocked {
+    } else if state == AgentState::Failed
+        || state == AgentState::Crashed
+        || state == AgentState::Blocked
+    {
         1
     } else {
         0
@@ -207,6 +214,8 @@ pub struct Multiplexer {
     terminal_states: HashMap<ExecutionId, TerminalState>,
     /// Agent runtime for managing agent sessions.
     agent_runtime: AgentRuntime,
+    /// Phase 3A: deterministic task orchestration engine (§10–§12, §43).
+    tasks: TaskScheduler,
     layout: LayoutEngine,
     pub notifications: NotificationCenter,
     pub events: EventBus,
@@ -248,6 +257,7 @@ impl Multiplexer {
             terminal_sessions: HashMap::new(),
             terminal_states: HashMap::new(),
             agent_runtime,
+            tasks: TaskScheduler::new(TaskGraph::new(), TaskPolicy::default()),
             layout: LayoutEngine::new(),
             notifications: NotificationCenter::new(),
             events: EventBus::new(),
@@ -964,6 +974,9 @@ impl Multiplexer {
                 event,
             });
         }
+        // Phase 3A: one orchestration pass per frame (§22 — task events are
+        // published in transition order; same-task ordering is strict).
+        self.step_tasks();
         // Deliver coalesced output to subscribers; disconnect slow clients.
         self.events.flush();
 
@@ -1060,6 +1073,357 @@ impl Multiplexer {
     }
 
     // ------------------------------------------------------------------
+    // Phase 3A: task orchestration (§43) — proxies onto the scheduler
+    // ------------------------------------------------------------------
+
+    /// Creates a task in a workspace (3a.md §8 typed errors: unknown agent
+    /// definitions, unknown workspaces and unknown dependencies are
+    /// rejected here, not at run time).
+    pub fn task_create(
+        &mut self,
+        workspace_id: &WorkspaceId,
+        title: &str,
+        description: &str,
+        assigned_agent: &str,
+        dependencies: &[TaskId],
+        review_required: bool,
+    ) -> Result<TaskId, TaskGraphError> {
+        if !self.agent_runtime.definition_exists(assigned_agent) {
+            return Err(TaskGraphError::UnknownAgentDefinition(
+                assigned_agent.into(),
+            ));
+        }
+        if self.workspace(workspace_id).is_none() {
+            return Err(TaskGraphError::UnknownWorkspace(workspace_id.clone()));
+        }
+        for dep in dependencies {
+            if self.tasks.graph().get_task(dep).is_none() {
+                return Err(TaskGraphError::UnknownTask(dep.clone()));
+            }
+        }
+        let mut task = Task::new(title, description, assigned_agent, workspace_id);
+        task.review_required = review_required;
+        let id = task.id.clone();
+        self.tasks.graph_mut().add_task(task)?;
+        for dep in dependencies {
+            self.tasks.graph_mut().add_dependency(&id, dep)?;
+        }
+        let event = terminal_session::orchestration::TaskEvent::TaskCreated {
+            task_id: id.clone(),
+            title: title.to_string(),
+        };
+        self.tasks.emit(event);
+        self.publish_task_events();
+        Ok(id)
+    }
+
+    /// §43 `task.run` — schedules the whole graph (or a single task).
+    pub fn task_run(&mut self) {
+        self.tasks.submit_all();
+        self.step_tasks();
+        self.publish_task_events();
+    }
+
+    pub fn task_add_dependency(
+        &mut self,
+        task: &TaskId,
+        dep: &TaskId,
+    ) -> Result<(), TaskGraphError> {
+        self.tasks.graph_mut().add_dependency(task, dep)
+    }
+
+    pub fn task_remove_dependency(
+        &mut self,
+        task: &TaskId,
+        dep: &TaskId,
+    ) -> Result<(), TaskGraphError> {
+        self.tasks.graph_mut().remove_dependency(task, dep)
+    }
+
+    pub fn task_cancel(&mut self, task_id: &TaskId) -> Result<(), TaskGraphError> {
+        let cmds = self.tasks.cancel(task_id)?;
+        self.execute_commands(cmds);
+        self.step_tasks();
+        self.publish_task_events();
+        Ok(())
+    }
+
+    /// §43 `task.retry` — re-queues a terminal/blocked task from scratch.
+    pub fn task_retry(&mut self, task_id: &TaskId) -> Result<(), TaskGraphError> {
+        self.tasks.retry(task_id)?;
+        self.step_tasks();
+        self.publish_task_events();
+        Ok(())
+    }
+
+    pub fn task_get(&self, task_id: &TaskId) -> Option<&Task> {
+        self.tasks.graph().get_task(task_id)
+    }
+
+    /// Determinism trace (task_id, event-kind) in emission order (§48).
+    pub fn scheduler_trace(&self) -> &[(TaskId, String)] {
+        self.tasks.trace()
+    }
+
+    /// Sets a task's launch environment (deterministic fixture knob — the
+    /// adapter still builds the vendor instruction).
+    pub fn task_set_environment(
+        &mut self,
+        task_id: &TaskId,
+        pairs: &[(String, String)],
+    ) -> Result<(), TaskGraphError> {
+        let Some(task) = self.tasks.graph_mut().get_task_mut(task_id) else {
+            return Err(TaskGraphError::UnknownTask(task_id.clone()));
+        };
+        task.environment = pairs.to_vec();
+        Ok(())
+    }
+
+    /// Appends explicit launch arguments (fixture scenarios such as
+    /// `--duration` for bounded long-running agents).
+    pub fn task_add_arguments(
+        &mut self,
+        task_id: &TaskId,
+        args: &[&str],
+    ) -> Result<(), TaskGraphError> {
+        let Some(task) = self.tasks.graph_mut().get_task_mut(task_id) else {
+            return Err(TaskGraphError::UnknownTask(task_id.clone()));
+        };
+        for a in args {
+            task.arguments.push(a.to_string());
+        }
+        Ok(())
+    }
+
+    /// Reassigns a task's agent. Registry validation happens at creation
+    /// and in `workflow_validate` (an invalid ref is a graph error, §8);
+    /// mutation itself is unvalidated so broken workflows stay inspectable.
+    pub fn task_set_agent(&mut self, task_id: &TaskId, agent: &str) -> Result<(), TaskGraphError> {
+        let Some(task) = self.tasks.graph_mut().get_task_mut(task_id) else {
+            return Err(TaskGraphError::UnknownTask(task_id.clone()));
+        };
+        task.assigned_agent = agent.to_string();
+        Ok(())
+    }
+
+    pub fn task_list(&self) -> Vec<&Task> {
+        self.tasks.graph().list_tasks()
+    }
+
+    /// §8 workflow validation (graph structure + engine refs).
+    pub fn workflow_validate(&self) -> Vec<TaskGraphError> {
+        let mut issues = self.tasks.graph().validate();
+        for t in self.tasks.graph().list_tasks() {
+            if !self.agent_runtime.definition_exists(&t.assigned_agent) {
+                issues.push(TaskGraphError::UnknownAgentDefinition(
+                    t.assigned_agent.clone(),
+                ));
+            }
+            if self.workspace(&t.workspace_id).is_none() {
+                issues.push(TaskGraphError::UnknownWorkspace(t.workspace_id.clone()));
+            }
+        }
+        issues
+    }
+
+    /// §43 `scheduler.status()` — full orchestration snapshot.
+    pub fn scheduler_status(&self) -> terminal_session::orchestration::SchedulerStatus {
+        self.tasks.status()
+    }
+
+    pub fn task_policy(&self) -> TaskPolicy {
+        self.tasks.policy().clone()
+    }
+
+    pub fn set_task_policy(&mut self, policy: TaskPolicy) {
+        self.tasks.set_policy(policy);
+    }
+
+    /// §29 human review boundary: approve/reject a NeedsReview task.
+    pub fn resolve_task_review(
+        &mut self,
+        task_id: &TaskId,
+        approve: bool,
+    ) -> Result<(), TaskGraphError> {
+        self.tasks.resolve_review(task_id, approve)?;
+        self.step_tasks();
+        self.publish_task_events();
+        Ok(())
+    }
+
+    /// §40 "Open Agent": attaches a live pane to an existing task agent
+    /// execution (headless by default in 3A — attach on demand).
+    pub fn attach_task_agent_pane(&mut self, task_id: &TaskId) -> Result<PaneId> {
+        let eid = self
+            .tasks
+            .graph()
+            .get_task(task_id)
+            .and_then(|t| t.agent_execution_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("task has no agent execution"))?;
+        let (target, cwd) = {
+            let ws = self.active_workspace();
+            let Some(tab) = ws.active_tab() else {
+                bail!("no active tab");
+            };
+            let target = tab
+                .active_pane
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no focused pane"))?;
+            let cwd = tab
+                .root
+                .find_pane(&target)
+                .map(|p| p.cwd.clone())
+                .unwrap_or_else(|| ws.project_root.clone());
+            (target, cwd)
+        };
+        let launch = self
+            .agent_runtime
+            .get_session(&eid)
+            .map(|s| s.launch)
+            .ok_or_else(|| anyhow::anyhow!("agent execution no longer registered"))?;
+        let mut pane = Pane::new(ExecutionKind::Agent, eid.clone(), cwd);
+        let mut stored = launch;
+        stored.redact();
+        pane.metadata = serde_json::json!({ "agent": { "launch": stored } });
+        let tab = self.active_tab_mut()?;
+        let inserted = tab
+            .root
+            .split_by_id(&target, SplitDirection::Vertical, pane)
+            .context("target pane disappeared")?;
+        tab.active_pane = Some(inserted.clone());
+        self.events.publish(ApplicationEvent::PaneCreated {
+            pane_id: inserted.clone(),
+            execution_id: eid,
+        });
+        Ok(inserted)
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3A: scheduler drain integration
+    // ------------------------------------------------------------------
+
+    /// One deterministic orchestration pass, driven from `drain_frame`:
+    /// builds the runtime view → scheduler decides → engine executes
+    /// commands → events published (§22, §54).
+    fn step_tasks(&mut self) {
+        let mut view = SchedulerView::default();
+        for (task_id, eid) in self.tasks.running_snapshot() {
+            let Some(state) = self.agent_runtime.raw_state(&eid) else {
+                continue;
+            };
+            view.running.insert(
+                task_id,
+                RuntimeAgentView {
+                    state,
+                    exit_code: self
+                        .agent_runtime
+                        .get_session(&eid)
+                        .and_then(|s| s.exit_code),
+                    work: self.agent_runtime.get_work(&eid),
+                    estimated_cost_cents: self.agent_runtime.estimated_cost_cents(&eid),
+                },
+            );
+        }
+        let cmds = self.tasks.step(&view);
+        self.execute_commands(cmds);
+        self.publish_task_events();
+    }
+
+    fn execute_commands(&mut self, cmds: Vec<SchedulerCommand>) {
+        for cmd in cmds {
+            match cmd {
+                SchedulerCommand::SpawnTask { task_id } => match self.spawn_task_agent(&task_id) {
+                    Ok(eid) => self.tasks.note_spawned(&task_id, &eid),
+                    Err(e) => self.tasks.note_spawn_failed(&task_id, e),
+                },
+                SchedulerCommand::StopTask {
+                    task_id,
+                    execution_id,
+                } => {
+                    let result = self.agent_runtime.stop(&execution_id);
+                    self.tasks.note_stopped(&task_id, &execution_id);
+                    if let Err(e) = result {
+                        tracing::warn!(
+                            "task {}: stop of {} failed: {:#}",
+                            task_id,
+                            execution_id.0,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn publish_task_events(&mut self) {
+        for event in self.tasks.take_events() {
+            self.events.publish(ApplicationEvent::TaskEvent { event });
+        }
+    }
+
+    /// Builds the launch for a task through the adapter boundary (§20):
+    /// `prepare_task` produces the vendor instruction; explicit task
+    /// arguments/environment are appended as deterministic overrides.
+    fn spawn_task_agent(&mut self, task_id: &TaskId) -> Result<ExecutionId> {
+        let launch = {
+            let graph = self.tasks.graph();
+            let task = graph
+                .get_task(task_id)
+                .ok_or_else(|| anyhow::anyhow!("unknown task {task_id}"))?;
+            let workspace = self
+                .workspace(&task.workspace_id)
+                .ok_or_else(|| anyhow::anyhow!("unknown workspace"))?;
+            // The attempt number is deterministic scheduling info the adapter
+            // may need (fixtures like `flaky`), so it is part of the context.
+            let mut context_env = task.environment.clone();
+            context_env.push((
+                "FAKE_AGENT_ATTEMPT".to_string(),
+                task.attempt_count.to_string(),
+            ));
+            let ctx = TaskContext {
+                workspace_id: workspace.id.clone(),
+                workspace_name: workspace.name.clone(),
+                project_root: workspace.project_root.clone(),
+                task_id: task.id.clone(),
+                task_title: task.title.clone(),
+                task_description: task.description.clone(),
+                dependencies: graph.dependency_summaries(task_id),
+                artifact_paths: graph.input_artifact_paths(task_id),
+                relevant_files: graph.relevant_files(task_id),
+                environment: context_env,
+            };
+            let adapter = self
+                .agent_runtime
+                .find_adapter(&task.assigned_agent)
+                .ok_or_else(|| anyhow::anyhow!("unknown agent definition"))?;
+            let prepared = adapter.prepare_task(&ctx);
+            let mut args = prepared.arguments;
+            args.extend(task.arguments.iter().cloned());
+            let mut env = prepared.environment;
+            env.extend(task.environment.iter().cloned());
+            env.push((
+                "FAKE_AGENT_ATTEMPT".to_string(),
+                task.attempt_count.to_string(),
+            ));
+            AgentLaunchConfig {
+                definition_id: task.assigned_agent.clone(),
+                cwd: workspace.project_root.clone(),
+                arguments: args,
+                provider_id: None,
+                model_id: None,
+                credential_ref: None,
+                resume_id: None,
+                environment: env,
+            }
+        };
+        let r = self.spawn_agent_session(launch, DEFAULT_COLS, DEFAULT_ROWS);
+        if let Err(e) = &r {
+            tracing::warn!("task {task_id}: spawn failed: {e:#}");
+        }
+        r
+    }
+
+    // ------------------------------------------------------------------
     // Phase 2C: dashboard / attention / review / prefs (§9–§14, §21–§22)
     // ------------------------------------------------------------------
 
@@ -1075,11 +1439,12 @@ impl Multiplexer {
                 filter.matches_state(state)
             })
             .map(|snapshot| {
-                let pane_id = self.pane_id_for_execution(&ExecutionId(snapshot.execution_id.clone()));
+                let pane_id =
+                    self.pane_id_for_execution(&ExecutionId(snapshot.execution_id.clone()));
                 AgentRow { pane_id, snapshot }
             })
             .collect();
-        rows.sort_by(|a, b| sort_rank(&b.snapshot).cmp(&sort_rank(&a.snapshot)));
+        rows.sort_by_key(|r| std::cmp::Reverse(sort_rank(&r.snapshot)));
         let mut d = AgentDashboard {
             rows,
             ..Default::default()
@@ -1087,17 +1452,21 @@ impl Multiplexer {
         d.total = d.rows.len();
         for r in &d.rows {
             let state = agent_state_from_str(&r.snapshot.state);
-            if terminal_session::work::attention_for(state).is_some() {
-                d.needs_you += 1;
-            } else if state == AgentState::Completed || state == AgentState::Stopped {
-                d.completed += 1;
-            } else if state == AgentState::Failed
-                || state == AgentState::Crashed
-                || state == AgentState::Blocked
-            {
-                d.failed += 1;
-            } else {
-                d.running += 1;
+            match state {
+                AgentState::Completed | AgentState::Stopped => d.completed += 1,
+                AgentState::Failed | AgentState::Crashed | AgentState::Blocked => {
+                    d.failed += 1;
+                    if terminal_session::work::attention_for(state).is_some() {
+                        d.needs_you += 1;
+                    }
+                }
+                _ => {
+                    if terminal_session::work::attention_for(state).is_some() {
+                        d.needs_you += 1;
+                    } else {
+                        d.running += 1;
+                    }
+                }
             }
         }
         d
@@ -1120,14 +1489,21 @@ impl Multiplexer {
                 continue;
             };
             let state = agent_state_from_str(&snap.state);
-            if terminal_session::work::attention_for(state).is_some() {
-                s.needs_you += 1;
-            } else if state == AgentState::Completed || state == AgentState::Stopped {
-                s.completed += 1;
-            } else if state == AgentState::Failed || state == AgentState::Crashed || state == AgentState::Blocked {
-                s.failed += 1;
-            } else {
-                s.running += 1;
+            match state {
+                AgentState::Completed | AgentState::Stopped => s.completed += 1,
+                AgentState::Failed | AgentState::Crashed | AgentState::Blocked => {
+                    s.failed += 1;
+                    if terminal_session::work::attention_for(state).is_some() {
+                        s.needs_you += 1;
+                    }
+                }
+                _ => {
+                    if terminal_session::work::attention_for(state).is_some() {
+                        s.needs_you += 1;
+                    } else {
+                        s.running += 1;
+                    }
+                }
             }
         }
         s
@@ -1207,10 +1583,7 @@ impl Multiplexer {
                 if reason.is_none() {
                     return;
                 }
-                let notified = self
-                    .notified_attention
-                    .entry(eid.clone())
-                    .or_default();
+                let notified = self.notified_attention.entry(eid.clone()).or_default();
                 if notified.contains(new_state) {
                     return;
                 }
@@ -1229,7 +1602,10 @@ impl Multiplexer {
                     terminal_session::work::AttentionReason::NeedsInput => {
                         if prefs.on_needs_me {
                             self.notifications.emit(Notification::new(
-                                NotificationKind::AgentNeedsInput { agent: name, pane_id },
+                                NotificationKind::AgentNeedsInput {
+                                    agent: name,
+                                    pane_id,
+                                },
                             ));
                         }
                     }
@@ -1257,12 +1633,12 @@ impl Multiplexer {
                     }
                 }
             }
-            AgentEvent::Completed => {
-                if prefs.on_completion {
-                    self.notifications.emit(Notification::new(
-                        NotificationKind::AgentCompleted { agent: name, pane_id },
-                    ));
-                }
+            AgentEvent::Completed if prefs.on_completion => {
+                self.notifications
+                    .emit(Notification::new(NotificationKind::AgentCompleted {
+                        agent: name,
+                        pane_id,
+                    }));
             }
             _ => {}
         }
@@ -1278,6 +1654,7 @@ impl Multiplexer {
             version: crate::persist::CURRENT_VERSION,
             workspaces: self.workspaces.clone(),
             active_workspace: active,
+            tasks: Some(self.tasks.export_persisted()),
         }
     }
 
@@ -1303,10 +1680,14 @@ impl Multiplexer {
                         continue;
                     };
                     let agent_obj = if pane.metadata.is_object() {
-                        pane.metadata.as_object_mut().expect("metadata is an object")
+                        pane.metadata
+                            .as_object_mut()
+                            .expect("metadata is an object")
                     } else {
                         pane.metadata = serde_json::json!({});
-                        pane.metadata.as_object_mut().expect("metadata is an object")
+                        pane.metadata
+                            .as_object_mut()
+                            .expect("metadata is an object")
                     };
                     let mut timeline = Vec::new();
                     for e in work.timeline.recent(20) {
@@ -1434,6 +1815,16 @@ impl Multiplexer {
         }
         self.workspaces = new_workspaces;
         self.active_workspace = 0;
+        // Phase 3A §24: rebuild the scheduler from disk. Running/Waiting
+        // tasks are marked Interrupted (nothing resumes silently); Ready
+        // tasks are re-queued. Task events from the transition are held
+        // until the next drain.
+        if let Some(tasks) = state.tasks {
+            self.tasks = TaskScheduler::import_persisted(tasks);
+            for event in self.tasks.take_events() {
+                self.events.publish(ApplicationEvent::TaskEvent { event });
+            }
+        }
         failed
     }
 

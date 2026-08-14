@@ -1,10 +1,13 @@
-# Current Architecture (Phase 1 + Phase 2 / 2B.1)
+# Current Architecture (Phase 1 + Phase 2 / 2B.1 + Phase 2C)
 
 This document describes the FlashTerminal architecture as implemented at the
-end of Phase 1, updated with the Phase 2 (multi-agent infrastructure) and
+end of Phase 1, updated with the Phase 2 (multi-agent infrastructure),
 Phase 2B.1 (real-agent validation + concurrency + desktop agent UX + event
-streaming) additions. Phase 1 sections are marked; the agent layer is
-`## AI Agents (Phase 2 / 2B.1)`.
+streaming) and Phase 2C (agent observability: work/activity/timeline/
+dashboard/attention/usage/pricing/health/replay/intent/notifications)
+additions. Phase 1 sections are marked; the agent layer is
+`## AI Agents (Phase 2 / 2B.1 / 2C)` — see also `agent-observability.md` for
+the Phase 2C surface.
 > **Interactive diagram:** open [`docs/diagrams/flashterminal-architecture.html`](diagrams/flashterminal-architecture.html) (source: `docs/diagrams/flashterminal.architecture.json`) for a navigable map of the architecture.
 
 ## Crate Responsibilities
@@ -14,13 +17,13 @@ streaming) additions. Phase 1 sections are marked; the agent layer is
 | **`terminal-core`** | Owns the terminal state model: packed 16-byte `Cell`, `Row`, `Cursor`, `Color`, `Attribute`, Unicode/wide/ZWJ handling, deferred wrap, alt screen, and the dirty-tracking bitset. **Tiered hot/cold scrollback** — a bounded `VecDeque<Row>` hot tier plus a cold tier of 128-row RLE+flate2 compressed blocks (`ColdStore`, `crates/terminal-core/src/scrollback.rs`), decode-on-demand viewport (ADR-0004). Memory is **flat (~3.4 MB/pane) from 10 k to 1 M history rows**. Exposes `RenderSnapshot` — an immutable, cell-reader view of the grid. |
 | **`terminal-parser`** | Stateless byte→`TerminalEvent` transducer built on `vte`. No state of its own. |
 | **`pty`** | Wraps `portable-pty` 0.8: spawns sessions, blocking `read_available`, non-blocking writes, resize, terminate. **Amortised O(1) pending-write FIFO** — 17.3 MB/s linear throughput. |
-| **`terminal-session`** | Ownership hub between PTY and UI. `Session` spawns the reader/parser thread and forwards batches over a bounded channel (cap 1024) for backpressure. `spawn_with_wake` fires an `EventLoopProxy` callback when batches arrive. **Phase 2: the agent runtime** — `AgentRuntime` (spawn/lifecycle/pump/events), `AgentRegistry` + adapters (`claude-code`, `codex`, `opencode`, `pi`, generic, fake), provider registry + model catalog, keychain `CredentialStore` (BYOK), `Redactor`, agent state machine with provenance-aware snapshots. |
+| **`terminal-session`** | Ownership hub between PTY and UI. `Session` spawns the reader/parser thread and forwards batches over a bounded channel (cap 1024) for backpressure. `spawn_with_wake` fires an `EventLoopProxy` callback when batches arrive. **Phase 2: the agent runtime** — `AgentRuntime` (spawn/lifecycle/pump/events), `AgentRegistry` + adapters (`claude-code`, `codex`, `opencode`, `pi`, generic, fake), provider registry + model catalog, keychain `CredentialStore` (BYOK), `Redactor`, agent state machine with provenance-aware snapshots. **Phase 2C: observability models** — `AgentWork`/Activity/Timeline/Summary/Attention, `AgentUsage` + `PricingRegistry`, secret-free health, replay fixtures, intent resolution (`work.rs`). |
 | **`terminal-text`** | Font discovery + glyph rasterization via `fontdue`, LRU `GlyphCache` keyed by (font, glyph, size). |
 | **`terminal-renderer`** | `wgpu` renderer: shared glyph atlas, instanced text, dirty-row updates, cursor/selection, chrome (sidebar/tab strip/focus borders) through the same atlas, and **`render_multi`** — renders N pane viewports in ONE frame (§10–11, §28). Consumes immutable `RenderSnapshot`s only. |
-| **`terminal-workspace`** | **Phase 1 — the multiplexer + workspace engine** (UI-agnostic). Owns `Workspace`s → `Tab`s → binary pane split trees (pure data), and the live `Session`s/`TerminalState`s keyed by `SessionId` (`Multiplexer`). Provides the layout engine, command registry, versioned persistence + restore, notification center, and the IPC protocol (Request/Response/Event over a Unix socket). **Phase 2/2B: agent pane integration** — `split_pane_agent` (redacted metadata), agent lifecycle + permission surface on `Multiplexer`, unified `ApplicationEvent` bus with bounded subscriber queues / coalescing / drop / slow-client-disconnect policies, and the `subscribe`/`unsubscribe` event-stream IPC. |
+| **`terminal-workspace`** | **Phase 1 — the multiplexer + workspace engine** (UI-agnostic). Owns `Workspace`s → `Tab`s → binary pane split trees (pure data), and the live `Session`s/`TerminalState`s keyed by `SessionId` (`Multiplexer`). Provides the layout engine, command registry, versioned persistence + restore, notification center, and the IPC protocol (Request/Response/Event over a Unix socket). **Phase 2/2B: agent pane integration** — `split_pane_agent` (redacted metadata), agent lifecycle + permission surface on `Multiplexer`, unified `ApplicationEvent` bus with bounded subscriber queues / coalescing / drop / slow-client-disconnect policies, and the `subscribe`/`unsubscribe` event-stream IPC. **Phase 2C: agent observability surface** — `agent_dashboard`/`workspace_agent_summary`/`agent_review` (bounded diffs), quiet-mode `NotificationPrefs` (persisted + redacted), `CommandRegistry::palette()`, intent-aware IPC requests (`agents`, `work`, `review`, `health`). |
 | **`crates/fake-agent`** | Deterministic agent executable (Phase 2B): `startup/working/streaming/waiting/approval/completion/failure/crash/large-output/long-running` scenarios for tests and stress harnesses. |
-| **`apps/desktop`** | `winit` 0.29 main binary. Owns the `Multiplexer` (behind a mutex shared with the IPC server), drains once per frame, renders all panes through the shared renderer, and draws the sidebar/tab-strip chrome. **Phase 2B: agent UX** — agent pane header (state badge, capability-gated Stop/Restart/Resume, permission Allow/Deny bar, completion/failure indicators), sidebar agent list + info panel. |
-| **`apps/cli`** | `terminal` binary: `workspace list|create|open|rename|close`, `tab create|close`, `pane split|close|focus|list`, `terminal serve` (headless control surface), **Phase 2: `agent list|spawn|spawn-pane|status|stop|restart|resume|pause|permission|watch`** (live event-stream subscription). |
+| **`apps/desktop`** | `winit` 0.29 main binary. Owns the `Multiplexer` (behind a mutex shared with the IPC server), drains once per frame, renders all panes through the shared renderer, and draws the sidebar/tab-strip chrome. **Phase 2B: agent UX** — agent pane header (state badge, capability-gated Stop/Restart/Resume, permission Allow/Deny bar, completion/failure indicators), sidebar agent list + info panel. **Phase 2C: observability UX** — filtered sidebar agent list (dashboard filters), review/work overlay with bounded diffs, agent logs, empty state + provider setup overlays, diagnostics overlay, command palette, quiet-mode toggle; every action routes through one `run_command` dispatch shared with key bindings. |
+| **`apps/cli`** | `terminal` binary: `workspace list|create|open|rename|close`, `tab create|close`, `pane split|close|focus|list`, `terminal serve` (headless control surface), **Phase 2: `agent list|spawn|spawn-pane|status|stop|restart|resume|pause|permission|watch`** (live event-stream subscription). **Phase 2C: `agents [filter]`, `agent work|timeline|review|health <id>`** (dashboard + observability over IPC). |
 | **`benchmarks`** | Validation & benchmark suite: `validate`, `scrollback_bench`, `raw_throughput`, `paste_bench`, `plateau`, `soak`, `alloc_profiler`, and Phase 1 `multiplex_bench` (creation latencies, 1–50 pane scaling, 20-pane stress with focused-pane input latency, state-batching metrics). **Phase 2B: `agent_stress`** (10-agent concurrency + interactive panes, 5-heavy starvation, memory scaling 1/5/10/20 × 4 workloads, event throughput, high-output 1/5/10 stability + tail integrity). |
 
 ## Thread Ownership & Data Flow
@@ -79,7 +82,7 @@ Rules (§3): workspaces own tabs, tabs own pane trees, panes *reference*
 sessions, the multiplexer owns live sessions, the renderer renders snapshots.
 The pane tree is pure data and fully serializable.
 
-## AI Agents (Phase 2 / 2B.1)
+## AI Agents (Phase 2 / 2B.1 / 2C)
 
 ```text
 agent process ──► PTY master ──► [reader + parser thread]  (same pipeline as shells)
@@ -128,6 +131,26 @@ agent process ──► PTY master ──► [reader + parser thread]  (same pip
   `benchmarks/src/bin/agent_stress.rs` (§2–6 harness),
   `real_agents` feature suite (§7–11, SKIP-when-unavailable), IPC/persistence
   integration tests. Results: `docs/agent-compatibility.md`, `docs/phase2b.md`.
+
+### Agent observability (Phase 2C)
+
+Backend models live in `terminal-session` (`work.rs`): `AgentWork` (one per
+execution id, status/commands/files/errors/usage, idempotent `finish`),
+heuristic `ActivityKind` with coalescing windows, bounded `AgentTimeline`
+ring, `attention_for(state)` as the single needs-you definition,
+`AgentUsage` + `PricingRegistry` (unknown ⇒ no estimate), secret-free
+`health()` rows, deterministic fixture `replay_into`. The engine
+(`terminal-workspace`) adds `agent_dashboard(filter)` (explicit overlapping
+counts: `needs_you` can include `failed`), `workspace_agent_summary()`,
+`agent_review()` (bounded diffs), the `NotificationCenter` + quiet-mode
+`NotificationPrefs` (persisted, redacted), and `CommandRegistry::palette()`.
+Desktop surfaces: filtered sidebar agent list, review/work overlay with
+bounded diffs, empty state + provider setup overlays, diagnostics overlay,
+palette dispatch, quiet-mode toggle, and dashboard-filter key bindings —
+all routed through one `run_command` dispatch. CLI adds
+`terminal agents [filter]` and `terminal agent work|timeline|review|health
+<id>`. Full surface: `docs/agent-observability.md`; verification truth
+table: `docs/phase2c-verification.md`.
 
 ## Verified Budgets (Phase 0.5 + Phase 1)
 

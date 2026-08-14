@@ -111,6 +111,10 @@ pub enum ApplicationEvent {
         execution_id: ExecutionId,
         event: AgentEvent,
     },
+    /// Phase 3A: orchestration lifecycle events (§21 — single event bus).
+    TaskEvent {
+        event: crate::orchestration::TaskEvent,
+    },
 }
 
 /// Semantic events specific to agent sessions.

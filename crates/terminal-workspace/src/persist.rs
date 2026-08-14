@@ -104,6 +104,7 @@ mod tests {
             version: 1,
             workspaces: vec![ws],
             active_workspace: Some(ws_id),
+            tasks: None,
         }
     }
 

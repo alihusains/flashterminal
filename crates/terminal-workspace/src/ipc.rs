@@ -19,6 +19,7 @@ use crate::events::EventFilter;
 use crate::model::{PaneId, SplitDirection, WorkspaceId};
 use terminal_session::execution::ApplicationEvent;
 use terminal_session::launch::AgentLaunchConfig;
+use terminal_session::orchestration::{Task, TaskId, TaskPolicy};
 
 /// Default control socket path (overridable via env for tests).
 pub fn default_socket_path() -> std::path::PathBuf {
@@ -149,6 +150,41 @@ pub enum Request {
         on_start: bool,
     },
     NotificationPrefs,
+    // --- Phase 3A: task orchestration (§43) ---
+    TaskCreate {
+        workspace_id: WorkspaceId,
+        title: String,
+        description: String,
+        assigned_agent: String,
+        dependencies: Vec<TaskId>,
+        review_required: bool,
+    },
+    TaskList,
+    TaskStatus {
+        task_id: TaskId,
+    },
+    /// `task.run` — schedules the whole graph.
+    TaskRun,
+    TaskCancel {
+        task_id: TaskId,
+    },
+    TaskRetry {
+        task_id: TaskId,
+    },
+    TaskPolicy,
+    SetTaskPolicy {
+        policy: TaskPolicy,
+    },
+    TaskResolveReview {
+        task_id: TaskId,
+        approve: bool,
+    },
+    TaskAttachPane {
+        task_id: TaskId,
+    },
+    WorkflowValidate,
+    /// `scheduler.status()` — full orchestration snapshot.
+    SchedulerStatus,
 }
 
 /// Application → client responses.
@@ -197,6 +233,22 @@ pub enum Response {
     },
     NotificationPrefs {
         prefs: crate::notify::NotificationPrefs,
+    },
+    // --- Phase 3A: task orchestration responses ---
+    Tasks {
+        tasks: Vec<Task>,
+    },
+    TaskStatus {
+        task: Task,
+    },
+    TaskPolicy {
+        policy: TaskPolicy,
+    },
+    SchedulerStatus {
+        status: terminal_session::orchestration::SchedulerStatus,
+    },
+    WorkflowValidation {
+        issues: Vec<String>,
     },
     Err {
         message: String,
@@ -634,6 +686,89 @@ pub fn handle(engine: &mut crate::engine::Multiplexer, req: Request) -> Response
         Request::NotificationPrefs => Response::NotificationPrefs {
             prefs: engine.notification_prefs(),
         },
+        // --- Phase 3A: task orchestration (§43) ---
+        Request::TaskCreate {
+            workspace_id,
+            title,
+            description,
+            assigned_agent,
+            dependencies,
+            review_required,
+        } => match engine.task_create(
+            &workspace_id,
+            &title,
+            &description,
+            &assigned_agent,
+            &dependencies,
+            review_required,
+        ) {
+            Ok(task_id) => Response::Ok {
+                message: format!("created task {task_id}"),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::TaskList => Response::Tasks {
+            tasks: engine.task_list().into_iter().cloned().collect(),
+        },
+        Request::TaskStatus { task_id } => match engine.task_get(&task_id) {
+            Some(task) => Response::TaskStatus { task: task.clone() },
+            None => Response::err(format!("unknown task {task_id}")),
+        },
+        Request::TaskRun => {
+            engine.task_run();
+            Response::Ok {
+                message: "workflow scheduled".into(),
+            }
+        }
+        Request::TaskCancel { task_id } => match engine.task_cancel(&task_id) {
+            Ok(()) => Response::Ok {
+                message: format!("cancelled task {task_id}"),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::TaskRetry { task_id } => match engine.task_retry(&task_id) {
+            Ok(()) => Response::Ok {
+                message: format!("retried task {task_id}"),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::TaskPolicy => Response::TaskPolicy {
+            policy: engine.task_policy(),
+        },
+        Request::SetTaskPolicy { policy } => {
+            engine.set_task_policy(policy);
+            Response::Ok {
+                message: "task policy updated".into(),
+            }
+        }
+        Request::TaskResolveReview { task_id, approve } => {
+            match engine.resolve_task_review(&task_id, approve) {
+                Ok(()) => Response::Ok {
+                    message: format!(
+                        "task {task_id} {}",
+                        if approve { "approved" } else { "rejected" }
+                    ),
+                },
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::TaskAttachPane { task_id } => match engine.attach_task_agent_pane(&task_id) {
+            Ok(pane_id) => Response::Ok {
+                message: format!("attached task {task_id} to pane {pane_id}"),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::WorkflowValidate => {
+            let issues: Vec<String> = engine
+                .workflow_validate()
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect();
+            Response::WorkflowValidation { issues }
+        }
+        Request::SchedulerStatus => Response::SchedulerStatus {
+            status: engine.scheduler_status(),
+        },
     }
 }
 
@@ -773,6 +908,91 @@ mod tests {
             }
             _ => panic!("expected workspaces response"),
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn socket_task_lifecycle_and_scheduler() {
+        let engine = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::engine::Multiplexer::new().unwrap(),
+        ));
+        let path = std::env::temp_dir().join(format!("ft-ipc3-{}.sock", std::process::id()));
+        serve(engine, &path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Create a workspace + a task bound to a known agent definition.
+        let ws = roundtrip(
+            &path,
+            &Request::WorkspaceCreate {
+                name: "tasks".into(),
+                project_root: "/tmp".into(),
+            },
+        )
+        .unwrap();
+        let Response::Ok { message } = ws else {
+            panic!("expected ok");
+        };
+        let workspace_id = message
+            .split_whitespace()
+            .next_back()
+            .expect("workspace id in create response")
+            .to_string();
+
+        // task.create, task.get, task.list, scheduler.status round-trips.
+        // "fake-agent" is a default definition (agent.rs defaults).
+        let create = roundtrip(
+            &path,
+            &Request::TaskCreate {
+                workspace_id,
+                title: "t1".into(),
+                description: "phase3a ipc test".into(),
+                assigned_agent: "fake-agent".into(),
+                dependencies: vec![],
+                review_required: false,
+            },
+        )
+        .unwrap();
+        let Response::Ok { message } = create else {
+            panic!("expected ok from task create");
+        };
+        let task_id = message
+            .split_whitespace()
+            .next_back()
+            .expect("task id in create response")
+            .to_string();
+
+        let get = roundtrip(
+            &path,
+            &Request::TaskStatus {
+                task_id: task_id.clone(),
+            },
+        )
+        .unwrap();
+        match &get {
+            Response::TaskStatus { task } => {
+                assert_eq!(task.title, "t1");
+                assert_eq!(task.assigned_agent, "fake-agent");
+            }
+            _ => panic!("expected task status response"),
+        }
+
+        let list = roundtrip(&path, &Request::TaskList).unwrap();
+        assert!(matches!(list, Response::Tasks { tasks } if tasks.len() == 1));
+
+        // Workflow validate is happy for a single task with a known agent.
+        let val = roundtrip(&path, &Request::WorkflowValidate).unwrap();
+        assert!(matches!(val, Response::WorkflowValidation { issues } if issues.is_empty()));
+
+        // Scheduler status shapes up (Pending until task.run).
+        let sched = roundtrip(&path, &Request::SchedulerStatus).unwrap();
+        assert!(matches!(
+            sched,
+            Response::SchedulerStatus { status } if status.states.len() == 1
+        ));
+
+        // Cancel a task that never ran.
+        let cancel = roundtrip(&path, &Request::TaskCancel { task_id }).unwrap();
+        assert!(matches!(cancel, Response::Ok { .. }));
         let _ = std::fs::remove_file(&path);
     }
 }

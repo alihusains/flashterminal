@@ -11,20 +11,49 @@ use crate::model::PaneId;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotificationKind {
     /// A pane's child process exited.
-    ProcessExited { pane_id: PaneId, code: Option<i32> },
+    ProcessExited {
+        pane_id: PaneId,
+        code: Option<i32>,
+    },
     /// A PTY/session error occurred (e.g. read error, spawn failure).
-    SessionError { pane_id: PaneId, message: String },
+    SessionError {
+        pane_id: PaneId,
+        message: String,
+    },
     /// The application failed to persist/restore a workspace.
-    PersistenceError { message: String },
+    PersistenceError {
+        message: String,
+    },
     // Phase 2C §21: meaningful agent notifications only (never per-output
     // or per-state-transition noise).
-    AgentCompleted { agent: String, pane_id: PaneId },
-    AgentFailed { agent: String, code: Option<i32>, pane_id: PaneId },
-    AgentNeedsApproval { agent: String, pane_id: PaneId },
-    AgentNeedsInput { agent: String, pane_id: PaneId },
-    AgentProviderFailure { agent: String, message: String, pane_id: PaneId },
+    AgentCompleted {
+        agent: String,
+        pane_id: PaneId,
+    },
+    AgentFailed {
+        agent: String,
+        code: Option<i32>,
+        pane_id: PaneId,
+    },
+    AgentNeedsApproval {
+        agent: String,
+        pane_id: PaneId,
+    },
+    AgentNeedsInput {
+        agent: String,
+        pane_id: PaneId,
+    },
+    AgentProviderFailure {
+        agent: String,
+        message: String,
+        pane_id: PaneId,
+    },
     /// The application requires the user's attention somewhere.
-    AttentionSummary { needs_you: u32, failed: u32, pane_id: PaneId },
+    AttentionSummary {
+        needs_you: u32,
+        failed: u32,
+        pane_id: PaneId,
+    },
 }
 
 /// Quiet-mode preferences (2c.md §22): workspace-level notification policy.

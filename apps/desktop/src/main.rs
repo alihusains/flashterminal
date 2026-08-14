@@ -30,10 +30,13 @@ use anyhow::Result;
 use arboard::Clipboard;
 use terminal_renderer::{CursorStyle, Renderer, ViewportRender};
 use terminal_workspace::command::{Command, CommandRegistry, KeyChord};
+use terminal_workspace::engine::AgentDashboard;
 use terminal_workspace::ipc;
 use terminal_workspace::model::SplitDirection;
 use terminal_workspace::terminal_session::agent::{AgentSnapshot, PermissionDecision};
 use terminal_workspace::terminal_session::execution::ExecutionId;
+use terminal_workspace::terminal_session::orchestration::Task;
+use terminal_workspace::terminal_session::work::{AgentFilter, AgentHealthRow};
 use terminal_workspace::{Multiplexer, Rect};
 use winit::{
     dpi::PhysicalSize,
@@ -84,6 +87,36 @@ enum AgentButton {
     Stop,
     Restart,
     Resume,
+}
+
+/// Overlay modes for full-screen UI (Phase 2C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayMode {
+    EmptyState,
+    ProviderSetup,
+    /// Phase 3A (§55): minimal task dashboard.
+    Tasks,
+}
+
+/// Provider setup state (Phase 2C §28).
+#[derive(Debug, Clone, Default)]
+struct ProviderSetupState {
+    selecting_provider: bool,
+    configured_providers: Vec<(String, bool)>,
+    error: Option<String>,
+}
+
+/// Work view content (diff panel) for an agent (Phase 2C §9).
+#[derive(Debug, Clone, Default)]
+struct WorkView {
+    /// Files changed (git diff).
+    changed_files: Vec<String>,
+    /// Current selected file.
+    selected_file: usize,
+    /// Diff text.
+    diff_text: String,
+    /// Success indicator.
+    success: bool,
 }
 
 /// A chrome click outcome, resolved before any `&mut self` call.
@@ -152,6 +185,21 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Phase 3A §55: task status color in the dashboard.
+fn task_state_color(
+    status: &terminal_workspace::terminal_session::orchestration::TaskStatus,
+) -> [f32; 4] {
+    use terminal_workspace::terminal_session::orchestration::TaskStatus::*;
+    match status {
+        Pending | Ready | Interrupted => CHROME_FG_DIM,
+        Running | Waiting => STATE_WORKING,
+        NeedsReview => STATE_APPROVAL,
+        Blocked => STATE_WAITING,
+        Completed => STATE_DONE,
+        Failed | Cancelled | Skipped => STATE_FAILED,
+    }
+}
+
 /// User events delivered to the event loop from other threads.
 #[derive(Debug, Clone, Copy)]
 enum AppEvent {
@@ -180,6 +228,24 @@ struct App {
     sidebar_agent_hits: Vec<(String, Rect)>,
     /// Agent filter for the dashboard (§37).
     agent_filter: AgentFilter,
+    /// Command palette state (§37).
+    palette_open: bool,
+    palette_query: String,
+    palette_selection: usize,
+    /// Work view overlay (diff view) for focused agent.
+    work_view_visible: bool,
+    /// Review data backing the work view (§9).
+    work_view: Option<WorkView>,
+    /// Developer diagnostics panel (Phase 2C §32).
+    diagnostics_visible: bool,
+    /// Empty state / setup overlay.
+    overlay_mode: Option<OverlayMode>,
+    /// Provider configuration UI state.
+    provider_setup: ProviderSetupState,
+    /// Agent installation status check.
+    agent_health: Vec<AgentHealthRow>,
+    /// Phase 3A: selected row in the task dashboard (insertion order).
+    tasks_selection: usize,
 }
 
 impl App {
@@ -200,6 +266,16 @@ impl App {
             agent_hits: Vec::new(),
             sidebar_agent_hits: Vec::new(),
             agent_filter: AgentFilter::All,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_selection: 0,
+            work_view_visible: false,
+            work_view: None,
+            diagnostics_visible: false,
+            overlay_mode: None,
+            provider_setup: ProviderSetupState::default(),
+            agent_health: Vec::new(),
+            tasks_selection: 0,
         }
     }
 
@@ -309,113 +385,183 @@ impl App {
 
     /// Runs a Phase 1 command against the engine (§15, §16).
     fn run_command(&mut self, cmd: &Command) {
-        let mut eng = self.engine.lock().expect("engine lock");
+        // Phase 2C agent commands lock the engine internally so `&mut self`
+        // helpers never alias an active `MutexGuard`.
+        if matches!(
+            cmd,
+            Command::ShowAgents
+                | Command::ShowAgentsNeedingAttention
+                | Command::ShowFailedAgents
+                | Command::ShowCompletedAgents
+                | Command::FocusNextAgent
+                | Command::FocusPreviousAgent
+                | Command::FocusAgent(_)
+                | Command::ToggleAgentWorkView
+                | Command::ReviewAgentChanges
+                | Command::OpenAgentLogs
+                | Command::StopAgent
+                | Command::RestartAgent
+                | Command::ResumeAgent
+                | Command::Approve
+                | Command::Deny
+                | Command::ToggleQuietMode
+                | Command::ToggleCommandPalette
+        ) {
+            self.dispatch_agent_command(cmd);
+            return;
+        }
+        // Phase 3A task commands: the task dashboard owns a selected task;
+        // these lock the engine themselves (never alias a live guard).
+        if matches!(
+            cmd,
+            Command::RunTasks
+                | Command::ToggleTasks
+                | Command::CancelSelectedTask
+                | Command::RetrySelectedTask
+                | Command::ApproveSelectedTask
+                | Command::RejectSelectedTask
+                | Command::OpenSelectedTaskAgent
+        ) {
+            self.dispatch_task_command(cmd);
+            return;
+        }
+        let result: anyhow::Result<()> = {
+            let mut eng = self.engine.lock().expect("engine lock");
+            match cmd {
+                Command::SplitHorizontal => eng.split_pane(SplitDirection::Horizontal).map(|_| ()),
+                Command::SplitVertical => eng.split_pane(SplitDirection::Vertical).map(|_| ()),
+                Command::ClosePane => {
+                    if let Some(id) = eng.focused_pane() {
+                        eng.close_pane(&id)
+                    } else {
+                        Ok(())
+                    }
+                }
+                Command::FocusNext => eng.focus_next(),
+                Command::FocusPrevious => eng.focus_previous(),
+                Command::ZoomPane => {
+                    if let Some(id) = eng.focused_pane() {
+                        eng.zoom_pane(&id)
+                    } else {
+                        Ok(())
+                    }
+                }
+                Command::ResizePaneLeft => {
+                    let pane = eng.focused_pane().unwrap_or_default();
+                    eng.resize_pane(&pane, -20.0)
+                }
+                Command::ResizePaneRight => {
+                    let pane = eng.focused_pane().unwrap_or_default();
+                    eng.resize_pane(&pane, 20.0)
+                }
+                Command::ResizePaneUp => {
+                    let pane = eng.focused_pane().unwrap_or_default();
+                    eng.resize_pane(&pane, -20.0)
+                }
+                Command::ResizePaneDown => {
+                    let pane = eng.focused_pane().unwrap_or_default();
+                    eng.resize_pane(&pane, 20.0)
+                }
+                Command::NewTab => eng.new_tab().map(|_| ()),
+                Command::CloseTab => {
+                    if let Some(id) = eng.active_tab_id() {
+                        eng.close_tab(&id)
+                    } else {
+                        Ok(())
+                    }
+                }
+                Command::NextTab => eng.next_tab(),
+                Command::PreviousTab => eng.previous_tab(),
+                Command::NewWorkspace => {
+                    let cwd = std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                        .to_string_lossy()
+                        .to_string();
+                    eng.create_workspace("New Workspace", &cwd).map(|_| ())
+                }
+                Command::CloseWorkspace => {
+                    let id = eng.active_workspace().id.clone();
+                    eng.close_workspace(&id)
+                }
+                Command::SwitchWorkspace(id) => eng.switch_workspace(id),
+                _ => Ok(()),
+            }
+        };
+        if let Err(e) = result {
+            tracing::debug!("command {cmd:?} failed: {e}");
+        }
+        self.persist();
+    }
+
+    /// Phase 2C agent commands (§36–§37): each locks the engine itself, so
+    /// `&mut self` helpers never alias an active `MutexGuard`.
+    fn dispatch_agent_command(&mut self, cmd: &Command) {
         let result: anyhow::Result<()> = match cmd {
-            Command::SplitHorizontal => eng.split_pane(SplitDirection::Horizontal).map(|_| ()),
-            Command::SplitVertical => eng.split_pane(SplitDirection::Vertical).map(|_| ()),
-            Command::ClosePane => {
-                if let Some(id) = eng.focused_pane() {
-                    eng.close_pane(&id)
-                } else {
-                    Ok(())
-                }
-            }
-            Command::FocusNext => eng.focus_next(),
-            Command::FocusPrevious => eng.focus_previous(),
-            Command::ZoomPane => {
-                if let Some(id) = eng.focused_pane() {
-                    eng.zoom_pane(&id)
-                } else {
-                    Ok(())
-                }
-            }
-            Command::ResizePaneLeft => {
-                let pane = eng.focused_pane().unwrap_or_default();
-                eng.resize_pane(&pane, -20.0)
-            }
-            Command::ResizePaneRight => {
-                let pane = eng.focused_pane().unwrap_or_default();
-                eng.resize_pane(&pane, 20.0)
-            }
-            Command::ResizePaneUp => {
-                let pane = eng.focused_pane().unwrap_or_default();
-                eng.resize_pane(&pane, -20.0)
-            }
-            Command::ResizePaneDown => {
-                let pane = eng.focused_pane().unwrap_or_default();
-                eng.resize_pane(&pane, 20.0)
-            }
-            Command::NewTab => eng.new_tab().map(|_| ()),
-            Command::CloseTab => {
-                if let Some(id) = eng.active_tab_id() {
-                    eng.close_tab(&id)
-                } else {
-                    Ok(())
-                }
-            }
-            Command::NextTab => eng.next_tab(),
-            Command::PreviousTab => eng.previous_tab(),
-            Command::NewWorkspace => {
-                let cwd = std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-                    .to_string_lossy()
-                    .to_string();
-                eng.create_workspace("New Workspace", &cwd).map(|_| ())
-            }
-            Command::CloseWorkspace => {
-                let id = eng.active_workspace().id.clone();
-                eng.close_workspace(&id)
-            }
-            Command::SwitchWorkspace(id) => eng.switch_workspace(id),
-            // --- Phase 2C: agent commands (§36–§37) ---
-            // Helpers lock the engine internally; drop the outer eng guard first
-            // so `&mut self` methods don't alias the MutexGuard.
             Command::ShowAgents => {
-                drop(eng);
-                self.agent_dashboard_filter(AgentFilter::All)
+                self.agent_dashboard_filter(AgentFilter::All);
+                Ok(())
             }
             Command::ShowAgentsNeedingAttention => {
-                drop(eng);
-                self.agent_dashboard_filter(AgentFilter::NeedsAttention)
+                self.agent_dashboard_filter(AgentFilter::NeedsAttention);
+                Ok(())
             }
             Command::ShowFailedAgents => {
-                drop(eng);
-                self.agent_dashboard_filter(AgentFilter::Failed)
+                self.agent_dashboard_filter(AgentFilter::Failed);
+                Ok(())
             }
             Command::ShowCompletedAgents => {
-                drop(eng);
-                self.agent_dashboard_filter(AgentFilter::Completed)
+                self.agent_dashboard_filter(AgentFilter::Completed);
+                Ok(())
             }
-            Command::FocusNextAgent => {
-                drop(eng);
-                self.cycle_agent(true)
+            Command::FocusNextAgent => self.cycle_agent(true),
+            Command::FocusPreviousAgent => self.cycle_agent(false),
+            Command::FocusAgent(pid) => {
+                let mut eng = self.engine.lock().expect("engine lock");
+                if pid.is_empty() {
+                    // Palette "Focus Agent": focus the first agent pane.
+                    let target = eng
+                        .agent_dashboard(AgentFilter::All)
+                        .rows
+                        .into_iter()
+                        .find_map(|r| r.pane_id);
+                    match target {
+                        Some(pane) => eng.focus_pane(&pane).map(|_| ()),
+                        None => Ok(()),
+                    }
+                } else {
+                    eng.focus_pane(pid).map(|_| ())
+                }
             }
-            Command::FocusPreviousAgent => {
-                drop(eng);
-                self.cycle_agent(false)
-            }
-            Command::FocusAgent(pid) => eng.focus_pane(&pid).map(|_| ()),
             Command::ToggleAgentWorkView | Command::ReviewAgentChanges => {
-                drop(eng);
-                self.toggle_work_view_focused()
+                self.toggle_work_view_focused();
+                Ok(())
             }
             Command::OpenAgentLogs => {
-                drop(eng);
-                self.open_logs_focused()
+                self.open_logs_focused();
+                Ok(())
             }
             Command::StopAgent => {
-                drop(eng);
-                self.agent_action_focused(AgentButton::Stop)
+                self.agent_action_focused(AgentButton::Stop);
+                Ok(())
             }
             Command::RestartAgent => {
-                drop(eng);
-                self.agent_action_focused(AgentButton::Restart)
+                self.agent_action_focused(AgentButton::Restart);
+                Ok(())
             }
             Command::ResumeAgent => {
-                drop(eng);
-                self.agent_action_focused(AgentButton::Resume)
+                self.agent_action_focused(AgentButton::Resume);
+                Ok(())
+            }
+            Command::Approve => {
+                self.permission_focused(true);
+                Ok(())
+            }
+            Command::Deny => {
+                self.permission_focused(false);
+                Ok(())
             }
             Command::ToggleQuietMode => {
+                let mut eng = self.engine.lock().expect("engine lock");
                 let prefs = eng.notification_prefs();
                 let quiet = !(prefs.on_needs_me && prefs.on_failure);
                 let new_prefs = if quiet {
@@ -432,16 +578,96 @@ impl App {
                 Ok(())
             }
             Command::ToggleCommandPalette => {
-                drop(eng);
                 self.toggle_palette();
-                return;
+                Ok(())
             }
+            _ => Ok(()),
         };
         if let Err(e) = result {
-            tracing::debug!("command {cmd:?} failed: {e}");
+            tracing::debug!("agent command {cmd:?} failed: {e}");
         }
-        drop(eng);
         self.persist();
+    }
+
+    /// Phase 3A task commands (§43, §55 — minimal UI): each locks the
+    /// engine itself, so `&mut self` helpers never alias a live guard.
+    fn dispatch_task_command(&mut self, cmd: &Command) {
+        let result: anyhow::Result<()> = match cmd {
+            Command::RunTasks => {
+                let mut eng = self.engine.lock().expect("engine lock");
+                eng.task_run();
+                // Show the dashboard so progress is visible.
+                self.overlay_mode = Some(OverlayMode::Tasks);
+                self.tasks_selection = 0;
+                Ok(())
+            }
+            Command::ToggleTasks => {
+                if self.overlay_mode == Some(OverlayMode::Tasks) {
+                    self.overlay_mode = None;
+                } else {
+                    self.overlay_mode = Some(OverlayMode::Tasks);
+                    self.tasks_selection = 0;
+                }
+                Ok(())
+            }
+            Command::CancelSelectedTask => {
+                let mut eng = self.engine.lock().expect("engine lock");
+                match self.selected_task_id(&eng) {
+                    Some(id) => {
+                        let _ = eng.task_cancel(&id);
+                        Ok(())
+                    }
+                    None => Ok(()),
+                }
+            }
+            Command::RetrySelectedTask => {
+                let mut eng = self.engine.lock().expect("engine lock");
+                match self.selected_task_id(&eng) {
+                    Some(id) => {
+                        let _ = eng.task_retry(&id);
+                        Ok(())
+                    }
+                    None => Ok(()),
+                }
+            }
+            Command::ApproveSelectedTask => self.resolve_selected_review(true),
+            Command::RejectSelectedTask => self.resolve_selected_review(false),
+            Command::OpenSelectedTaskAgent => {
+                let mut eng = self.engine.lock().expect("engine lock");
+                match self.selected_task_id(&eng) {
+                    Some(id) => {
+                        let _ = eng.attach_task_agent_pane(&id);
+                        Ok(())
+                    }
+                    None => Ok(()),
+                }
+            }
+            _ => Ok(()),
+        };
+        if let Err(e) = result {
+            tracing::debug!("task command {cmd:?} failed: {e}");
+        }
+        self.persist();
+    }
+
+    /// The task id selected in the dashboard (insertion order of the
+    /// schedulers status — deterministic §10).
+    fn selected_task_id(
+        &self,
+        eng: &Multiplexer,
+    ) -> Option<terminal_session::orchestration::TaskId> {
+        eng.scheduler_status()
+            .states
+            .get(self.tasks_selection)
+            .map(|(id, _)| id.clone())
+    }
+
+    fn resolve_selected_review(&mut self, approve: bool) -> anyhow::Result<()> {
+        let mut eng = self.engine.lock().expect("engine lock");
+        if let Some(id) = self.selected_task_id(&eng) {
+            let _ = eng.resolve_task_review(&id, approve);
+        }
+        Ok(())
     }
 
     /// Maps a winit key event to a `KeyChord` (macOS Cmd = super → ctrl).
@@ -644,6 +870,83 @@ impl App {
                 window.request_redraw();
             }
         }
+
+        // Draw overlays on top of the normal rendering. Each overlay gathers
+        // its data first (short-lived borrows of `self`), then draws with a
+        // disjoint `&mut self.renderer` borrow.
+        let window_size = self
+            .window
+            .as_ref()
+            .map(|w| w.inner_size())
+            .unwrap_or_default();
+        // Command palette.
+        if self.palette_open {
+            let commands = self.registry.palette();
+            let selection = self.palette_selection;
+            let query = self.palette_query.clone();
+            if let Some(renderer) = self.renderer.as_mut() {
+                App::draw_palette(renderer, window_size, &commands, selection, &query);
+            }
+        }
+        // Empty state overlay.
+        if let Some(OverlayMode::EmptyState) = self.overlay_mode {
+            let health = self.agent_health.clone();
+            if let Some(renderer) = self.renderer.as_mut() {
+                App::draw_empty_state(renderer, window_size, &health);
+            }
+        }
+        // Provider setup overlay.
+        if let Some(OverlayMode::ProviderSetup) = self.overlay_mode {
+            let setup = self.provider_setup.clone();
+            if let Some(renderer) = self.renderer.as_mut() {
+                App::draw_provider_setup(renderer, window_size, &setup);
+            }
+        }
+        // Phase 3A task dashboard overlay (§55 minimal UI).
+        if let Some(OverlayMode::Tasks) = self.overlay_mode {
+            let (tasks, status, selection) = {
+                let eng = self.engine.lock().expect("engine lock");
+                (
+                    eng.task_list().into_iter().cloned().collect::<Vec<_>>(),
+                    eng.scheduler_status(),
+                    self.tasks_selection,
+                )
+            };
+            if let Some(renderer) = self.renderer.as_mut() {
+                App::draw_tasks(renderer, window_size, &tasks, &status, selection);
+            }
+        }
+        // Diagnostics panel.
+        if self.diagnostics_visible {
+            let (dashboard, events_applied, latency_p95, subscribers) = {
+                let eng = self.engine.lock().expect("engine lock");
+                (
+                    eng.agent_dashboard(AgentFilter::All),
+                    eng.metrics.events_applied,
+                    eng.metrics.apply_latency_p95_us(),
+                    eng.events.subscriber_count(),
+                )
+            };
+            if let Some(renderer) = self.renderer.as_mut() {
+                App::draw_diagnostics(
+                    renderer,
+                    window_size,
+                    &dashboard,
+                    events_applied,
+                    latency_p95,
+                    subscribers,
+                );
+            }
+        }
+        // Work review view.
+        if self.work_view_visible {
+            let view = self.work_view.clone();
+            if let Some(renderer) = self.renderer.as_mut() {
+                if let Some(view) = &view {
+                    App::draw_work_view(renderer, window_size, view);
+                }
+            }
+        }
     }
 
     /// Sidebar (§17): workspaces on top, tabs of the active workspace below,
@@ -709,6 +1012,24 @@ impl App {
         y += cell_h;
         renderer.chrome_text(10.0, y, "AGENTS", CHROME_FG_DIM);
         y += cell_h + 6.0;
+        // Workspace summary (§14): counts update live with agent state.
+        let summary = eng.workspace_agent_summary();
+        if summary.agents > 0 {
+            renderer.chrome_text(
+                10.0,
+                y,
+                &format!(
+                    "{} agents · {} working · {} needs you · {} done · {} failed",
+                    summary.agents,
+                    summary.running,
+                    summary.needs_you,
+                    summary.completed,
+                    summary.failed
+                ),
+                CHROME_FG_DIM,
+            );
+            y += cell_h + 4.0;
+        }
         for (pane_id, eid) in agents {
             let snap = eng.agent_runtime().get_session(&ExecutionId(eid.clone()));
             let name = snap
@@ -968,33 +1289,82 @@ impl App {
                 }
             }
         }
-        if next {
-            eng.cycle_agent_focus_forward();
-        } else {
-            eng.cycle_agent_focus_backward();
+        if agents.is_empty() {
+            return Ok(());
         }
+        let focused = eng.focused_pane();
+        let idx = focused
+            .as_ref()
+            .and_then(|f| agents.iter().position(|a| a == f));
+        let next_idx = match idx {
+            Some(i) if next => (i + 1) % agents.len(),
+            Some(i) => (i + agents.len() - 1) % agents.len(),
+            None => 0,
+        };
+        eng.focus_pane(&agents[next_idx])?;
         Ok(())
     }
 
-    /// Toggles the work view for the focused pane (§25).
+    /// Toggles the work view (diff review, §9/§25) for the focused pane.
     fn toggle_work_view_focused(&mut self) {
-        let eng = self.engine.lock().expect("engine lock");
-        let pid = eng.focused_pane().unwrap_or_default();
-        tracing::debug!("toggling work view for agent pane {pid}");
+        let review = {
+            let eng = self.engine.lock().expect("engine lock");
+            let pid = eng.focused_pane().unwrap_or_default();
+            let Some(eid) = eng.execution_id_for_pane(&pid) else {
+                tracing::debug!("work view: focused pane {pid} has no execution");
+                return;
+            };
+            eng.agent_review(&eid)
+        };
+        let Some(review) = review else {
+            self.work_view_visible = false;
+            self.work_view = None;
+            return;
+        };
+        self.work_view = Some(WorkView {
+            changed_files: review.files.iter().map(|f| f.path.clone()).collect(),
+            selected_file: 0,
+            diff_text: review
+                .files
+                .first()
+                .and_then(|f| f.diff.clone())
+                .unwrap_or_default(),
+            success: true,
+        });
+        self.work_view_visible = true;
     }
 
-    /// Opens logs for the focused agent (§37).
+    /// Opens the agent's working-directory log surface (§37). The desktop
+    /// falls back to revealing the workspace directory in Finder when the
+    /// runtime exposes no per-agent log file yet.
     fn open_logs_focused(&mut self) {
-        let eng = self.engine.lock().expect("engine lock");
-        let pid = eng.focused_pane().unwrap_or_default();
+        let (pid, cwd) = {
+            let eng = self.engine.lock().expect("engine lock");
+            let pid = eng.focused_pane().unwrap_or_default();
+            let Some(eid) = eng.execution_id_for_pane(&pid) else {
+                return;
+            };
+            let cwd = eng
+                .agent_runtime()
+                .get_session(&eid)
+                .map(|s| s.cwd.clone())
+                .unwrap_or_default();
+            (pid, cwd)
+        };
         tracing::debug!("opening logs for focused agent pane {pid}");
+        if !cwd.is_empty() {
+            let _ = std::process::Command::new("open").arg(&cwd).spawn();
+        }
     }
 
     /// Performs an agent action on the focused pane (§19).
     fn agent_action_focused(&mut self, btn: AgentButton) {
-        let result: anyhow::Result<()> = {
+        let pid = {
             let eng = self.engine.lock().expect("engine lock");
-            let pid = eng.focused_pane().unwrap_or_default().to_string();
+            eng.focused_pane().unwrap_or_default().to_string()
+        };
+        let result: anyhow::Result<()> = {
+            let mut eng = self.engine.lock().expect("engine lock");
             let Some(eid) = eng.execution_id_for_pane(&pid) else {
                 tracing::debug!("agent action {btn:?} on {pid}: no execution");
                 return;
@@ -1011,9 +1381,510 @@ impl App {
         self.persist();
     }
 
+    /// Applies Allow/Deny to the focused agent's pending permission (§18).
+    fn permission_focused(&mut self, allow: bool) {
+        let pid = {
+            let eng = self.engine.lock().expect("engine lock");
+            eng.focused_pane().unwrap_or_default().to_string()
+        };
+        let result: anyhow::Result<()> = {
+            let eng = self.engine.lock().expect("engine lock");
+            let Some(eid) = eng.execution_id_for_pane(&pid) else {
+                tracing::debug!("permission on {pid}: no execution");
+                return;
+            };
+            let decision = if allow {
+                PermissionDecision::AllowOnce
+            } else {
+                PermissionDecision::Deny
+            };
+            eng.agent_runtime().respond_permission(&eid, decision)
+        };
+        if let Err(e) = result {
+            tracing::debug!("permission on {pid} failed: {e}");
+        }
+    }
+
     /// Toggles the command palette (§37).
     fn toggle_palette(&mut self) {
-        tracing::debug!("toggling command palette");
+        self.palette_open = !self.palette_open;
+        self.palette_selection = 0;
+        if self.palette_open {
+            self.refresh_palette_commands();
+        }
+    }
+
+    fn refresh_palette_commands(&mut self) {
+        // Palette matches are computed per-frame in `draw_palette` from the
+        // query; this hook just resets navigation to the top (§38).
+        self.palette_selection = 0;
+    }
+
+    /// Opens the empty state overlay (§26) with real agent health rows.
+    fn open_empty_state(&mut self) {
+        let health = {
+            let eng = self.engine.lock().expect("engine lock");
+            eng.agent_runtime().health()
+        };
+        self.agent_health = health;
+        self.overlay_mode = Some(OverlayMode::EmptyState);
+        self.diagnostics_visible = false;
+        self.work_view_visible = false;
+        self.palette_open = false;
+    }
+
+    /// Opens the provider setup overlay (§28).
+    fn open_provider_setup(&mut self) {
+        let providers = {
+            let eng = self.engine.lock().expect("engine lock");
+            eng.agent_runtime().provider_status().clone()
+        };
+        self.provider_setup = ProviderSetupState {
+            selecting_provider: false,
+            configured_providers: providers,
+            error: None,
+        };
+        self.overlay_mode = Some(OverlayMode::ProviderSetup);
+        self.diagnostics_visible = false;
+        self.work_view_visible = false;
+        self.palette_open = false;
+    }
+
+    /// Closes all overlays.
+    fn close_overlays(&mut self) {
+        self.overlay_mode = None;
+        self.diagnostics_visible = false;
+        self.work_view_visible = false;
+        self.palette_open = false;
+        self.palette_query.clear();
+        self.palette_selection = 0;
+    }
+
+    /// Draws the command palette overlay (§37): live-query filtered command
+    /// list from the registry, arrow-key navigation, Enter runs the command.
+    fn draw_palette(
+        renderer: &mut Renderer,
+        window_size: PhysicalSize<u32>,
+        commands: &[Command],
+        selection: usize,
+        query: &str,
+    ) {
+        let (cw, ch) = renderer.cell_size();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        let w = (35.0_f32 * cw).min(600.0_f32);
+        let h = (12.0_f32 * ch).min(400.0_f32);
+        let x = (window_size.width as f32 - w) / 2.0;
+        let y = (window_size.height as f32 - h) / 2.0;
+        renderer.chrome_rect(
+            0.0,
+            0.0,
+            window_size.width as f32,
+            window_size.height as f32,
+            [0.0, 0.0, 0.0, 0.5],
+        );
+        renderer.chrome_rect(x, y, w, h, [0.12, 0.12, 0.15, 1.0]);
+        renderer.chrome_border(x, y, w, h, 1.0, CHROME_ACCENT);
+        renderer.chrome_text(x + 10.0, y + 8.0, &format!("> {query}"), CHROME_ACCENT);
+        let q = query.to_lowercase();
+        let matches: Vec<&Command> = commands
+            .iter()
+            .filter(|cmd| cmd.to_label().to_lowercase().contains(&q))
+            .collect();
+        let start = selection.saturating_sub(3);
+        let end = (start + 10).min(matches.len());
+        for (k, cmd) in matches.iter().enumerate().skip(start).take(end - start) {
+            let item_y = y + 20.0 + (k as f32 * ch);
+            if k == selection {
+                renderer.chrome_rect(x + 5.0, item_y, w - 10.0, ch, CHROME_ACCENT);
+                renderer.chrome_text(x + 10.0, item_y, cmd.to_label(), [0.0, 0.0, 0.0, 1.0]);
+            } else {
+                renderer.chrome_text(x + 10.0, item_y, cmd.to_label(), CHROME_FG);
+            }
+        }
+        renderer.chrome_text(
+            x + 10.0,
+            y + h - 20.0,
+            "↑↓ to navigate · Enter to run · Esc to close",
+            CHROME_FG_DIM,
+        );
+    }
+
+    /// Draws the empty state overlay (§26) from real agent health rows —
+    /// never faked agents; rows come from the runtime's binary/auth probe.
+    fn draw_empty_state(
+        renderer: &mut Renderer,
+        window_size: PhysicalSize<u32>,
+        health: &[AgentHealthRow],
+    ) {
+        let (cw, ch) = renderer.cell_size();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        let w = (44.0_f32 * cw).min(720.0_f32);
+        let h = (14.0_f32 * ch).min(480.0_f32);
+        let x = (window_size.width as f32 - w) / 2.0;
+        let y = (window_size.height as f32 - h) / 2.0;
+        renderer.chrome_rect(
+            0.0,
+            0.0,
+            window_size.width as f32,
+            window_size.height as f32,
+            [0.0, 0.0, 0.0, 0.7],
+        );
+        renderer.chrome_rect(x, y, w, h, [0.12, 0.12, 0.15, 1.0]);
+        renderer.chrome_border(x, y, w, h, 1.0, CHROME_ACCENT);
+        renderer.chrome_text(x + 20.0, y + 16.0, "AI Agents", CHROME_ACCENT);
+        renderer.chrome_text(
+            x + 20.0,
+            y + 36.0,
+            "Run an agent in this workspace.",
+            CHROME_FG,
+        );
+        let mut y_pos = y + 62.0;
+        for row in health {
+            let status = if row.installed {
+                if row.credential_configured {
+                    "✓ Installed · Authenticated"
+                } else {
+                    "✓ Installed · auth required"
+                }
+            } else {
+                "not installed"
+            };
+            let col = if row.installed && row.credential_configured {
+                STATE_DONE
+            } else if row.installed {
+                STATE_APPROVAL
+            } else {
+                CHROME_FG_DIM
+            };
+            renderer.chrome_rect(x + 30.0, y_pos, w - 60.0, ch, [0.08, 0.08, 0.10, 1.0]);
+            renderer.chrome_border(x + 30.0, y_pos, w - 60.0, ch, 1.0, CHROME_FG_DIM);
+            let name = truncate(&row.display_name, 24);
+            renderer.chrome_text(x + 40.0, y_pos, &name, CHROME_FG);
+            renderer.chrome_text(
+                x + 40.0 + name.chars().count() as f32 * 7.5 + 8.0,
+                y_pos,
+                status,
+                col,
+            );
+            y_pos += ch + 8.0;
+        }
+        if health.is_empty() {
+            renderer.chrome_text(
+                x + 30.0,
+                y_pos,
+                "No agent definitions registered.",
+                CHROME_FG_DIM,
+            );
+        }
+        renderer.chrome_text(
+            x + 20.0,
+            y + h - 20.0,
+            "Press Esc to return.",
+            CHROME_FG_DIM,
+        );
+    }
+
+    /// Draws the provider setup overlay (§28): per-provider credential
+    /// presence (never secrets).
+    fn draw_provider_setup(
+        renderer: &mut Renderer,
+        window_size: PhysicalSize<u32>,
+        state: &ProviderSetupState,
+    ) {
+        let (cw, ch) = renderer.cell_size();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        let w = (40.0_f32 * cw).min(600.0_f32);
+        let h = (12.0_f32 * ch).min(400.0_f32);
+        let x = (window_size.width as f32 - w) / 2.0;
+        let y = (window_size.height as f32 - h) / 2.0;
+        renderer.chrome_rect(
+            0.0,
+            0.0,
+            window_size.width as f32,
+            window_size.height as f32,
+            [0.0, 0.0, 0.0, 0.7],
+        );
+        renderer.chrome_rect(x, y, w, h, [0.12, 0.12, 0.15, 1.0]);
+        renderer.chrome_border(x, y, w, h, 1.0, CHROME_ACCENT);
+        renderer.chrome_text(x + 20.0, y + 20.0, "Configure AI Provider", CHROME_ACCENT);
+        if state.selecting_provider {
+            renderer.chrome_text(
+                x + 20.0,
+                y + 34.0,
+                "Select a provider to configure…",
+                CHROME_FG_DIM,
+            );
+        }
+        let mut y_pos = y + 48.0;
+        for (name, configured) in &state.configured_providers {
+            let status = if *configured {
+                "✓ Configured"
+            } else {
+                "Not configured"
+            };
+            renderer.chrome_text(
+                x + 20.0,
+                y_pos,
+                &format!("{}: {}", truncate(name, 20), status),
+                if *configured { STATE_DONE } else { CHROME_FG },
+            );
+            y_pos += ch + 10.0;
+        }
+        if let Some(err) = &state.error {
+            renderer.chrome_text(
+                x + 20.0,
+                y + h - 32.0,
+                truncate(err, 60).as_str(),
+                STATE_FAILED,
+            );
+        }
+        renderer.chrome_text(x + 20.0, y + h - 20.0, "Press Esc to close.", CHROME_FG_DIM);
+    }
+
+    /// Phase 3A §55 minimal task UI: live scheduler snapshot with an
+    /// action hint bar. Reads are fresh per frame; actions happen via
+    /// `dispatch_task_command` (never here).
+    fn draw_tasks(
+        renderer: &mut Renderer,
+        window_size: PhysicalSize<u32>,
+        tasks: &[Task],
+        status: &terminal_workspace::terminal_session::orchestration::SchedulerStatus,
+        selection: usize,
+    ) {
+        let (cw, ch) = renderer.cell_size();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        let w = (72.0_f32 * cw).min(860.0_f32);
+        let h = (24.0_f32 * ch).min(680.0_f32);
+        let x = (window_size.width as f32 - w) / 2.0;
+        let y = (window_size.height as f32 - h) / 2.0;
+        renderer.chrome_rect(
+            0.0,
+            0.0,
+            window_size.width as f32,
+            window_size.height as f32,
+            [0.0, 0.0, 0.0, 0.7],
+        );
+        renderer.chrome_rect(x, y, w, h, [0.12, 0.12, 0.15, 1.0]);
+        renderer.chrome_border(x, y, w, h, 1.0, CHROME_ACCENT);
+        renderer.chrome_text(
+            x + 20.0,
+            y + 16.0,
+            &format!(
+                "TASKS — {} queued · {} running · {} completed · {} failed · {}¢ spent",
+                status.queued.len(),
+                status.running.len(),
+                status.completed_count,
+                status.failed_count,
+                status.actual_cost_cents
+            ),
+            CHROME_ACCENT,
+        );
+        let start = selection.saturating_sub(9);
+        for (row, t) in tasks.iter().skip(start).take(18).enumerate() {
+            let row_y = y + 36.0 + (row as f32 * ch);
+            let selected = row + start == selection;
+            if selected {
+                renderer.chrome_rect(x + 6.0, row_y - 2.0, w - 12.0, ch, CHROME_ACCENT);
+            }
+            let fg = if selected {
+                [0.0, 0.0, 0.0, 1.0]
+            } else {
+                task_state_color(&t.status)
+            };
+            let exec = t
+                .agent_execution_id
+                .as_ref()
+                .map(|e| format!("[{}]", truncate(&e.0, 8)))
+                .unwrap_or_default();
+            renderer.chrome_text(
+                x + 12.0,
+                row_y,
+                &format!(
+                    "{:<5} {:<14} {} · {} · {} attempt(s) {}",
+                    t.status.label(),
+                    truncate(&t.title, 14),
+                    t.assigned_agent,
+                    truncate(&t.id, 8),
+                    t.attempt_count,
+                    exec
+                ),
+                fg,
+            );
+            if let Some(err) = &t.error {
+                renderer.chrome_text(
+                    x + 12.0,
+                    row_y + ch * 0.5,
+                    &truncate(&err.message, 60),
+                    STATE_FAILED,
+                );
+            }
+        }
+        renderer.chrome_text(
+            x + 20.0,
+            y + h - 20.0,
+            "↑↓ select · Enter run all · c cancel · r retry · a approve · d reject · p open agent · Esc close",
+            CHROME_FG_DIM,
+        );
+    }
+
+    /// Draws the developer diagnostics panel (§32): engine metrics plus the
+    /// agent dashboard. Never exposes secrets or credentials.
+    fn draw_diagnostics(
+        renderer: &mut Renderer,
+        window_size: PhysicalSize<u32>,
+        dashboard: &AgentDashboard,
+        events_applied: u64,
+        latency_p95_us: f64,
+        subscribers: usize,
+    ) {
+        let (cw, ch) = renderer.cell_size();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        let w = (64.0_f32 * cw).min(780.0_f32);
+        let h = (22.0_f32 * ch).min(640.0_f32);
+        let x = (window_size.width as f32 - w) / 2.0;
+        let y = (window_size.height as f32 - h) / 2.0;
+        renderer.chrome_rect(
+            0.0,
+            0.0,
+            window_size.width as f32,
+            window_size.height as f32,
+            [0.0, 0.0, 0.0, 0.7],
+        );
+        renderer.chrome_rect(x, y, w, h, [0.12, 0.12, 0.15, 1.0]);
+        renderer.chrome_border(x, y, w, h, 1.0, CHROME_ACCENT);
+        renderer.chrome_text(x + 20.0, y + 16.0, "Developer Diagnostics", CHROME_ACCENT);
+        let mut line = y + 40.0;
+        renderer.chrome_text(
+            x + 20.0,
+            line,
+            &format!("Events applied: {events_applied}"),
+            CHROME_FG,
+        );
+        line += ch;
+        renderer.chrome_text(
+            x + 20.0,
+            line,
+            &format!("Apply latency p95: {latency_p95_us:.0} µs"),
+            CHROME_FG,
+        );
+        line += ch;
+        renderer.chrome_text(
+            x + 20.0,
+            line,
+            &format!("Event subscribers: {subscribers}"),
+            CHROME_FG,
+        );
+        line += ch + 6.0;
+        renderer.chrome_text(
+            x + 20.0,
+            line,
+            &format!(
+                "Agents: {} total · {} running · {} needs you · {} failed · {} completed",
+                dashboard.total,
+                dashboard.running,
+                dashboard.needs_you,
+                dashboard.failed,
+                dashboard.completed
+            ),
+            CHROME_FG_DIM,
+        );
+        line += ch + 6.0;
+        for row in dashboard.rows.iter().take(9) {
+            let s = &row.snapshot;
+            renderer.chrome_text(
+                x + 20.0,
+                line,
+                &format!(
+                    "{} · {} · {} · {} (conf {}) · {} evt · exit {:?}",
+                    truncate(&s.display_name, 16),
+                    truncate(&s.execution_id, 10),
+                    s.state,
+                    s.activity_kind,
+                    s.activity_confidence,
+                    s.events_emitted,
+                    s.exit_code,
+                ),
+                CHROME_FG_DIM,
+            );
+            line += ch;
+        }
+        renderer.chrome_text(x + 20.0, y + h - 20.0, "Press Esc to close.", CHROME_FG_DIM);
+    }
+
+    /// Draws the work review/diff view overlay (§9): changed files with the
+    /// selected file's bounded git diff.
+    fn draw_work_view(renderer: &mut Renderer, window_size: PhysicalSize<u32>, view: &WorkView) {
+        let (cw, ch) = renderer.cell_size();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        let w = (64.0_f32 * cw).min(820.0_f32);
+        let h = (26.0_f32 * ch).min(640.0_f32);
+        let x = (window_size.width as f32 - w) / 2.0;
+        let y = (window_size.height as f32 - h) / 2.0;
+        renderer.chrome_rect(
+            0.0,
+            0.0,
+            window_size.width as f32,
+            window_size.height as f32,
+            [0.0, 0.0, 0.0, 0.7],
+        );
+        renderer.chrome_rect(x, y, w, h, [0.12, 0.12, 0.15, 1.0]);
+        renderer.chrome_border(x, y, w, h, 1.0, CHROME_ACCENT);
+        renderer.chrome_text(x + 20.0, y + 16.0, "Review Changes", CHROME_ACCENT);
+        let status = if view.success {
+            "work loaded from agent runtime"
+        } else {
+            "no recorded work"
+        };
+        renderer.chrome_text(x + 20.0, y + 34.0, status, CHROME_FG_DIM);
+        let mut line = y + 52.0;
+        if view.changed_files.is_empty() {
+            renderer.chrome_text(x + 20.0, line, "No changes to review.", CHROME_FG);
+            line += ch;
+            renderer.chrome_text(
+                x + 20.0,
+                line,
+                "(no files_changed recorded for this work)",
+                CHROME_FG_DIM,
+            );
+        } else {
+            for (i, f) in view.changed_files.iter().take(6).enumerate() {
+                let sel = i == view.selected_file;
+                let label = if sel {
+                    format!("▸ {f}")
+                } else {
+                    format!("  {f}")
+                };
+                renderer.chrome_text(
+                    x + 20.0,
+                    line,
+                    &truncate(&label, 40),
+                    if sel { CHROME_ACCENT } else { CHROME_FG_DIM },
+                );
+                line += ch;
+            }
+            line += ch;
+            if view.diff_text.is_empty() {
+                renderer.chrome_text(x + 20.0, line, "(no diff available)", CHROME_FG_DIM);
+            } else {
+                for dl in view.diff_text.lines().take(12) {
+                    renderer.chrome_text(x + 20.0, line, &truncate(dl, 70), CHROME_FG);
+                    line += ch;
+                }
+            }
+        }
+        renderer.chrome_text(x + 20.0, y + h - 20.0, "Press Esc to close.", CHROME_FG_DIM);
     }
 
     /// Permission decision (§18) — normalized by the runtime, translated
@@ -1042,7 +1913,120 @@ impl App {
         if event.state != ElementState::Pressed {
             return;
         }
-        // 1. App commands first (registry lookup).
+        // 1. Handle overlay keys first.
+        if event.logical_key == NamedKey::Escape {
+            // Always close overlays on Escape.
+            self.close_overlays();
+            return;
+        }
+        // 1b. Empty state: Enter opens provider setup for the chosen agent
+        // (the provider overlay lists credential status per provider).
+        if let Some(OverlayMode::EmptyState) = self.overlay_mode {
+            if event.logical_key == NamedKey::Enter {
+                self.open_provider_setup();
+                return;
+            }
+            return;
+        }
+        // 1c. Task dashboard (Phase 3A §55): arrow navigation + one-key
+        // actions; everything else is consumed by the overlay.
+        if let Some(OverlayMode::Tasks) = self.overlay_mode {
+            match &event.logical_key {
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.tasks_selection = self.tasks_selection.saturating_sub(1);
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    let count = {
+                        let eng = self.engine.lock().expect("engine lock");
+                        eng.scheduler_status().states.len()
+                    };
+                    if count > 0 {
+                        self.tasks_selection = (self.tasks_selection + 1).min(count - 1);
+                    }
+                }
+                Key::Named(NamedKey::Enter) => {
+                    let cmd = Command::RunTasks;
+                    self.run_command(&cmd);
+                }
+                Key::Character(c) => match c.as_str() {
+                    "c" => {
+                        let cmd = Command::CancelSelectedTask;
+                        self.run_command(&cmd);
+                    }
+                    "r" => {
+                        let cmd = Command::RetrySelectedTask;
+                        self.run_command(&cmd);
+                    }
+                    "a" => {
+                        let cmd = Command::ApproveSelectedTask;
+                        self.run_command(&cmd);
+                    }
+                    "d" => {
+                        let cmd = Command::RejectSelectedTask;
+                        self.run_command(&cmd);
+                    }
+                    "p" => {
+                        let cmd = Command::OpenSelectedTaskAgent;
+                        self.run_command(&cmd);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+            return;
+        }
+        // 2. Handle command palette interaction.
+        if self.palette_open {
+            match &event.logical_key {
+                Key::Named(NamedKey::ArrowUp) => {
+                    if self.palette_selection > 0 {
+                        self.palette_selection -= 1;
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    let count = self
+                        .registry
+                        .palette()
+                        .iter()
+                        .filter(|cmd| {
+                            cmd.to_label()
+                                .to_lowercase()
+                                .contains(&self.palette_query.to_lowercase())
+                        })
+                        .count();
+                    if count > 0 {
+                        self.palette_selection = (self.palette_selection + 1).min(count - 1);
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    let q = self.palette_query.to_lowercase();
+                    let matches: Vec<Command> = self
+                        .registry
+                        .palette()
+                        .into_iter()
+                        .filter(|cmd| cmd.to_label().to_lowercase().contains(&q))
+                        .collect();
+                    if let Some(cmd) = matches.get(self.palette_selection) {
+                        let cmd = cmd.clone();
+                        self.run_command(&cmd);
+                    }
+                    self.close_overlays();
+                    return;
+                }
+                _ => {
+                    // Allow text input in palette.
+                    if let Some(text) = &event.text {
+                        self.palette_query.push_str(text);
+                        self.palette_selection = 0;
+                        self.refresh_palette_commands();
+                        return;
+                    }
+                }
+            }
+        }
+        // 3. App commands first (registry lookup).
         if let Some(chord) = self.chord_from(&event.logical_key) {
             if let Some(cmd) = self.registry.lookup(&chord) {
                 let cmd = cmd.clone();
@@ -1050,7 +2034,7 @@ impl App {
                 return;
             }
         }
-        // 2. Otherwise forward the key to the focused pane's session (§9).
+        // 4. Otherwise forward the key to the focused pane's session (§9).
         let ctrl = self.modifiers.state().control_key();
         let alt = self.modifiers.state().alt_key();
         let app_keys = {
@@ -1158,6 +2142,18 @@ fn main() -> Result<()> {
 
     let mut app = App::new(engine);
     app.wake_proxy = Some(event_loop.create_proxy());
+
+    // First-run experience (§26): show the empty state when no agent
+    // sessions exist yet. Esc dismisses it for the session.
+    {
+        let has_agents = {
+            let eng = app.engine.lock().expect("engine lock");
+            eng.agent_runtime().session_count() > 0
+        };
+        if !has_agents {
+            app.open_empty_state();
+        }
+    }
 
     event_loop.run(move |event, event_loop| {
         event_loop.set_control_flow(ControlFlow::Wait);

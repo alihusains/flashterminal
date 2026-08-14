@@ -7,7 +7,7 @@
 //! interface (§18).
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -157,11 +157,25 @@ fn main() -> Result<()> {
         return roundtrip_and_print(&socket, request);
     }
 
+    // Phase 3A: `terminal task set-policy <key> <value>` — read-modify-write
+    // over the socket so untouched policy keys keep their live values.
+    if args[0] == "task" && args.get(1).map(|s| s.as_str()) == Some("set-policy") {
+        return set_task_policy(&socket, &args[2..]);
+    }
+
     let request = match args[0].as_str() {
         "workspace" => workspace_cmd(&args[1..])?,
         "tab" => tab_cmd(&args[1..])?,
         "pane" => pane_cmd(&args[1..])?,
         "agent" => agent_cmd(&args[1..])?,
+        "task" => task_cmd(&args[1..])?,
+        "tasks" => Request::TaskList,
+        // §42 workflow commands: list = task list, validate = graph check.
+        "workflow" => match args.get(1).map(|s| s.as_str()) {
+            Some("list") => Request::TaskList,
+            Some("validate") => Request::WorkflowValidate,
+            other => bail!("usage: terminal workflow list|validate (got {other:?})"),
+        },
         "help" | "--help" | "-h" => {
             print_help();
             return Ok(());
@@ -331,6 +345,121 @@ fn pane_cmd(args: &[String]) -> Result<Request> {
     })
 }
 
+/// Phase 3A (§43): `terminal task create|list|status|run|cancel|retry|
+/// review|attach|validate|policy|scheduler`.
+fn task_cmd(args: &[String]) -> Result<Request> {
+    let Some(cmd) = args.first() else {
+        bail!(
+            "usage: terminal task create|list|status|run|cancel|retry|review|attach|validate|policy|scheduler"
+        );
+    };
+    Ok(match cmd.as_str() {
+        "create" => {
+            // terminal task create <workspace-id> <title> <agent> [--dep <task-id>]... [--review]
+            let workspace_id = required(args, 1, "create <workspace-id> <title> <agent>")?;
+            let title = required(args, 2, "create <workspace-id> <title> <agent>")?;
+            let agent = required(args, 3, "create <workspace-id> <title> <agent>")?;
+            let mut deps = Vec::new();
+            let mut review_required = false;
+            let mut i = 4;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--dep" => {
+                        let dep = required(args, i + 1, "--dep <task-id>")?;
+                        deps.push(dep);
+                        i += 2;
+                    }
+                    "--review" => {
+                        review_required = true;
+                        i += 1;
+                    }
+                    other => bail!("unknown task create flag `{other}`"),
+                }
+            }
+            Request::TaskCreate {
+                workspace_id,
+                title,
+                description: String::new(),
+                assigned_agent: agent,
+                dependencies: deps,
+                review_required,
+            }
+        }
+        "list" => Request::TaskList,
+        "show" | "status" => Request::TaskStatus {
+            task_id: required(args, 1, "show <task-id>")?,
+        },
+        "run" => Request::TaskRun,
+        "cancel" => Request::TaskCancel {
+            task_id: required(args, 1, "cancel <task-id>")?,
+        },
+        "retry" => Request::TaskRetry {
+            task_id: required(args, 1, "retry <task-id>")?,
+        },
+        "review" => match args.get(1).map(|s| s.as_str()) {
+            Some("approve") => Request::TaskResolveReview {
+                task_id: required(args, 2, "review approve <task-id>")?,
+                approve: true,
+            },
+            Some("reject") => Request::TaskResolveReview {
+                task_id: required(args, 2, "review reject <task-id>")?,
+                approve: false,
+            },
+            _ => bail!("usage: terminal task review <approve|reject> <task-id>"),
+        },
+        "attach" => Request::TaskAttachPane {
+            task_id: required(args, 1, "attach <task-id>")?,
+        },
+        "validate" => Request::WorkflowValidate,
+        "policy" => Request::TaskPolicy,
+        "scheduler" => Request::SchedulerStatus,
+        other => bail!("unknown task command `{other}`"),
+    })
+}
+
+/// `terminal task set-policy <key> <value>` — get, mutate one key, set.
+fn set_task_policy(socket: &Path, args: &[String]) -> Result<()> {
+    let key = required(args, 0, "set-policy <key> <value>")?;
+    let value = required(args, 1, "set-policy <key> <value>")?;
+    let Response::TaskPolicy { mut policy } = ipc::roundtrip(socket, &Request::TaskPolicy)? else {
+        bail!("unexpected response to task policy request");
+    };
+    match key.as_str() {
+        "max-parallel" => {
+            policy.max_parallel_tasks = value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("max-parallel must be an integer"))?;
+        }
+        "max-agents" => {
+            policy.max_agents = value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("max-agents must be an integer"))?;
+        }
+        "max-cost-cents" => {
+            policy.max_cost_cents = Some(
+                value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("max-cost-cents must be an integer"))?,
+            );
+        }
+        "max-retries" => {
+            policy.retry.max_retries = value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("max-retries must be an integer"))?;
+        }
+        other => bail!(
+            "unknown policy key `{other}` (max-parallel|max-agents|max-cost-cents|max-retries)"
+        ),
+    }
+    match ipc::roundtrip(socket, &Request::SetTaskPolicy { policy }) {
+        Ok(resp) => {
+            print_response(resp);
+            Ok(())
+        }
+        Err(e) => bail!("set-policy failed: {e}"),
+    }
+}
+
 fn required(args: &[String], idx: usize, usage: &str) -> Result<String> {
     args.get(idx)
         .cloned()
@@ -339,7 +468,9 @@ fn required(args: &[String], idx: usize, usage: &str) -> Result<String> {
 
 /// Phase 2C: parses `terminal agents [filter]` filters (deterministic
 /// dashboard filters, §13/§15).
-fn parse_filter(f: Option<&str>) -> Result<terminal_workspace::terminal_session::work::AgentFilter> {
+fn parse_filter(
+    f: Option<&str>,
+) -> Result<terminal_workspace::terminal_session::work::AgentFilter> {
     use terminal_workspace::terminal_session::work::AgentFilter::*;
     Ok(match f.map(|s| s.to_ascii_lowercase()).as_deref() {
         None | Some("all") => All,
@@ -353,7 +484,7 @@ fn parse_filter(f: Option<&str>) -> Result<terminal_workspace::terminal_session:
     })
 }
 
-fn roundtrip_and_print(socket: &PathBuf, request: Request) -> Result<()> {
+fn roundtrip_and_print(socket: &Path, request: Request) -> Result<()> {
     match ipc::roundtrip(socket, &request) {
         Ok(response) => {
             print_response(response);
@@ -455,12 +586,7 @@ fn print_response(resp: Response) {
                 println!("no work record for this execution");
                 return;
             };
-            println!(
-                "work {} — {} [{}]",
-                w.id,
-                w.title,
-                w.status.label()
-            );
+            println!("work {} — {} [{}]", w.id, w.title, w.status.label());
             if !w.description.is_empty() {
                 println!("  description: {}", w.description);
             }
@@ -469,7 +595,10 @@ fn print_response(resp: Response) {
             }
             if let (Some(inp), Some(out)) = (w.usage.input_tokens, w.usage.output_tokens) {
                 println!("  tokens: {inp} in / {out} out (est. cost ${:.4})", {
-                    w.usage.estimated_cost_cents.map(|c| c as f64 / 100.0).unwrap_or(0.0)
+                    w.usage
+                        .estimated_cost_cents
+                        .map(|c| c as f64 / 100.0)
+                        .unwrap_or(0.0)
                 });
             } else {
                 println!("  tokens: unavailable");
@@ -479,9 +608,18 @@ fn print_response(resp: Response) {
                 "  files changed: {} · commands run: {} · tests passed: {}",
                 s.files_changed,
                 s.commands_run,
-                s.tests_passed.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into())
+                s.tests_passed
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "unknown".into())
             );
-            println!("  files: {}", w.files_changed.iter().cloned().collect::<Vec<_>>().join(", "));
+            println!(
+                "  files: {}",
+                w.files_changed
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             let current = w
                 .current_activity()
                 .map(|a| a.display())
@@ -494,7 +632,12 @@ fn print_response(resp: Response) {
         } => {
             println!("timeline for {execution_id}:");
             for e in entries {
-                println!("  {} {} — {}", e.at.format("%H:%M:%S"), e.kind.label(), e.detail);
+                println!(
+                    "  {} {} — {}",
+                    e.at.format("%H:%M:%S"),
+                    e.kind.label(),
+                    e.detail
+                );
             }
         }
         Response::AgentReview { review } => {
@@ -507,7 +650,14 @@ fn print_response(resp: Response) {
                 println!("  {}", f.path);
                 if let Some(diff) = &f.diff {
                     if !diff.is_empty() {
-                        println!("{}", diff.lines().take(12).map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n"));
+                        println!(
+                            "{}",
+                            diff.lines()
+                                .take(12)
+                                .map(|l| format!("    {l}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        );
                     }
                 }
             }
@@ -526,7 +676,11 @@ fn print_response(resp: Response) {
                     h.status.label(),
                     h.definition_id,
                     h.binary_path.clone().unwrap_or_else(|| "not found".into()),
-                    if h.credential_configured { "configured" } else { "not configured" }
+                    if h.credential_configured {
+                        "configured"
+                    } else {
+                        "not configured"
+                    }
                 );
             }
         }
@@ -544,13 +698,96 @@ fn print_response(resp: Response) {
             println!(
                 "notifications: needs-me {}{}",
                 if prefs.on_needs_me { "on" } else { "off" },
-                if !prefs.on_failure { " · failures off" } else { "" }
+                if !prefs.on_failure {
+                    " · failures off"
+                } else {
+                    ""
+                }
             );
+        }
+        // --- Phase 3A printers (§43, §52) ---
+        Response::Tasks { tasks } => {
+            if tasks.is_empty() {
+                println!("no tasks");
+            }
+            for t in &tasks {
+                print_task_line(t);
+            }
+        }
+        Response::TaskStatus { task } => {
+            print_task_line(&task);
+            if let Some(err) = &task.error {
+                println!("  error: {} ({:?})", err.message, err.class);
+            }
+            if let Some(r) = &task.result {
+                println!(
+                    "  result: {} · {} · {} attempt(s)",
+                    r.status.label(),
+                    r.summary,
+                    r.attempt_count
+                );
+            }
+            if task.review_required {
+                println!("  review required");
+            }
+        }
+        Response::TaskPolicy { policy } => {
+            println!(
+                "task policy: max-parallel {} · max-agents {} · max-cost {}¢ · retries {}",
+                policy.max_parallel_tasks,
+                policy.max_agents,
+                policy
+                    .max_cost_cents
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unbounded".into()),
+                policy.retry.max_retries,
+            );
+        }
+        Response::SchedulerStatus { status } => {
+            println!(
+                "scheduler: {} queued · {} running · started {} · completed {} · failed {} · cancelled {} · retried {} · actual cost {}¢",
+                status.queued.len(),
+                status.running.len(),
+                status.started_count,
+                status.completed_count,
+                status.failed_count,
+                status.cancelled_count,
+                status.retried_count,
+                status.actual_cost_cents
+            );
+            for (id, st) in &status.states {
+                println!("  {st} {id}");
+            }
+        }
+        Response::WorkflowValidation { issues } => {
+            if issues.is_empty() {
+                println!("workflow valid");
+            } else {
+                for issue in &issues {
+                    println!("issue: {issue}");
+                }
+            }
         }
         Response::Subscribed { .. } => {
             // Only reachable through the streaming path; handled in
             // `agent_watch` before any roundtrip.
         }
+    }
+}
+
+/// Phase 3A §43: one-line task summary.
+fn print_task_line(t: &terminal_workspace::terminal_session::orchestration::Task) {
+    let exec = t
+        .agent_execution_id
+        .as_ref()
+        .map(|e| format!(" [{}]", &e.0[..e.0.len().min(8)]))
+        .unwrap_or_default();
+    println!(
+        "{} {} — {} ({} agent{exec}; {} attempt(s))",
+        t.status, t.id, t.title, t.assigned_agent, t.attempt_count
+    );
+    if !t.dependencies.is_empty() {
+        println!("  depends on: {}", t.dependencies.join(", "));
     }
 }
 
@@ -574,6 +811,16 @@ fn print_help() {
          terminal agent spawn-pane <definition-id> <horizontal|vertical> [cwd]\n\
          terminal agent status|stop|restart|resume|pause <execution-id>\n\
          terminal agent permission <execution-id> <deny|allow-once|allow>\n\
-         terminal agent watch [execution-id-prefix]   # live event stream (no polling)"
+         terminal agent watch [execution-id-prefix]   # live event stream (no polling)\n\
+         terminal tasks\n\
+         terminal task create <workspace-id> <title> <agent> [--dep <task-id>]... [--review]\n\
+         terminal task status|cancel|retry|attach <task-id>\n\
+         terminal task run\n\
+         terminal task review <approve|reject> <task-id>\n\
+         terminal task policy\n\
+         terminal task set-policy <max-parallel|max-agents|max-cost-cents|max-retries> <value>\n\
+         terminal task scheduler\n\
+         terminal task validate\n\
+         terminal workflow list|validate"
     );
 }

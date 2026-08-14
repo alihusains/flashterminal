@@ -8,10 +8,9 @@
 //! - `--scenario approval` : Prints approval request and waits
 //! - `--scenario completion` : Prints success message and exits 0
 //! - `--scenario failure` : Prints error message and exits 1
-//! - `--scenario crash` : Exits abruptly with code 139
-//! - `--scenario large-output` : Prints 100K lines then exits
-//! - `--scenario long-running` : Emits working output until stdin closes
-//!   (optional `--duration <secs>` bounds it for tests)
+//! - `--scenario auth-failure` : Prints auth error and exits 2
+//! - `--scenario flaky` : Fails with exit 3 on attempt 1, succeeds on
+//!   `--attempt N` whenever N > 1 (deterministic retry fixture)
 
 use std::io::{self, BufRead, Write};
 use std::thread;
@@ -24,6 +23,12 @@ fn main() {
         .position(|a| a == "--scenario")
         .and_then(|i| args.get(i + 1).cloned())
         .unwrap_or_else(|| "working".to_string());
+    let attempt: u64 = args
+        .iter()
+        .position(|a| a == "--attempt")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     let duration_secs: Option<u64> = args
         .iter()
         .position(|a| a == "--duration")
@@ -93,6 +98,20 @@ fn main() {
         "failure" => {
             eprintln!("Error: Simulated agent failure");
             std::process::exit(1);
+        }
+        "auth-failure" => {
+            eprintln!("Error: Invalid API credentials");
+            std::process::exit(2);
+        }
+        "flaky" => {
+            // Deterministic retry fixture (3a.md §33): attempt 1 fails with
+            // a transient failure; later attempts succeed.
+            if attempt <= 1 {
+                eprintln!("Error: Transient provider hiccup");
+                std::process::exit(3);
+            }
+            println!("Task completed successfully (attempt {attempt}).");
+            std::process::exit(0);
         }
         "crash" => {
             std::process::exit(139); // SIGSEGV

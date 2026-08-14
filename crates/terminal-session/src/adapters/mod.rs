@@ -171,6 +171,8 @@ pub fn not_found_error(display_name: &str, install_hint: Option<&str>) -> anyhow
 /// default env var".
 pub type EnvVarDecision = Option<&'static str>;
 
+use crate::orchestration::{PreparedTask, TaskContext};
+
 /// Trait shared by all adapters: definition, capabilities, spawn spec.
 pub trait AgentAdapterImpl: Send + Sync {
     fn definition(&self) -> &AgentDefinition;
@@ -205,6 +207,57 @@ pub trait AgentAdapterImpl: Send + Sync {
             crate::agent::PermissionDecision::AllowOnce
             | crate::agent::PermissionDecision::Allow => b"y\n".to_vec(),
         }
+    }
+    /// Phase 3A §20: the ONLY place task instructions for a vendor are
+    /// constructed. The scheduler never builds vendor prompts — it hands the
+    /// structured [`TaskContext`] here and launches what this returns.
+    /// The default is vendor-neutral text of the task contract.
+    fn prepare_task(&self, ctx: &TaskContext) -> PreparedTask {
+        default_prepare_task(ctx)
+    }
+}
+
+/// The vendor-neutral default task instruction (adapter boundary §20).
+/// Extracted so adapters can call it without recursively invoking their own
+/// override.
+pub fn default_prepare_task(ctx: &TaskContext) -> PreparedTask {
+    let mut instructions = String::new();
+    instructions.push_str(&format!(
+        "TASK: {}\n{}\n",
+        ctx.task_title, ctx.task_description
+    ));
+    if !ctx.dependencies.is_empty() {
+        instructions.push_str("DEPENDENCIES (completed):\n");
+        for d in &ctx.dependencies {
+            instructions.push_str(&format!(
+                "  - {} ({}){}\n",
+                d.title,
+                d.status,
+                if d.artifacts.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", d.artifacts.join(", "))
+                }
+            ));
+        }
+    }
+    if !ctx.artifact_paths.is_empty() {
+        instructions.push_str(&format!(
+            "INPUT ARTIFACTS: {}\n",
+            ctx.artifact_paths.join(", ")
+        ));
+    }
+    if !ctx.relevant_files.is_empty() {
+        instructions.push_str(&format!(
+            "RELEVANT FILES: {}\n",
+            ctx.relevant_files.join(", ")
+        ));
+    }
+    instructions.push_str(&format!("WORKSPACE: {}\n", ctx.project_root));
+    PreparedTask {
+        instructions,
+        arguments: Vec::new(),
+        environment: Vec::new(),
     }
 }
 

@@ -52,7 +52,10 @@ impl ActivityKind {
     /// Whether a new observation of this kind is worth a timeline entry
     /// (§23: coalesce noisy same-kind readings).
     pub fn timeline_worthy(self) -> bool {
-        !matches!(self, ActivityKind::Reading | ActivityKind::Thinking | ActivityKind::Unknown)
+        !matches!(
+            self,
+            ActivityKind::Reading | ActivityKind::Thinking | ActivityKind::Unknown
+        )
     }
 
     /// Short label for the work view.
@@ -363,8 +366,7 @@ impl AgentWork {
     /// Pushes a coalesced activity record (newest last, bounded).
     pub fn push_activity(&mut self, act: AgentActivityState) {
         if let Some(last) = self.activity.back_mut() {
-            if last.kind == act.kind
-                && act.at_ms.saturating_sub(last.at_ms) <= ACTIVITY_COALESCE_MS
+            if last.kind == act.kind && act.at_ms.saturating_sub(last.at_ms) <= ACTIVITY_COALESCE_MS
             {
                 last.count += 1;
                 if !act.detail.is_empty() {
@@ -700,8 +702,10 @@ pub fn observe_command(line: &str) -> Option<String> {
         .unwrap_or(trimmed);
     if body.contains(" ") && !body.contains("=") && !body.ends_with(':') && !body.ends_with('|') {
         let first = body.split_whitespace().next().unwrap_or("");
-        if ["npm", "cargo", "git", "pnpm", "yarn", "make", "python", "node", "ruby", "bun"]
-            .contains(&first)
+        if [
+            "npm", "cargo", "git", "pnpm", "yarn", "make", "python", "node", "ruby", "bun",
+        ]
+        .contains(&first)
         {
             return Some(body.to_string());
         }
@@ -807,10 +811,7 @@ impl PricingRegistry {
 
     pub fn register(&mut self, pricing: PricingDefinition) {
         self.by_model.insert(
-            (
-                pricing.provider_id.clone(),
-                pricing.model_id.clone(),
-            ),
+            (pricing.provider_id.clone(), pricing.model_id.clone()),
             pricing,
         );
     }
@@ -822,13 +823,19 @@ impl PricingRegistry {
 
     /// Computes an estimated cost from usage. Returns `None` when pricing
     /// is unknown for the provider/model (never estimate blindly, §18).
-    pub fn estimate_cents(&self, provider_id: &str, model_id: &str, usage: &AgentUsage) -> Option<u64> {
+    pub fn estimate_cents(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        usage: &AgentUsage,
+    ) -> Option<u64> {
         let p = self.get(provider_id, model_id)?;
         let input = usage.input_tokens?;
         let output = usage.output_tokens?;
         let mut cents = input.saturating_mul(p.input_price_per_mtok_cents) / 1_000_000
             + output.saturating_mul(p.output_price_per_mtok_cents) / 1_000_000;
-        if let (Some(cached), Some(rate)) = (usage.cached_tokens, p.cache_read_price_per_mtok_cents) {
+        if let (Some(cached), Some(rate)) = (usage.cached_tokens, p.cache_read_price_per_mtok_cents)
+        {
             cents += cached.saturating_mul(rate) / 1_000_000;
         }
         Some(cents.max(1))
@@ -901,13 +908,34 @@ pub struct AgentHealthRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RecordedAgentEvent {
-    Started { at_ms: u64 },
-    Activity { kind: ActivityKind, detail: String, at_ms: u64 },
-    State { state: AgentState, at_ms: u64 },
-    Output { text: String, at_ms: u64 },
-    Permission { action: String, context: String, at_ms: u64 },
-    Completed { at_ms: u64 },
-    Exited { code: Option<i32>, at_ms: u64 },
+    Started {
+        at_ms: u64,
+    },
+    Activity {
+        kind: ActivityKind,
+        detail: String,
+        at_ms: u64,
+    },
+    State {
+        state: AgentState,
+        at_ms: u64,
+    },
+    Output {
+        text: String,
+        at_ms: u64,
+    },
+    Permission {
+        action: String,
+        context: String,
+        at_ms: u64,
+    },
+    Completed {
+        at_ms: u64,
+    },
+    Exited {
+        code: Option<i32>,
+        at_ms: u64,
+    },
 }
 
 impl RecordedAgentEvent {
@@ -922,11 +950,30 @@ pub fn fixture_long_running() -> Vec<RecordedAgentEvent> {
     let t = 1_000_000u64;
     vec![
         RecordedAgentEvent::Started { at_ms: t },
-        RecordedAgentEvent::State { state: AgentState::Starting, at_ms: t + 1 },
-        RecordedAgentEvent::Activity { kind: ActivityKind::Reading, detail: "auth.ts".into(), at_ms: t + 2 },
-        RecordedAgentEvent::Activity { kind: ActivityKind::Planning, detail: "".into(), at_ms: t + 3 },
-        RecordedAgentEvent::Activity { kind: ActivityKind::Editing, detail: "src/auth.ts".into(), at_ms: t + 4 },
-        RecordedAgentEvent::Activity { kind: ActivityKind::RunningTests, detail: "".into(), at_ms: t + 5 },
+        RecordedAgentEvent::State {
+            state: AgentState::Starting,
+            at_ms: t + 1,
+        },
+        RecordedAgentEvent::Activity {
+            kind: ActivityKind::Reading,
+            detail: "auth.ts".into(),
+            at_ms: t + 2,
+        },
+        RecordedAgentEvent::Activity {
+            kind: ActivityKind::Planning,
+            detail: "".into(),
+            at_ms: t + 3,
+        },
+        RecordedAgentEvent::Activity {
+            kind: ActivityKind::Editing,
+            detail: "src/auth.ts".into(),
+            at_ms: t + 4,
+        },
+        RecordedAgentEvent::Activity {
+            kind: ActivityKind::RunningTests,
+            detail: "".into(),
+            at_ms: t + 5,
+        },
     ]
 }
 
@@ -934,9 +981,19 @@ pub fn fixture_approval() -> Vec<RecordedAgentEvent> {
     let t = 2_000_000u64;
     vec![
         RecordedAgentEvent::Started { at_ms: t },
-        RecordedAgentEvent::State { state: AgentState::Working, at_ms: t + 1 },
-        RecordedAgentEvent::Permission { action: "write file".into(), context: "src/auth.ts".into(), at_ms: t + 2 },
-        RecordedAgentEvent::State { state: AgentState::NeedsApproval, at_ms: t + 3 },
+        RecordedAgentEvent::State {
+            state: AgentState::Working,
+            at_ms: t + 1,
+        },
+        RecordedAgentEvent::Permission {
+            action: "write file".into(),
+            context: "src/auth.ts".into(),
+            at_ms: t + 2,
+        },
+        RecordedAgentEvent::State {
+            state: AgentState::NeedsApproval,
+            at_ms: t + 3,
+        },
     ]
 }
 
@@ -944,8 +1001,14 @@ pub fn fixture_waiting() -> Vec<RecordedAgentEvent> {
     let t = 3_000_000u64;
     vec![
         RecordedAgentEvent::Started { at_ms: t },
-        RecordedAgentEvent::State { state: AgentState::Working, at_ms: t + 1 },
-        RecordedAgentEvent::State { state: AgentState::Waiting, at_ms: t + 2 },
+        RecordedAgentEvent::State {
+            state: AgentState::Working,
+            at_ms: t + 1,
+        },
+        RecordedAgentEvent::State {
+            state: AgentState::Waiting,
+            at_ms: t + 2,
+        },
     ]
 }
 
@@ -953,11 +1016,27 @@ pub fn fixture_failure() -> Vec<RecordedAgentEvent> {
     let t = 4_000_000u64;
     vec![
         RecordedAgentEvent::Started { at_ms: t },
-        RecordedAgentEvent::State { state: AgentState::Working, at_ms: t + 1 },
-        RecordedAgentEvent::Activity { kind: ActivityKind::RunningCommand, detail: "npm test".into(), at_ms: t + 2 },
-        RecordedAgentEvent::Output { text: "3 tests failed".into(), at_ms: t + 3 },
-        RecordedAgentEvent::Exited { code: Some(1), at_ms: t + 4 },
-        RecordedAgentEvent::State { state: AgentState::Failed, at_ms: t + 5 },
+        RecordedAgentEvent::State {
+            state: AgentState::Working,
+            at_ms: t + 1,
+        },
+        RecordedAgentEvent::Activity {
+            kind: ActivityKind::RunningCommand,
+            detail: "npm test".into(),
+            at_ms: t + 2,
+        },
+        RecordedAgentEvent::Output {
+            text: "3 tests failed".into(),
+            at_ms: t + 3,
+        },
+        RecordedAgentEvent::Exited {
+            code: Some(1),
+            at_ms: t + 4,
+        },
+        RecordedAgentEvent::State {
+            state: AgentState::Failed,
+            at_ms: t + 5,
+        },
     ]
 }
 
@@ -965,11 +1044,24 @@ pub fn fixture_completion() -> Vec<RecordedAgentEvent> {
     let t = 5_000_000u64;
     vec![
         RecordedAgentEvent::Started { at_ms: t },
-        RecordedAgentEvent::State { state: AgentState::Working, at_ms: t + 1 },
-        RecordedAgentEvent::Activity { kind: ActivityKind::Editing, detail: "src/oauth.ts".into(), at_ms: t + 2 },
+        RecordedAgentEvent::State {
+            state: AgentState::Working,
+            at_ms: t + 1,
+        },
+        RecordedAgentEvent::Activity {
+            kind: ActivityKind::Editing,
+            detail: "src/oauth.ts".into(),
+            at_ms: t + 2,
+        },
         RecordedAgentEvent::Completed { at_ms: t + 3 },
-        RecordedAgentEvent::Exited { code: Some(0), at_ms: t + 4 },
-        RecordedAgentEvent::State { state: AgentState::Completed, at_ms: t + 5 },
+        RecordedAgentEvent::Exited {
+            code: Some(0),
+            at_ms: t + 4,
+        },
+        RecordedAgentEvent::State {
+            state: AgentState::Completed,
+            at_ms: t + 5,
+        },
     ]
 }
 
@@ -978,7 +1070,11 @@ pub fn fixture_rapid_states() -> Vec<RecordedAgentEvent> {
     events.push(RecordedAgentEvent::Started { at_ms: 6_000_000 });
     for i in 0..50u64 {
         events.push(RecordedAgentEvent::State {
-            state: if i % 2 == 0 { AgentState::Working } else { AgentState::Waiting },
+            state: if i % 2 == 0 {
+                AgentState::Working
+            } else {
+                AgentState::Waiting
+            },
             at_ms: 6_000_000 + i,
         });
     }
@@ -1001,11 +1097,31 @@ pub fn fixture_multiple_activities() -> Vec<RecordedAgentEvent> {
     let t = 8_000_000u64;
     vec![
         RecordedAgentEvent::Started { at_ms: t },
-        RecordedAgentEvent::Activity { kind: ActivityKind::Reading, detail: "src".into(), at_ms: t + 1 },
-        RecordedAgentEvent::Activity { kind: ActivityKind::Planning, detail: "".into(), at_ms: t + 2 },
-        RecordedAgentEvent::Activity { kind: ActivityKind::Editing, detail: "auth.ts".into(), at_ms: t + 3 },
-        RecordedAgentEvent::Activity { kind: ActivityKind::RunningTests, detail: "".into(), at_ms: t + 4 },
-        RecordedAgentEvent::Activity { kind: ActivityKind::Finishing, detail: "".into(), at_ms: t + 5 },
+        RecordedAgentEvent::Activity {
+            kind: ActivityKind::Reading,
+            detail: "src".into(),
+            at_ms: t + 1,
+        },
+        RecordedAgentEvent::Activity {
+            kind: ActivityKind::Planning,
+            detail: "".into(),
+            at_ms: t + 2,
+        },
+        RecordedAgentEvent::Activity {
+            kind: ActivityKind::Editing,
+            detail: "auth.ts".into(),
+            at_ms: t + 3,
+        },
+        RecordedAgentEvent::Activity {
+            kind: ActivityKind::RunningTests,
+            detail: "".into(),
+            at_ms: t + 4,
+        },
+        RecordedAgentEvent::Activity {
+            kind: ActivityKind::Finishing,
+            detail: "".into(),
+            at_ms: t + 5,
+        },
     ]
 }
 
@@ -1055,7 +1171,9 @@ pub fn replay_into(
             RecordedAgentEvent::Output { text, .. } => {
                 sink(crate::execution::AgentEvent::Output { text: text.clone() });
             }
-            RecordedAgentEvent::Permission { action, context, .. } => {
+            RecordedAgentEvent::Permission {
+                action, context, ..
+            } => {
                 work.timeline.push(TimelineKind::Approval, context.clone());
                 sink(crate::execution::AgentEvent::PermissionRequested {
                     action: action.clone(),
@@ -1125,10 +1243,19 @@ impl AgentFilter {
             AgentFilter::All => true,
             AgentFilter::NeedsAttention => attention_for(state).is_some(),
             AgentFilter::Running => {
-                matches!(state, AgentState::Starting | AgentState::Working | AgentState::Waiting | AgentState::NeedsApproval)
+                matches!(
+                    state,
+                    AgentState::Starting
+                        | AgentState::Working
+                        | AgentState::Waiting
+                        | AgentState::NeedsApproval
+                )
             }
             AgentFilter::Failed => {
-                matches!(state, AgentState::Failed | AgentState::Crashed | AgentState::Blocked)
+                matches!(
+                    state,
+                    AgentState::Failed | AgentState::Crashed | AgentState::Blocked
+                )
             }
             AgentFilter::Completed => {
                 matches!(state, AgentState::Completed | AgentState::Stopped)
@@ -1150,32 +1277,53 @@ impl IntentResolver {
         let has = |w: &str| q.contains(w);
         if has("need") || has("attention") || has("needing") {
             if has("approval") {
-                return Some(AgentIntent::ShowAgents { filter: AgentFilter::NeedingApproval });
+                return Some(AgentIntent::ShowAgents {
+                    filter: AgentFilter::NeedingApproval,
+                });
             }
             if has("input") {
-                return Some(AgentIntent::ShowAgents { filter: AgentFilter::NeedingInput });
+                return Some(AgentIntent::ShowAgents {
+                    filter: AgentFilter::NeedingInput,
+                });
             }
-            return Some(AgentIntent::ShowAgents { filter: AgentFilter::NeedsAttention });
+            return Some(AgentIntent::ShowAgents {
+                filter: AgentFilter::NeedsAttention,
+            });
         }
         if has("fail") {
-            return Some(AgentIntent::ShowAgents { filter: AgentFilter::Failed });
+            return Some(AgentIntent::ShowAgents {
+                filter: AgentFilter::Failed,
+            });
         }
         if has("complete") || has("done") {
-            return Some(AgentIntent::ShowAgents { filter: AgentFilter::Completed });
+            return Some(AgentIntent::ShowAgents {
+                filter: AgentFilter::Completed,
+            });
         }
         if has("running") || has("show agents") || has("agents") {
             if has("running") {
-                return Some(AgentIntent::ShowAgents { filter: AgentFilter::Running });
+                return Some(AgentIntent::ShowAgents {
+                    filter: AgentFilter::Running,
+                });
             }
-            return Some(AgentIntent::ShowAgents { filter: AgentFilter::All });
+            return Some(AgentIntent::ShowAgents {
+                filter: AgentFilter::All,
+            });
         }
-        if has("focus") || has("show claude") || has("show codex") || has("show opencode") || has("show pi") {
+        if has("focus")
+            || has("show claude")
+            || has("show codex")
+            || has("show opencode")
+            || has("show pi")
+        {
             for name in ["claude", "codex", "opencode", "pi"] {
                 if has(name) {
                     return Some(AgentIntent::FocusAgent { name: name.into() });
                 }
             }
-            return Some(AgentIntent::ShowAgents { filter: AgentFilter::All });
+            return Some(AgentIntent::ShowAgents {
+                filter: AgentFilter::All,
+            });
         }
         if has("review") && has("change") {
             return Some(AgentIntent::ReviewChanges);
@@ -1279,7 +1427,10 @@ mod tests {
             attention_for(AgentState::NeedsApproval),
             Some(AttentionReason::PermissionRequested)
         );
-        assert_eq!(attention_for(AgentState::Waiting), Some(AttentionReason::NeedsInput));
+        assert_eq!(
+            attention_for(AgentState::Waiting),
+            Some(AttentionReason::NeedsInput)
+        );
         assert_eq!(
             attention_for(AgentState::Failed),
             Some(AttentionReason::ErrorIntervention)
@@ -1303,33 +1454,49 @@ mod tests {
             cached_tokens: Some(500_000),
             ..Default::default()
         };
-        let cents = r.estimate_cents("anthropic", "claude-sonnet-4-5", &usage).unwrap();
+        let cents = r
+            .estimate_cents("anthropic", "claude-sonnet-4-5", &usage)
+            .unwrap();
         assert!(cents > 0);
         // Unknown model → no estimate (never fabricated).
-        assert!(r.estimate_cents("anthropic", "unknown-model", &usage).is_none());
-        assert!(r.estimate_cents("openrouter", "claude-sonnet-4-5", &usage).is_none());
+        assert!(r
+            .estimate_cents("anthropic", "unknown-model", &usage)
+            .is_none());
+        assert!(r
+            .estimate_cents("openrouter", "claude-sonnet-4-5", &usage)
+            .is_none());
         // Missing usage → no estimate.
         let empty = AgentUsage::default();
-        assert!(r.estimate_cents("anthropic", "claude-sonnet-4-5", &empty).is_none());
+        assert!(r
+            .estimate_cents("anthropic", "claude-sonnet-4-5", &empty)
+            .is_none());
     }
 
     #[test]
     fn intent_resolution_is_deterministic() {
         assert_eq!(
             IntentResolver::resolve("show agents that need me"),
-            Some(AgentIntent::ShowAgents { filter: AgentFilter::NeedsAttention })
+            Some(AgentIntent::ShowAgents {
+                filter: AgentFilter::NeedsAttention
+            })
         );
         assert_eq!(
             IntentResolver::resolve("show failed agents"),
-            Some(AgentIntent::ShowAgents { filter: AgentFilter::Failed })
+            Some(AgentIntent::ShowAgents {
+                filter: AgentFilter::Failed
+            })
         );
         assert_eq!(
             IntentResolver::resolve("show completed agents"),
-            Some(AgentIntent::ShowAgents { filter: AgentFilter::Completed })
+            Some(AgentIntent::ShowAgents {
+                filter: AgentFilter::Completed
+            })
         );
         assert_eq!(
             IntentResolver::resolve("focus Codex"),
-            Some(AgentIntent::FocusAgent { name: "codex".into() })
+            Some(AgentIntent::FocusAgent {
+                name: "codex".into()
+            })
         );
         assert_eq!(
             IntentResolver::resolve("review changes"),
@@ -1356,10 +1523,16 @@ mod tests {
             emitted.push(e);
         });
         assert!(matches!(emitted[0], crate::execution::AgentEvent::Started));
-        assert!(work.status == WorkStatus::Completed, "fixture must finish work");
+        assert!(
+            work.status == WorkStatus::Completed,
+            "fixture must finish work"
+        );
         assert!(emitted.iter().any(|e| matches!(
             e,
-            crate::execution::AgentEvent::Activity { kind: ActivityKind::Editing, .. }
+            crate::execution::AgentEvent::Activity {
+                kind: ActivityKind::Editing,
+                ..
+            }
         )));
         // Failure fixture classifies the work as failed via exit handling
         // in the runtime; at the model level the Completed fixture is the
@@ -1367,14 +1540,16 @@ mod tests {
         let mut w2 = AgentWork::new("s", "t");
         replay_into(&mut w2, &fixture_failure(), &mut |_| {});
         assert!(w2.status == WorkStatus::Running || w2.status == WorkStatus::Failed);
-        assert!(w2.activity.len() >= 1);
+        assert!(!w2.activity.is_empty());
     }
 
     #[test]
     fn all_fixtures_are_secret_free_and_serializable() {
         for (name, events) in all_fixtures() {
             let json = serde_json::to_string(&events).unwrap();
-            assert!(!json.to_lowercase().contains("key") || name == "large-output" || name == "failure");
+            assert!(
+                !json.to_lowercase().contains("key") || name == "large-output" || name == "failure"
+            );
             let back: Vec<RecordedAgentEvent> = serde_json::from_str(&json).unwrap();
             assert_eq!(back.len(), events.len());
         }
@@ -1389,7 +1564,9 @@ mod tests {
         // a known file.
         let dir = std::env::temp_dir();
         let existing = std::fs::read_dir(&dir).ok().and_then(|mut it| {
-            it.next().and_then(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string())
+            it.next()
+                .and_then(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
         });
         if let Some(f) = existing {
             if let Some(found) = observe_file(&format!("→ {f}"), dir.to_string_lossy().as_ref()) {

@@ -131,4 +131,7 @@ pub struct PersistedState {
     pub workspaces: Vec<Workspace>,
     #[serde(default)]
     pub active_workspace: Option<WorkspaceId>,
+    /// Phase 3A §52: versioned orchestration state (bounded, no secrets).
+    #[serde(default)]
+    pub tasks: Option<terminal_session::orchestration::PersistedSchedulerState>,
 }

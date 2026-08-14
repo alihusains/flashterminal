@@ -45,6 +45,21 @@ pub enum Command {
     Deny,
     ToggleQuietMode,
     ToggleCommandPalette,
+    // --- Phase 3A: task orchestration (§43, §55 — minimal UI) ---
+    /// `task.run` — schedules the whole workflow graph.
+    RunTasks,
+    /// Opens the task dashboard overlay.
+    ToggleTasks,
+    /// Cancels the task selected in the task dashboard.
+    CancelSelectedTask,
+    /// Retries the task selected in the task dashboard.
+    RetrySelectedTask,
+    /// Approves the NeedsReview task selected in the dashboard.
+    ApproveSelectedTask,
+    /// Rejects the NeedsReview task selected in the dashboard.
+    RejectSelectedTask,
+    /// Attaches a live agent pane to the selected task's execution.
+    OpenSelectedTaskAgent,
 }
 
 /// A key chord: optional modifiers + a printable key name (e.g. "d", "w",
@@ -56,6 +71,56 @@ pub struct KeyChord {
     pub alt: bool,
     pub shift: bool,
     pub key: String,
+}
+
+impl Command {
+    /// Palette/UI label (Phase 2C §37). Parameterized variants use a static
+    /// label — the palette runs the action against the focused target.
+    pub fn to_label(&self) -> &'static str {
+        match self {
+            Command::SplitHorizontal => "Split Horizontal",
+            Command::SplitVertical => "Split Vertical",
+            Command::ClosePane => "Close Pane",
+            Command::FocusNext => "Focus Next Pane",
+            Command::FocusPrevious => "Focus Previous Pane",
+            Command::ResizePaneLeft => "Resize Pane Left",
+            Command::ResizePaneRight => "Resize Pane Right",
+            Command::ResizePaneUp => "Resize Pane Up",
+            Command::ResizePaneDown => "Resize Pane Down",
+            Command::ZoomPane => "Zoom Pane",
+            Command::NewTab => "New Tab",
+            Command::CloseTab => "Close Tab",
+            Command::NextTab => "Next Tab",
+            Command::PreviousTab => "Previous Tab",
+            Command::NewWorkspace => "New Workspace",
+            Command::SwitchWorkspace(_) => "Switch Workspace",
+            Command::CloseWorkspace => "Close Workspace",
+            Command::ShowAgents => "Show Agents",
+            Command::ShowAgentsNeedingAttention => "Show Agents Needing Attention",
+            Command::ShowFailedAgents => "Show Failed Agents",
+            Command::ShowCompletedAgents => "Show Completed Agents",
+            Command::FocusNextAgent => "Focus Next Agent",
+            Command::FocusPreviousAgent => "Focus Previous Agent",
+            Command::FocusAgent(_) => "Focus Agent",
+            Command::ToggleAgentWorkView => "Toggle Agent Work View",
+            Command::ReviewAgentChanges => "Review Agent Changes",
+            Command::OpenAgentLogs => "Open Agent Logs",
+            Command::StopAgent => "Stop Agent",
+            Command::RestartAgent => "Restart Agent",
+            Command::ResumeAgent => "Resume Agent",
+            Command::Approve => "Approve",
+            Command::Deny => "Deny",
+            Command::ToggleQuietMode => "Toggle Quiet Mode",
+            Command::ToggleCommandPalette => "Command Palette",
+            Command::RunTasks => "Run All Tasks",
+            Command::ToggleTasks => "Show Tasks",
+            Command::CancelSelectedTask => "Cancel Selected Task",
+            Command::RetrySelectedTask => "Retry Selected Task",
+            Command::ApproveSelectedTask => "Approve Selected Task",
+            Command::RejectSelectedTask => "Reject Selected Task",
+            Command::OpenSelectedTaskAgent => "Open Selected Task Agent",
+        }
+    }
 }
 
 impl KeyChord {
@@ -130,6 +195,12 @@ pub fn default_bindings() -> Vec<(KeyChord, Command)> {
         (KeyChord::ctrl_alt("r"), Command::RestartAgent),
         (KeyChord::ctrl_alt("q"), Command::ToggleQuietMode),
         (KeyChord::ctrl("k"), Command::ToggleCommandPalette),
+        // --- Phase 3A: task dashboard + workflow actions (§43) ---
+        (KeyChord::ctrl_alt("t"), Command::ToggleTasks),
+        (KeyChord::ctrl_alt("Enter"), Command::RunTasks),
+        (KeyChord::ctrl_alt("c"), Command::CancelSelectedTask),
+        (KeyChord::ctrl_alt("x"), Command::RetrySelectedTask),
+        (KeyChord::ctrl_alt("p"), Command::OpenSelectedTaskAgent),
     ]
 }
 
@@ -161,6 +232,43 @@ impl CommandRegistry {
 
     pub fn all_commands(&self) -> impl Iterator<Item = &Command> {
         self.bindings.iter().map(|(_, cmd)| cmd)
+    }
+
+    /// Every palette-offerable command (Phase 2C §37): bound commands plus
+    /// the remaining parameterless commands, so "Show Agents", "Review
+    /// Agent Changes", … are reachable even without a default key binding.
+    /// Parameterized commands run against the focused target — the desktop
+    /// treats the empty-pid `FocusAgent` as "focus the first agent pane".
+    pub fn palette(&self) -> Vec<Command> {
+        let mut out: Vec<Command> = self.bindings.iter().map(|(_, cmd)| cmd.clone()).collect();
+        const EXTRA: &[Command] = &[
+            Command::ShowAgents,
+            Command::ShowAgentsNeedingAttention,
+            Command::ShowFailedAgents,
+            Command::ShowCompletedAgents,
+            Command::FocusAgent(String::new()),
+            Command::ReviewAgentChanges,
+            Command::OpenAgentLogs,
+            Command::ResumeAgent,
+            Command::Approve,
+            Command::Deny,
+            Command::ToggleQuietMode,
+            Command::ToggleCommandPalette,
+            // Phase 3A task dashboard + workflow actions (§43, §55).
+            Command::RunTasks,
+            Command::ToggleTasks,
+            Command::CancelSelectedTask,
+            Command::RetrySelectedTask,
+            Command::ApproveSelectedTask,
+            Command::RejectSelectedTask,
+            Command::OpenSelectedTaskAgent,
+        ];
+        for cmd in EXTRA {
+            if !out.contains(cmd) {
+                out.push(cmd.clone());
+            }
+        }
+        out
     }
 }
 
