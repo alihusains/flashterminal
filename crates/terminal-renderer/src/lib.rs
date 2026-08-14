@@ -328,6 +328,16 @@ impl GlyphAtlas {
         self.shelf_h = self.shelf_h.max(h);
 
         let entry = AtlasEntry { x, y, w, h };
+        // Zero-width glyphs (e.g. space) rasterize to an empty bitmap; the
+        // atlas region must still be defined (wgpu rejects 0-byte uploads
+        // and the texture is otherwise uninitialized), so fill the slot
+        // with transparent coverage.
+        let src: Vec<u8> = if g.bitmap.is_empty() {
+            vec![0u8; (w * h) as usize]
+        } else {
+            Vec::new()
+        };
+        let source: &[u8] = if src.is_empty() { &g.bitmap } else { &src };
         // Copy the bitmap into the atlas (R8 coverage).
         queue.write_texture(
             wgpu::ImageCopyTexture {
@@ -336,7 +346,7 @@ impl GlyphAtlas {
                 origin: wgpu::Origin3d { x, y, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
-            &g.bitmap,
+            source,
             wgpu::ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(w),
@@ -600,7 +610,7 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,

@@ -132,6 +132,43 @@ agent process ──► PTY master ──► [reader + parser thread]  (same pip
   `real_agents` feature suite (§7–11, SKIP-when-unavailable), IPC/persistence
   integration tests. Results: `docs/agent-compatibility.md`, `docs/phase2b.md`.
 
+## Task Orchestration (Phase 3A / 3A.1)
+
+```text
+task_run ──► TaskScheduler::step (pure fn of graph + runtime view)
+              └─► typed SpawnTask(TaskContext)          (no raw subprocesses)
+                    └─► adapter.prepare_task ──► AgentRuntime spawns the agent
+runtime exit ──► engine observes in deterministic drain order
+                    └─► scheduler classifies (FailureClass) ──► TaskEvent bus
+```
+
+- **`TaskScheduler`** (`terminal-session::orchestration`): insertion-ordered
+  `TaskGraph`, explicit validated transitions, deterministic topological
+  order, capacity arcs (`max_agents`/`max_parallel_tasks` never overshot),
+  retry policy (auth never / flaky once), review boundary (`NeedsReview`
+  halts the workflow), hard cost budget, `PersistedSchedulerState`
+  (versioned, bounded, secret-free; restore → `Interrupted`, never silent
+  resume).
+- **Engine glue** (`terminal-workspace`): task API on `Multiplexer`
+  (create/run/cancel/retry/get/list/set-policy/validate/resolve-review/
+  attach-pane/status), `step_tasks` inside `drain_frame` (idle cost
+  microseconds), `ApplicationEvent::TaskEvent` on the bus.
+- **Determinism**: same graph + same view ⇒ same commands in the same
+  order; per-task event order guaranteed; cross-task emission order
+  deterministic since 3A.1 (sessions drain in sorted `ExecutionId` order —
+  a HashMap-iteration race fixed by the 10-run determinism test).
+- **Surfaces**: IPC task request/response set (13 requests) + event
+  streaming; CLI `terminal task|workflow|tasks|scheduler`; desktop
+  dashboard + detail panel + create form + filters + palette (7+4
+  commands, Ctrl-Alt bindings).
+- **Validation**: `crates/terminal-workspace/tests/phase3a` (22 tests:
+  lifecycle, retry, review, budgets, persistence, determinism ×10, stress,
+  idle gate, command-safety table, event flood), `orchestration_bench`
+  (40-cell matrix + 80/20 fairness), `real_agent_tasks` (`#[ignore]`d,
+  SKIP/record semantics). Docs: `docs/phase3a.md`,
+  `docs/orchestration.md`, `docs/phase3a-manual.md`,
+  `docs/phase3a-verification.md`.
+
 ### Agent observability (Phase 2C)
 
 Backend models live in `terminal-session` (`work.rs`): `AgentWork` (one per

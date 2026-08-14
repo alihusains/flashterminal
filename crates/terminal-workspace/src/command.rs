@@ -50,6 +50,14 @@ pub enum Command {
     RunTasks,
     /// Opens the task dashboard overlay.
     ToggleTasks,
+    /// Opens the create-task form (3A.1 §6 palette completeness).
+    CreateTask,
+    /// Dashboard filtered to blocked tasks.
+    ShowBlockedTasks,
+    /// Dashboard filtered to tasks needing review.
+    ShowTasksNeedingReview,
+    /// Selects the first task and opens its detail panel.
+    OpenTask,
     /// Cancels the task selected in the task dashboard.
     CancelSelectedTask,
     /// Retries the task selected in the task dashboard.
@@ -114,6 +122,10 @@ impl Command {
             Command::ToggleCommandPalette => "Command Palette",
             Command::RunTasks => "Run All Tasks",
             Command::ToggleTasks => "Show Tasks",
+            Command::CreateTask => "Create Task",
+            Command::ShowBlockedTasks => "Show Blocked Tasks",
+            Command::ShowTasksNeedingReview => "Show Tasks Needing Review",
+            Command::OpenTask => "Open Task",
             Command::CancelSelectedTask => "Cancel Selected Task",
             Command::RetrySelectedTask => "Retry Selected Task",
             Command::ApproveSelectedTask => "Approve Selected Task",
@@ -257,6 +269,10 @@ impl CommandRegistry {
             // Phase 3A task dashboard + workflow actions (§43, §55).
             Command::RunTasks,
             Command::ToggleTasks,
+            Command::CreateTask,
+            Command::ShowBlockedTasks,
+            Command::ShowTasksNeedingReview,
+            Command::OpenTask,
             Command::CancelSelectedTask,
             Command::RetrySelectedTask,
             Command::ApproveSelectedTask,

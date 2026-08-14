@@ -185,6 +185,18 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Phase 3A.1 §4: milliseconds → "m:ss" / "s.ss" for the detail panel.
+fn format_duration(ms: u64) -> String {
+    if ms == 0 {
+        "–".to_string()
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let secs = ms / 1000;
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    }
+}
+
 /// Phase 3A §55: task status color in the dashboard.
 fn task_state_color(
     status: &terminal_workspace::terminal_session::orchestration::TaskStatus,
@@ -246,6 +258,45 @@ struct App {
     agent_health: Vec<AgentHealthRow>,
     /// Phase 3A: selected row in the task dashboard (insertion order).
     tasks_selection: usize,
+    /// Phase 3A.1 §4: task detail panel open inside the dashboard.
+    task_detail_open: bool,
+    /// Phase 3A.1 §6: dashboard filter (All / Blocked / NeedsReview).
+    task_filter: TaskFilter,
+    /// Phase 3A.1 §6: create-task form open inside the dashboard.
+    task_create_open: bool,
+    /// Title being typed into the create-task form.
+    task_create_title: String,
+    /// Agent for the create-task form (defaults to the always-registered
+    /// fake-agent; unknown refs fail with a graph error on submit).
+    task_create_agent: String,
+}
+
+/// Dashboard filter for the task overlay (Phase 3A.1 §6 palette completeness).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskFilter {
+    All,
+    Blocked,
+    NeedsReview,
+}
+
+impl TaskFilter {
+    fn matches(&self, t: &Task) -> bool {
+        match self {
+            TaskFilter::All => true,
+            TaskFilter::Blocked => t.status == terminal_session::orchestration::TaskStatus::Blocked,
+            TaskFilter::NeedsReview => {
+                t.status == terminal_session::orchestration::TaskStatus::NeedsReview
+            }
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            TaskFilter::All => "all tasks",
+            TaskFilter::Blocked => "blocked tasks",
+            TaskFilter::NeedsReview => "tasks needing review",
+        }
+    }
 }
 
 impl App {
@@ -276,6 +327,11 @@ impl App {
             provider_setup: ProviderSetupState::default(),
             agent_health: Vec::new(),
             tasks_selection: 0,
+            task_detail_open: false,
+            task_filter: TaskFilter::All,
+            task_create_open: false,
+            task_create_title: String::new(),
+            task_create_agent: "fake-agent".to_string(),
         }
     }
 
@@ -416,6 +472,10 @@ impl App {
             cmd,
             Command::RunTasks
                 | Command::ToggleTasks
+                | Command::CreateTask
+                | Command::ShowBlockedTasks
+                | Command::ShowTasksNeedingReview
+                | Command::OpenTask
                 | Command::CancelSelectedTask
                 | Command::RetrySelectedTask
                 | Command::ApproveSelectedTask
@@ -598,6 +658,8 @@ impl App {
                 eng.task_run();
                 // Show the dashboard so progress is visible.
                 self.overlay_mode = Some(OverlayMode::Tasks);
+                self.task_create_open = false;
+                self.task_detail_open = false;
                 self.tasks_selection = 0;
                 Ok(())
             }
@@ -606,8 +668,45 @@ impl App {
                     self.overlay_mode = None;
                 } else {
                     self.overlay_mode = Some(OverlayMode::Tasks);
+                    self.task_filter = TaskFilter::All;
+                    self.task_create_open = false;
+                    self.task_detail_open = false;
                     self.tasks_selection = 0;
                 }
+                Ok(())
+            }
+            Command::CreateTask => {
+                // Open the create-task form (3A.1 §6).
+                self.overlay_mode = Some(OverlayMode::Tasks);
+                self.task_detail_open = false;
+                self.task_create_open = true;
+                self.task_create_title.clear();
+                Ok(())
+            }
+            Command::ShowBlockedTasks => {
+                self.overlay_mode = Some(OverlayMode::Tasks);
+                self.task_filter = TaskFilter::Blocked;
+                self.task_create_open = false;
+                self.task_detail_open = false;
+                self.tasks_selection = 0;
+                Ok(())
+            }
+            Command::ShowTasksNeedingReview => {
+                self.overlay_mode = Some(OverlayMode::Tasks);
+                self.task_filter = TaskFilter::NeedsReview;
+                self.task_create_open = false;
+                self.task_detail_open = false;
+                self.tasks_selection = 0;
+                Ok(())
+            }
+            Command::OpenTask => {
+                // Select the first task (if any) and open its detail.
+                let eng = self.engine.lock().expect("engine lock");
+                let visible = self.visible_tasks(&eng);
+                self.overlay_mode = Some(OverlayMode::Tasks);
+                self.task_create_open = false;
+                self.task_detail_open = !visible.is_empty();
+                self.tasks_selection = 0;
                 Ok(())
             }
             Command::CancelSelectedTask => {
@@ -650,16 +749,27 @@ impl App {
         self.persist();
     }
 
-    /// The task id selected in the dashboard (insertion order of the
-    /// schedulers status — deterministic §10).
+    /// Tasks visible under the current dashboard filter, in scheduler
+    /// insertion order (§10 deterministic).
+    fn visible_tasks(&self, eng: &Multiplexer) -> Vec<terminal_session::orchestration::TaskId> {
+        eng.scheduler_status()
+            .states
+            .iter()
+            .map(|(id, _)| id.clone())
+            .filter(|id| {
+                eng.task_get(id)
+                    .map(|t| self.task_filter.matches(t))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// The task id selected in the dashboard (filtered insertion order).
     fn selected_task_id(
         &self,
         eng: &Multiplexer,
     ) -> Option<terminal_session::orchestration::TaskId> {
-        eng.scheduler_status()
-            .states
-            .get(self.tasks_selection)
-            .map(|(id, _)| id.clone())
+        self.visible_tasks(eng).get(self.tasks_selection).cloned()
     }
 
     fn resolve_selected_review(&mut self, approve: bool) -> anyhow::Result<()> {
@@ -902,18 +1012,55 @@ impl App {
                 App::draw_provider_setup(renderer, window_size, &setup);
             }
         }
-        // Phase 3A task dashboard overlay (§55 minimal UI).
+        // Phase 3A task dashboard overlay (§55 minimal UI + 3A.1 §4–6).
         if let Some(OverlayMode::Tasks) = self.overlay_mode {
-            let (tasks, status, selection) = {
+            let (
+                tasks,
+                status,
+                selection,
+                filter_label,
+                detail_open,
+                create_open,
+                create_title,
+                create_agent,
+            ) = {
                 let eng = self.engine.lock().expect("engine lock");
+                let tasks = eng
+                    .task_list()
+                    .into_iter()
+                    .filter(|t| self.task_filter.matches(t))
+                    .cloned()
+                    .collect::<Vec<_>>();
                 (
-                    eng.task_list().into_iter().cloned().collect::<Vec<_>>(),
+                    tasks,
                     eng.scheduler_status(),
                     self.tasks_selection,
+                    self.task_filter.label(),
+                    self.task_detail_open,
+                    self.task_create_open,
+                    self.task_create_title.clone(),
+                    self.task_create_agent.clone(),
                 )
             };
             if let Some(renderer) = self.renderer.as_mut() {
-                App::draw_tasks(renderer, window_size, &tasks, &status, selection);
+                if create_open {
+                    App::draw_task_create(renderer, window_size, &create_title, &create_agent);
+                } else {
+                    App::draw_tasks(
+                        renderer,
+                        window_size,
+                        &tasks,
+                        &status,
+                        selection,
+                        filter_label,
+                        detail_open,
+                    );
+                    if detail_open {
+                        if let Some(task) = tasks.get(selection) {
+                            App::draw_task_detail(renderer, window_size, task);
+                        }
+                    }
+                }
             }
         }
         // Diagnostics panel.
@@ -1458,6 +1605,9 @@ impl App {
         self.palette_open = false;
         self.palette_query.clear();
         self.palette_selection = 0;
+        self.task_detail_open = false;
+        self.task_create_open = false;
+        self.task_filter = TaskFilter::All;
     }
 
     /// Draws the command palette overlay (§37): live-query filtered command
@@ -1647,15 +1797,17 @@ impl App {
         renderer.chrome_text(x + 20.0, y + h - 20.0, "Press Esc to close.", CHROME_FG_DIM);
     }
 
-    /// Phase 3A §55 minimal task UI: live scheduler snapshot with an
-    /// action hint bar. Reads are fresh per frame; actions happen via
-    /// `dispatch_task_command` (never here).
+    /// Phase 3A §55 + 3A.1 §6 task dashboard: live scheduler snapshot with
+    /// an action hint bar and filter awareness. Reads are fresh per frame;
+    /// actions happen via `dispatch_task_command` (never here).
     fn draw_tasks(
         renderer: &mut Renderer,
         window_size: PhysicalSize<u32>,
         tasks: &[Task],
         status: &terminal_workspace::terminal_session::orchestration::SchedulerStatus,
         selection: usize,
+        filter_label: &str,
+        detail_open: bool,
     ) {
         let (cw, ch) = renderer.cell_size();
         if cw <= 0.0 || ch <= 0.0 {
@@ -1678,7 +1830,7 @@ impl App {
             x + 20.0,
             y + 16.0,
             &format!(
-                "TASKS — {} queued · {} running · {} completed · {} failed · {}¢ spent",
+                "TASKS ({filter_label}) — {} queued · {} running · {} completed · {} failed · {}¢ spent",
                 status.queued.len(),
                 status.running.len(),
                 status.completed_count,
@@ -1730,7 +1882,210 @@ impl App {
         renderer.chrome_text(
             x + 20.0,
             y + h - 20.0,
-            "↑↓ select · Enter run all · c cancel · r retry · a approve · d reject · p open agent · Esc close",
+            if detail_open {
+                "↑↓ next task · Enter close · u run all · c cancel · r retry · a approve · d reject · p open agent · Esc back"
+            } else {
+                "↑↓ select · Enter detail · u run all · c cancel · r retry · a approve · d reject · p open agent · Esc close"
+            },
+            CHROME_FG_DIM,
+        );
+    }
+
+    /// Phase 3A.1 §4 task detail panel: the full Task record (status, agent,
+    /// attempts, duration, dependencies, result summary, files, commands,
+    /// artifacts, error). Actions stay one-key and state-gated in hints.
+    fn draw_task_detail(renderer: &mut Renderer, window_size: PhysicalSize<u32>, task: &Task) {
+        let (cw, ch) = renderer.cell_size();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        let w = (74.0_f32 * cw).min(920.0_f32);
+        let h = (30.0_f32 * ch).min(760.0_f32);
+        let x = (window_size.width as f32 - w) / 2.0;
+        let y = (window_size.height as f32 - h) / 2.0;
+        renderer.chrome_rect(x, y, w, h, [0.10, 0.10, 0.13, 1.0]);
+        renderer.chrome_border(x, y, w, h, 1.0, CHROME_ACCENT);
+        let color = task_state_color(&task.status);
+        renderer.chrome_text(
+            x + 20.0,
+            y + 16.0,
+            &format!("TASK — {}", truncate(&task.title, 46)),
+            CHROME_ACCENT,
+        );
+        let mut line = y + 16.0 + ch;
+        let desc = if task.description.is_empty() {
+            "(no description)".to_string()
+        } else {
+            truncate(&task.description, 74)
+        };
+        renderer.chrome_text(x + 20.0, line, &desc, CHROME_FG_DIM);
+        line += ch + 6.0;
+        let duration = format_duration(task.duration_ms);
+        let cost = task
+            .result
+            .as_ref()
+            .and_then(|r| r.estimated_cost_cents)
+            .map(|c| format!("~{c}¢"))
+            .unwrap_or_else(|| "–".to_string());
+        renderer.chrome_text(
+            x + 20.0,
+            line,
+            &format!(
+                "Status: {}   Agent: {}   Attempt: {}   Duration: {}   Cost: {}",
+                task.status.label(),
+                task.assigned_agent,
+                task.attempt_count,
+                duration,
+                cost
+            ),
+            color,
+        );
+        line += ch;
+        if task.review_required {
+            renderer.chrome_text(x + 20.0, line, "Review required: yes", STATE_APPROVAL);
+            line += ch;
+        }
+        let dep_names = task
+            .dependencies
+            .iter()
+            .take(8)
+            .map(|d| truncate(d, 12))
+            .collect::<Vec<_>>()
+            .join(", ");
+        renderer.chrome_text(
+            x + 20.0,
+            line,
+            &format!(
+                "Dependencies: {}",
+                if dep_names.is_empty() {
+                    "none".to_string()
+                } else {
+                    dep_names
+                }
+            ),
+            CHROME_FG_DIM,
+        );
+        line += ch + 6.0;
+        if let Some(result) = &task.result {
+            let summary = if result.summary.is_empty() {
+                "(no summary)".to_string()
+            } else {
+                truncate(&result.summary, 74)
+            };
+            renderer.chrome_text(x + 20.0, line, &summary, CHROME_FG);
+            line += ch + 6.0;
+            let files = result
+                .files_changed
+                .iter()
+                .take(6)
+                .map(|f| truncate(f, 26))
+                .collect::<Vec<_>>()
+                .join(", ");
+            renderer.chrome_text(
+                x + 20.0,
+                line,
+                &format!("Files changed ({}):", result.files_changed.len()),
+                CHROME_FG_DIM,
+            );
+            line += ch;
+            if !files.is_empty() {
+                renderer.chrome_text(x + 20.0, line, &files, CHROME_FG);
+                line += ch;
+            }
+            let commands = result
+                .commands
+                .iter()
+                .take(6)
+                .map(|c| truncate(c, 46))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            renderer.chrome_text(
+                x + 20.0,
+                line,
+                &format!("Commands ({}):", result.commands.len()),
+                CHROME_FG_DIM,
+            );
+            line += ch;
+            if !commands.is_empty() {
+                renderer.chrome_text(x + 20.0, line, &commands, CHROME_FG);
+                line += ch;
+            }
+            let artifacts = result
+                .artifacts
+                .iter()
+                .take(6)
+                .map(|a| {
+                    format!(
+                        "{:?} {}",
+                        a.kind,
+                        truncate(a.path.as_deref().unwrap_or(""), 20)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            renderer.chrome_text(
+                x + 20.0,
+                line,
+                &format!("Artifacts ({}):", result.artifacts.len()),
+                CHROME_FG_DIM,
+            );
+            line += ch;
+            if !artifacts.is_empty() {
+                renderer.chrome_text(x + 20.0, line, &artifacts, CHROME_FG);
+                line += ch;
+            }
+        } else {
+            renderer.chrome_text(x + 20.0, line, "Result: (not finished)", CHROME_FG_DIM);
+            line += ch + 6.0;
+        }
+        if let Some(err) = &task.error {
+            renderer.chrome_text(
+                x + 20.0,
+                line,
+                &format!("Error: {}", truncate(&err.message, 74)),
+                STATE_FAILED,
+            );
+        }
+        renderer.chrome_text(
+            x + 20.0,
+            y + h - 20.0,
+            "Enter close · u run all · c cancel · r retry · a approve · d reject · p open agent · v view changes · Esc back",
+            CHROME_FG_DIM,
+        );
+    }
+
+    /// Phase 3A.1 §6 create-task form: minimal title + agent entry; Enter
+    /// creates with no dependencies and no review gate.
+    fn draw_task_create(
+        renderer: &mut Renderer,
+        window_size: PhysicalSize<u32>,
+        title: &str,
+        agent: &str,
+    ) {
+        let (cw, ch) = renderer.cell_size();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        let w = (52.0_f32 * cw).min(680.0_f32);
+        let h = (10.0_f32 * ch).min(300.0_f32);
+        let x = (window_size.width as f32 - w) / 2.0;
+        let y = (window_size.height as f32 - h) / 2.0;
+        renderer.chrome_rect(x, y, w, h, [0.10, 0.10, 0.13, 1.0]);
+        renderer.chrome_border(x, y, w, h, 1.0, CHROME_ACCENT);
+        renderer.chrome_text(x + 20.0, y + 16.0, "CREATE TASK", CHROME_ACCENT);
+        let mut line = y + 20.0 + ch;
+        renderer.chrome_text(x + 20.0, line, "Title:", CHROME_FG_DIM);
+        line += ch;
+        let cursor = if title.is_empty() { "_" } else { "" };
+        renderer.chrome_text(x + 20.0, line, &format!("  {title}{cursor}"), CHROME_FG);
+        line += ch + 6.0;
+        renderer.chrome_text(x + 20.0, line, "Agent:", CHROME_FG_DIM);
+        line += ch;
+        renderer.chrome_text(x + 20.0, line, &format!("  {agent}"), CHROME_FG);
+        renderer.chrome_text(
+            x + 20.0,
+            y + h - 20.0,
+            "Enter create · Esc cancel",
             CHROME_FG_DIM,
         );
     }
@@ -1915,8 +2270,14 @@ impl App {
         }
         // 1. Handle overlay keys first.
         if event.logical_key == NamedKey::Escape {
-            // Always close overlays on Escape.
-            self.close_overlays();
+            // Esc unwinds: create form → task detail → all overlays.
+            if self.task_create_open {
+                self.task_create_open = false;
+            } else if self.task_detail_open {
+                self.task_detail_open = false;
+            } else {
+                self.close_overlays();
+            }
             return;
         }
         // 1b. Empty state: Enter opens provider setup for the chosen agent
@@ -1928,9 +2289,99 @@ impl App {
             }
             return;
         }
-        // 1c. Task dashboard (Phase 3A §55): arrow navigation + one-key
-        // actions; everything else is consumed by the overlay.
+        // 1c. Task dashboard (Phase 3A §55 + 3A.1 §4–6): the overlay has
+        // three modes — create-task form, task detail, and the task list.
         if let Some(OverlayMode::Tasks) = self.overlay_mode {
+            // 1c-i. Create-task form captures free text.
+            if self.task_create_open {
+                match &event.logical_key {
+                    Key::Named(NamedKey::Backspace) => {
+                        self.task_create_title.pop();
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        let title = self.task_create_title.trim().to_string();
+                        let agent = self.task_create_agent.clone();
+                        self.task_create_open = false;
+                        if !title.is_empty() {
+                            let mut eng = self.engine.lock().expect("engine lock");
+                            let ws_id = eng.active_workspace().id.clone();
+                            match eng.task_create(&ws_id, &title, "", &agent, &[], false) {
+                                Ok(_) => {
+                                    self.tasks_selection = 0;
+                                    self.task_filter = TaskFilter::All;
+                                }
+                                Err(e) => tracing::debug!("create task failed: {e}"),
+                            }
+                        }
+                        self.persist();
+                    }
+                    Key::Character(c) => {
+                        if let Some(text) = &event.text {
+                            self.task_create_title.push_str(text);
+                        } else {
+                            self.task_create_title.push_str(c);
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            // 1c-ii. Task detail: nav + actions; Enter/Esc back to list.
+            if self.task_detail_open {
+                match &event.logical_key {
+                    Key::Named(NamedKey::ArrowUp) => {
+                        self.tasks_selection = self.tasks_selection.saturating_sub(1);
+                    }
+                    Key::Named(NamedKey::ArrowDown) => {
+                        let count = {
+                            let eng = self.engine.lock().expect("engine lock");
+                            self.visible_tasks(&eng).len()
+                        };
+                        if count > 0 {
+                            self.tasks_selection = (self.tasks_selection + 1).min(count - 1);
+                        }
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        self.task_detail_open = false;
+                    }
+                    Key::Character(c) => match c.as_str() {
+                        "v" => {
+                            // View Changes: attach the live agent pane and
+                            // open its work view.
+                            let mut eng = self.engine.lock().expect("engine lock");
+                            if let Some(id) = self.selected_task_id(&eng) {
+                                if eng.attach_task_agent_pane(&id).is_ok() {
+                                    self.work_view_visible = true;
+                                }
+                            }
+                        }
+                        "c" => {
+                            let cmd = Command::CancelSelectedTask;
+                            self.run_command(&cmd);
+                        }
+                        "r" => {
+                            let cmd = Command::RetrySelectedTask;
+                            self.run_command(&cmd);
+                        }
+                        "a" => {
+                            let cmd = Command::ApproveSelectedTask;
+                            self.run_command(&cmd);
+                        }
+                        "d" => {
+                            let cmd = Command::RejectSelectedTask;
+                            self.run_command(&cmd);
+                        }
+                        "p" => {
+                            let cmd = Command::OpenSelectedTaskAgent;
+                            self.run_command(&cmd);
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+                return;
+            }
+            // 1c-iii. Task list mode.
             match &event.logical_key {
                 Key::Named(NamedKey::ArrowUp) => {
                     self.tasks_selection = self.tasks_selection.saturating_sub(1);
@@ -1938,17 +2389,22 @@ impl App {
                 Key::Named(NamedKey::ArrowDown) => {
                     let count = {
                         let eng = self.engine.lock().expect("engine lock");
-                        eng.scheduler_status().states.len()
+                        self.visible_tasks(&eng).len()
                     };
                     if count > 0 {
                         self.tasks_selection = (self.tasks_selection + 1).min(count - 1);
                     }
                 }
                 Key::Named(NamedKey::Enter) => {
-                    let cmd = Command::RunTasks;
-                    self.run_command(&cmd);
+                    // Open the detail panel for the selected task.
+                    let eng = self.engine.lock().expect("engine lock");
+                    self.task_detail_open = self.selected_task_id(&eng).is_some();
                 }
                 Key::Character(c) => match c.as_str() {
+                    "u" => {
+                        let cmd = Command::RunTasks;
+                        self.run_command(&cmd);
+                    }
                     "c" => {
                         let cmd = Command::CancelSelectedTask;
                         self.run_command(&cmd);

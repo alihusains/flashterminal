@@ -897,7 +897,11 @@ impl Multiplexer {
         }
         let focused_eid = focused.and_then(|f| self.execution_id_for_pane(&f));
 
-        let eids: Vec<ExecutionId> = self.terminal_sessions.keys().cloned().collect();
+        // Deterministic drain order (§48): HashMap iteration is unstable, and
+        // which exit is *observed first* within one frame decides the
+        // emission order of same-frame task events (failed vs completed).
+        let mut eids: Vec<ExecutionId> = self.terminal_sessions.keys().cloned().collect();
+        eids.sort_by(|a, b| a.0.cmp(&b.0));
         for eid in eids {
             let cap = if Some(&eid) == focused_eid.as_ref() {
                 usize::MAX

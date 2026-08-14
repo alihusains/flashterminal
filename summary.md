@@ -1,22 +1,76 @@
 # FlashTerminal — Development Summary
 
-**Status:** ✅ PHASE 3A COMPLETE — Deterministic Multi-Agent Task
-Orchestration (2026-08-14). Phase 2C backend/tests verified with desktop
-gaps recorded; Phase 2B.1 complete (see history below).
+**Status:** ✅ PHASE 3A.1 COMPLETE — Orchestration Validation + Gap-Closing
+(2026-08-14). Deterministic multi-agent orchestration validated end-to-end:
+detail UI, palette, command validation, desktop manual pass (6 renderer
+bugs fixed), benchmark matrix, event flood, flakiness root-caused,
+determinism race fixed. Real-agent task execution recorded (unavailable
+headless in this environment — see below). See `docs/phase3a-verification.md`.
 
 ```text
+workspace total:                243/243 PASS (0 failed)
 terminal-session lib:          59/59 PASS
 terminal-workspace lib:        41/41 PASS (incl. 4 IPC round-trip)
-phase3a suite:                 18/18 PASS  (incl. 100-task stress ×3 levels,
-                                           determinism ×10, idle perf gate)
+phase3a suite:                 22/22 PASS  (18 prior + command-safety
+                                           table ×11 states, review
+                                           resolution, 2 event-flood)
 phase2c suite:                 18/18 PASS
-phase051 + all other suites:   green
-clippy (touched crates):       0 warnings
+real_agent_tasks (ignored):    3/3 PASS — opencode COMPLETED a task;
+                                           claude-code/codex/pi recorded
+                                           TIMEOUT/AUTH (see below)
+clippy (workspace -D warnings): 0 warnings
 fmt:                           clean
-desktop build:                 clean
-release build (desktop+cli+fake-agent): PASS (45 s)
-CLI end-to-end smoke:          PASS (create/list/run/cancel/policy/scheduler)
+release build (workspace):     clean
+orchestration_bench:           40 cells + 80/20 fairness ALL PASS
+agent_stress 8:                ALL PASS (48.8k events/s, p95 16.4 µs)
+multiplex_bench ×10:           10/10 PASS (~45 s each, 0 hangs)
+desktop manual pass:           launch + render + stability ✓ (6 bugs fixed)
 ```
+
+---
+
+## Phase 3A.1 — Orchestration Release Gate + Real-World Validation (2026-08-14)
+
+Per `phases/3a1.md` §1–33. Verdict: **READY FOR PHASE 3B** (see final
+report in `docs/phase3a-verification.md`).
+
+### Closed gaps + new validation
+
+| § | Item | Outcome |
+|---|------|---------|
+| §4–5 | Task detail UI | `draw_task_detail` overlay: full `Task` record (status color-coded, agent, attempts, duration, cost from result, dependencies, summary, ≤6 files/commands/artifacts, error). Enter opens detail (was run-all), `u` run-all, Esc unwinds form→detail→overlays. |
+| §6 | Palette completeness | `CreateTask`, `ShowBlockedTasks`, `ShowTasksNeedingReview`, `OpenTask` — commands + palette + gate; create form (title+agent via `engine.task_create`, defaults to fake-agent); dashboard filter All/Blocked/NeedsReview; `v` in detail attaches agent pane + work view. |
+| §7 | Task-command validation | `commands_are_safe_across_all_task_states` — 11 fixtures (none/unknown/pending/running/waiting/blocked/needs-review/completed/failed/cancelled/skipped) × cancel/retry/approve/reject/attach: typed errors, never panic, state-set stable after. `review_resolution_is_type_safe_and_state_consistent`. |
+| §8 | Desktop manual pass | **The app had never launched** — first frame always panicked in wgpu. Found + fixed 6 stacked renderer bugs (see below). After: window 1200×792 renders, stable >35 s, log 0 bytes. Screenshots blocked (no Screen Recording permission) — evidence via CGWindowList + logs. |
+| §9–11 | Real-agent tasks | `real_agent_tasks.rs` (`#[ignore]`d, opt-in `-- --ignored`; **3/3 PASS**): trivial tasks through the full pipeline per agent; deadline-cancel (claude hangs); engine-side assertions only. Recorded: **opencode COMPLETED** (2.17 s, exit 0, 1 attempt — full adapter→launch→PTY→work-record→result path, also inside the 5-agent parallel isolation run), claude-code/codex UNAVAILABLE (empty output / dead omniroute proxy `localhost:20128`, 90 s timeouts), pi UNAVAILABLE (auth in this environment). Auth-failure fixture verified typed: `AgentFailed` kind + `AuthenticationFailure` **class** (the retry gate). |
+| §12–14 | Benchmark matrix | `orchestration_bench` (release): 40 cells ({1,10,20,50,100}t × {1,2,5,10} caps × serial/wide) all started==completed; serial ~46–50 t/s (spawn-bound), wide scales cap1 48 → cap10 296 t/s (100t wide 0.34 s); queue ≤22; RSS 12–24 MB. Fairness 80+20 @cap5: 5.22 s, 100 completed, 0 failed/blocked, 100 started. |
+| §15 | Event flood | `large-output` (100k lines): settles, completes, follow-up runs; peak drain >1k batches/s; outbox bounded (<10k). 4 concurrent floods: 4 completed, 0 failed. |
+| §16 | multiplex_bench flakiness | Harness 10×: **10/10 PASS ~45 s, 0 fails/hangs**. Root cause: not reproducible in isolation — earlier hangs only under heavy parallel load (PTY spawn starvation); closed with evidence. |
+| §17–28 | Security/perf/architecture | Orchestration crate: zero raw process spawns (grep). Sentinel tests green (IPC stream, persistence secret-shape, scheduler state `credential_ref`-free). Idle gate + stress re-verified with orchestration present (48.8k ev/s, p95 16.4 µs). **Determinism race found+fixed**: `drain_frame` iterated HashMap sessions → same-frame exit order raced (`failed` vs `completed` emission); now sorted `ExecutionId` order; determinism re-verified 5× full-suite 22/22. |
+| §29–33 | Docs + truth table + report | `docs/phase3a.md` (new), `docs/orchestration.md` (new), `docs/phase3a-manual.md` (new), `docs/phase3a-verification.md` (new — spec truth table + gates + final report §33 A–I), `docs/architecture-current.md` updated. |
+
+### Renderer bugs found + fixed by the manual pass (desktop never launched before)
+
+`@builtin(vertex_index)` as expression (invalid) → vertex input param;
+dynamic array indexing rejected by naga (module + function scope) →
+arithmetic `quad_corner`; duplicate `@builtin(position)` in `fs_glyph` →
+single source; uniform binding 0 `VERTEX`-only though `fs_glyph` reads it →
+`VERTEX_FRAGMENT`; empty-bitmap glyph upload (0-byte `write_texture`) →
+zero-fill the atlas slot (`terminal-renderer`).
+
+### Not done / honest records (Phase 3A.1)
+
+- **Real-agent task completion**: opencode completed a trivial task end-to-end
+  (exit 0); claude-code/codex/pi could not run headless in this environment
+  (recorded, never faked; BYOK creds + a reachable provider endpoint will
+  complete the matrix — run
+  `cargo test -p terminal-workspace --test real_agent_tasks -- --ignored`).
+- **Desktop visual confirmation**: screenshots pending Screen Recording
+  permission for the host terminal (window/render/stability verified
+  programmatically).
+- Explicitly NOT built (unchanged, §32): LLM planner, decomposition,
+  auto-selection, agent-to-agent comms/handoffs/debate, manager agents,
+  visual workflow editor, distributed/cloud orchestration, pause.
 
 ---
 

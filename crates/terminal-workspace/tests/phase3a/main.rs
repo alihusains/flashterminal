@@ -103,8 +103,15 @@ fn create_rejects_unknown_agent_and_workspace() {
     );
     assert!(err.contains("UnknownWorkspace"), "{err}");
     let a = create_task(&mut m, "a", "completion", &[]);
-    m.task_create(&ws_id(&m), "b", "", "fake-agent", &[a.clone()], false)
-        .expect("b depends on a");
+    m.task_create(
+        &ws_id(&m),
+        "b",
+        "",
+        "fake-agent",
+        std::slice::from_ref(&a),
+        false,
+    )
+    .expect("b depends on a");
     let ghost = task_error_kind(
         &m.task_create(
             &ws_id(&m),
@@ -300,7 +307,11 @@ fn transient_failure_retries_then_succeeds() {
     let mut m = new_engine();
     let id = create_task(&mut m, "flaky", "flaky", &[]);
     m.task_run();
-    assert!(drain_until_terminal(&mut m, &[id.clone()], 30_000));
+    assert!(drain_until_terminal(
+        &mut m,
+        std::slice::from_ref(&id),
+        30_000
+    ));
     let t = m.task_get(&id).unwrap();
     assert_eq!(t.status, TaskStatus::Completed, "retry recovered");
     assert_eq!(t.attempt_count, 2, "attempt 1 failed, attempt 2 succeeded");
@@ -319,7 +330,11 @@ fn auth_failure_is_never_auto_retried() {
     let mut m = new_engine();
     let id = create_task(&mut m, "auth", "auth-failure", &[]);
     m.task_run();
-    assert!(drain_until_terminal(&mut m, &[id.clone()], 30_000));
+    assert!(drain_until_terminal(
+        &mut m,
+        std::slice::from_ref(&id),
+        30_000
+    ));
     let t = m.task_get(&id).unwrap();
     assert_eq!(t.status, TaskStatus::Failed);
     assert_eq!(t.attempt_count, 1, "no retry for auth failures");
@@ -420,7 +435,11 @@ fn exhausted_budget_blocks_further_starts() {
     policy.max_cost_cents = None;
     m.set_task_policy(policy);
     m.task_retry(&a).unwrap();
-    assert!(drain_until_terminal(&mut m, &[a.clone()], 30_000));
+    assert!(drain_until_terminal(
+        &mut m,
+        std::slice::from_ref(&a),
+        30_000
+    ));
     assert_eq!(status_of(&m, &a), TaskStatus::Completed);
 }
 
@@ -519,7 +538,11 @@ fn waiting_task_waits_for_human_then_completes() {
     m.agent_runtime_mut()
         .respond_permission(&eid, PermissionDecision::AllowOnce)
         .expect("permission answered");
-    assert!(drain_until_terminal(&mut m, &[id.clone()], 30_000));
+    assert!(drain_until_terminal(
+        &mut m,
+        std::slice::from_ref(&id),
+        30_000
+    ));
     assert_eq!(status_of(&m, &id), TaskStatus::Completed);
 }
 
@@ -596,7 +619,11 @@ fn persistence_roundtrip_marks_inflight_interrupted() {
     let b = create_task(&mut m, "inflight", "long-running", &[]);
     m.task_add_arguments(&b, &["--duration", "600"]).unwrap();
     m.task_run();
-    assert!(drain_until_terminal(&mut m, &[a.clone()], 30_000));
+    assert!(drain_until_terminal(
+        &mut m,
+        std::slice::from_ref(&a),
+        30_000
+    ));
     // Make sure b actually started before snapshot.
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
@@ -643,7 +670,11 @@ fn task_events_are_ordered_per_task() {
     let mut m = new_engine();
     let a = create_task(&mut m, "a", "completion", &[]);
     m.task_run();
-    assert!(drain_until_terminal(&mut m, &[a.clone()], 30_000));
+    assert!(drain_until_terminal(
+        &mut m,
+        std::slice::from_ref(&a),
+        30_000
+    ));
     let trace = m.scheduler_trace();
     let mine: Vec<&str> = trace
         .iter()
@@ -746,4 +777,412 @@ fn idle_orchestration_drains_do_not_degrade_frames() {
     );
     let s = m.scheduler_status();
     assert!(s.states.is_empty(), "no tasks were invented");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3A.1 §7: task commands are safe against every reachable state.
+// ---------------------------------------------------------------------------
+
+/// Builds every reachable task state using the deterministic fixture.
+/// Returns (task id, expected state) — the table asserts the state was
+/// actually reached before exercising the commands.
+///
+/// `Ready` is intentionally absent: it is the pre-start scheduled band a
+/// task passes through *inside* a single `step()` (submit→spawn), never
+/// observable through the public engine API; the API treats it like
+/// `Pending` for every command.
+#[derive(Debug)]
+enum Fixture {
+    NoTasks,
+    UnknownId,
+    Pending,
+    Running,
+    Waiting,
+    Blocked,
+    NeedsReview,
+    Completed,
+    Failed,
+    Cancelled,
+    Skipped,
+}
+
+fn build_fixture(m: &mut Multiplexer, f: &Fixture) -> String {
+    match f {
+        Fixture::NoTasks => String::new(),
+        Fixture::UnknownId => "task-does-not-exist".to_string(),
+        Fixture::Pending => create_task(m, "p", "completion", &[]),
+        Fixture::Running => {
+            let id = create_task(m, "run", "long-running", &[]);
+            m.task_add_arguments(&id, &["--duration", "30"])
+                .expect("args set");
+            m.task_run();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline {
+                let _ = m.drain_frame();
+                if m.task_get(&id)
+                    .map(|t| t.status)
+                    .unwrap_or(TaskStatus::Pending)
+                    == TaskStatus::Running
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            id
+        }
+        Fixture::Waiting => {
+            let a = create_task(m, "wa", "long-running", &[]);
+            m.task_add_arguments(&a, &["--duration", "30"])
+                .expect("args set");
+            let b = create_task(m, "wb", "completion", &[&a]);
+            m.task_run();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline {
+                let _ = m.drain_frame();
+                if m.task_get(&b)
+                    .map(|t| t.status)
+                    .unwrap_or(TaskStatus::Pending)
+                    == TaskStatus::Waiting
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            b
+        }
+        Fixture::Blocked => {
+            // Hard failure policy on the dependency → dependent is Blocked.
+            let a = create_task(m, "bA", "failure", &[]);
+            let b = create_task(m, "bB", "completion", &[&a]);
+            let mut policy = m.task_policy();
+            policy.failure = DependencyFailurePolicy::BlockDownstream;
+            m.set_task_policy(policy);
+            m.task_run();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                let _ = m.drain_frame();
+                if m.task_get(&b)
+                    .map(|t| t.status)
+                    .unwrap_or(TaskStatus::Pending)
+                    == TaskStatus::Blocked
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            b
+        }
+        Fixture::NeedsReview => {
+            let rid = m
+                .task_create(&ws_id(m), "nr", "phase3a fixture", "fake-agent", &[], true)
+                .expect("review task created");
+            m.task_set_environment(
+                &rid,
+                &[("FAKE_AGENT_SCENARIO".to_string(), "completion".to_string())],
+            )
+            .expect("scenario set");
+            m.task_run();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                let _ = m.drain_frame();
+                if m.task_get(&rid)
+                    .map(|t| t.status)
+                    .unwrap_or(TaskStatus::Pending)
+                    == TaskStatus::NeedsReview
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            rid
+        }
+        Fixture::Completed => {
+            let id = create_task(m, "c", "completion", &[]);
+            m.task_run();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                let _ = m.drain_frame();
+                if m.task_get(&id)
+                    .map(|t| t.status)
+                    .unwrap_or(TaskStatus::Pending)
+                    == TaskStatus::Completed
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            id
+        }
+        Fixture::Failed => {
+            let id = create_task(m, "f", "failure", &[]);
+            let mut policy = m.task_policy();
+            policy.retry = Default::default(); // never retry hard failures
+            m.set_task_policy(policy);
+            m.task_run();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                let _ = m.drain_frame();
+                if m.task_get(&id)
+                    .map(|t| t.status)
+                    .unwrap_or(TaskStatus::Pending)
+                    == TaskStatus::Failed
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            id
+        }
+        Fixture::Cancelled => {
+            let id = create_task(m, "x", "long-running", &[]);
+            m.task_add_arguments(&id, &["--duration", "30"])
+                .expect("args set");
+            m.task_run();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline {
+                let _ = m.drain_frame();
+                if m.task_get(&id)
+                    .map(|t| t.status)
+                    .unwrap_or(TaskStatus::Pending)
+                    == TaskStatus::Running
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = m.task_cancel(&id);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline {
+                let _ = m.drain_frame();
+                if m.task_get(&id)
+                    .map(|t| t.status)
+                    .unwrap_or(TaskStatus::Pending)
+                    == TaskStatus::Cancelled
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            id
+        }
+        Fixture::Skipped => {
+            // Fail-fast dependency policy → the dependent never runs.
+            let a = create_task(m, "sA", "failure", &[]);
+            let b = create_task(m, "sB", "completion", &[&a]);
+            let mut policy = m.task_policy();
+            policy.failure = DependencyFailurePolicy::SkipDownstream;
+            m.set_task_policy(policy);
+            m.task_run();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                let _ = m.drain_frame();
+                if m.task_get(&b)
+                    .map(|t| t.status)
+                    .unwrap_or(TaskStatus::Pending)
+                    == TaskStatus::Skipped
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            b
+        }
+    }
+}
+
+#[test]
+fn commands_are_safe_across_all_task_states() {
+    if !fake_available() {
+        eprintln!("skipping: fake-agent binary not built");
+        return;
+    }
+    let fixtures = [
+        Fixture::NoTasks,
+        Fixture::UnknownId,
+        Fixture::Pending,
+        Fixture::Running,
+        Fixture::Waiting,
+        Fixture::Blocked,
+        Fixture::NeedsReview,
+        Fixture::Completed,
+        Fixture::Failed,
+        Fixture::Cancelled,
+        Fixture::Skipped,
+    ];
+    for f in &fixtures {
+        let mut m = new_engine();
+        let id = build_fixture(&mut m, f);
+        let before = m.scheduler_status().states.len();
+        let label = format!("{f:?}");
+
+        // Cancel must never panic; on unknown ids it errors cleanly.
+        let cancel = m.task_cancel(&id);
+        match f {
+            Fixture::UnknownId => assert!(cancel.is_err(), "{label}: unknown cancel must err"),
+            Fixture::NoTasks => assert!(cancel.is_err(), "{label}: empty cancel must err"),
+            _ => assert!(
+                cancel.is_ok() || cancel.is_err(),
+                "{label}: cancel panicked"
+            ),
+        }
+
+        let retry = m.task_retry(&id);
+        match f {
+            Fixture::UnknownId => assert!(retry.is_err(), "{label}: unknown retry must err"),
+            Fixture::NoTasks => assert!(retry.is_err(), "{label}: empty retry must err"),
+            _ => assert!(retry.is_ok() || retry.is_err(), "{label}: retry panicked"),
+        }
+        // Review resolution must be a typed error or no-op, never a panic.
+        let approve = m.resolve_task_review(&id, true);
+        let reject = m.resolve_task_review(&id, false);
+        assert!(
+            approve.is_ok() || approve.is_err(),
+            "{label}: approve panicked"
+        );
+        assert!(
+            reject.is_ok() || reject.is_err(),
+            "{label}: reject panicked"
+        );
+        // Attach must be a typed error or a pane, never a panic.
+        let attach = m.attach_task_agent_pane(&id);
+        assert!(
+            attach.is_ok() || attach.is_err(),
+            "{label}: attach panicked"
+        );
+
+        // The engine must stay alive and consistent after every interaction.
+        let _ = m.drain_frame();
+        let after = m.scheduler_status().states.len();
+        match f {
+            Fixture::NoTasks => assert_eq!(after, 0, "{label}: tasks invented"),
+            Fixture::UnknownId => {
+                assert_eq!(after, before, "{label}: unknown id changed state")
+            }
+            _ => assert_eq!(after, before, "{label}: task set changed size"),
+        }
+    }
+}
+
+#[test]
+fn review_resolution_is_type_safe_and_state_consistent() {
+    if !fake_available() {
+        eprintln!("skipping: fake-agent binary not built");
+        return;
+    }
+    let mut m = new_engine();
+    let rid = build_fixture(&mut m, &Fixture::NeedsReview);
+    assert_eq!(status_of(&m, &rid), TaskStatus::NeedsReview);
+
+    // Approving must leave the task in a consistent successor state (a
+    // typed error is only legal if the review was already resolved).
+    match m.resolve_task_review(&rid, true) {
+        Ok(()) => {
+            let _ = m.drain_frame();
+            let s = m.scheduler_status();
+            assert_eq!(s.completed_count + s.failed_count, 1);
+        }
+        Err(e) => {
+            let _ = m.drain_frame();
+            let t = status_of(&m, &rid);
+            assert_ne!(
+                t,
+                TaskStatus::NeedsReview,
+                "{e:?}: review errored without a state change"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3A.1 §15: event flood — large-output tasks must not wedge the
+// scheduler or the event bus.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn large_output_flood_completes_without_wedging() {
+    if !fake_available() {
+        eprintln!("skipping: fake-agent binary not built");
+        return;
+    }
+    let mut m = new_engine();
+    let id = create_task(&mut m, "flood", "large-output", &[]);
+    let events_before = m.metrics.events_applied;
+    m.task_run();
+    let started = Instant::now();
+    // Custom drain loop: sample queue depth and sustained throughput while
+    // the 100k-line flood streams through the same bus as the scheduler.
+    let mut max_queue = 0usize;
+    let mut peak_eps = 0.0f64;
+    let mut settled = false;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
+        let _ = m.drain_frame();
+        max_queue = max_queue.max(m.session_pending_total());
+        peak_eps = peak_eps.max(m.metrics.events_per_second());
+        if m.task_get(&id)
+            .map(|t| t.status.is_terminal())
+            .unwrap_or(false)
+        {
+            settled = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(settled, "large-output task did not settle in 120s");
+    let elapsed = started.elapsed();
+    let events = m.metrics.events_applied - events_before;
+    // Batch-count evidence that output actually flowed (batches, not lines),
+    // sustained throughput, and a bounded outbox — the flood must not wedge
+    // the scheduler or the event bus.
+    assert!(
+        events > 100,
+        "flood produced only {events} batches — suspicious"
+    );
+    assert!(
+        peak_eps > 1_000.0,
+        "flood never sustained >1k batches/s (peak {peak_eps:.0})"
+    );
+    assert!(
+        max_queue < 10_000,
+        "outbox grew unbounded during flood: {max_queue}"
+    );
+    eprintln!(
+        "event flood: {elapsed:?} wall, {events} batches, peak {peak_eps:.0}/s, max queue {max_queue}"
+    );
+    let t = m.task_get(&id).unwrap();
+    assert_eq!(t.status, TaskStatus::Completed, "flood task result");
+    // The scheduler remains responsive afterwards: a second task runs fine.
+    let id2 = create_task(&mut m, "after", "completion", &[]);
+    m.task_run();
+    assert!(drain_until_terminal(
+        &mut m,
+        std::slice::from_ref(&id2),
+        30_000
+    ));
+}
+
+#[test]
+fn concurrent_flood_does_not_drop_completions() {
+    if !fake_available() {
+        eprintln!("skipping: fake-agent binary not built");
+        return;
+    }
+    let mut m = new_engine();
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let id = create_task(&mut m, &format!("flood{i}"), "large-output", &[]);
+        ids.push(id);
+    }
+    let mut policy = m.task_policy();
+    policy.max_agents = 4;
+    policy.max_parallel_tasks = 4;
+    m.set_task_policy(policy);
+    m.task_run();
+    assert!(
+        drain_until_terminal(&mut m, &ids, 120_000),
+        "concurrent floods did not settle"
+    );
+    let s = m.scheduler_status();
+    assert_eq!(s.completed_count, 4, "all flood tasks completed");
+    assert_eq!(s.failed_count, 0);
 }

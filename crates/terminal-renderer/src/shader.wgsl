@@ -18,14 +18,15 @@ struct Uniforms {
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
 
-const QUAD_CORNERS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
-    vec2<f32>(0.0, 0.0),
-    vec2<f32>(1.0, 0.0),
-    vec2<f32>(0.0, 1.0),
-    vec2<f32>(1.0, 0.0),
-    vec2<f32>(1.0, 1.0),
-    vec2<f32>(0.0, 1.0),
-);
+/// Corner of the unit quad for vertex index `vi` (triangle list, 6 verts):
+/// (0,0) (1,0) (0,1) (1,0) (1,1) (0,1). Computed arithmetically — this naga
+/// version rejects non-constant array indexing entirely.
+fn quad_corner(vi: u32) -> vec2<f32> {
+    let c = vi % 6u;
+    let x = select(1.0, 0.0, c == 0u || c == 3u || c == 5u);
+    let y = select(1.0, 0.0, c == 0u || c == 1u || c == 3u);
+    return vec2<f32>(x, y);
+}
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -50,12 +51,13 @@ fn ndc(p: vec2<f32>) -> vec4<f32> {
 
 @vertex
 fn vs_bg(
+    @builtin(vertex_index) vi: u32,
     @location(0) pos: vec2<f32>,
     @location(1) size: vec2<f32>,
     @location(2) color: vec4<f32>,
 ) -> VsOut {
     var out: VsOut;
-    let corner = QUAD_CORNERS[u32(@builtin(vertex_index)) % 6u];
+    let corner = quad_corner(vi);
     out.position = ndc(pos + corner * size);
     out.uv = vec2<f32>(0.0, 0.0);
     out.color = color;
@@ -75,6 +77,7 @@ fn fs_bg(in: VsOut) -> @location(0) vec4<f32> {
 
 @vertex
 fn vs_glyph(
+    @builtin(vertex_index) vi: u32,
     @location(0) pos: vec2<f32>,
     @location(1) uv_rect: vec4<f32>,
     @location(2) fg: vec4<f32>,
@@ -83,7 +86,7 @@ fn vs_glyph(
     var out: VsOut;
     // Glyph quads are sized by the glyph bitmap; uv_rect.zw is the bitmap
     // size in UV space relative to the square atlas texture.
-    let corner = QUAD_CORNERS[u32(@builtin(vertex_index)) % 6u];
+    let corner = quad_corner(vi);
     let quad_size = uv_rect.zw * u.atlas_size; // uv w/h * atlas px == px
     out.position = ndc(pos + corner * quad_size);
     out.uv = uv_rect.xy + corner * uv_rect.zw;
@@ -94,10 +97,7 @@ fn vs_glyph(
 }
 
 @fragment
-fn fs_glyph(
-    in: VsOut,
-    @builtin(position) frag_pos: vec4<f32>,
-) -> @location(0) vec4<f32> {
+fn fs_glyph(in: VsOut) -> @location(0) vec4<f32> {
     let alpha = textureSample(atlas, samp, in.uv).r;
     var col = vec4<f32>(in.color.rgb, in.color.a * alpha);
 
@@ -107,7 +107,7 @@ fn fs_glyph(
     }
 
     // Underline / strikethrough are drawn procedurally relative to the cell.
-    let ypx = (1.0 - frag_pos.y) * u.screen_size.y * 0.5; // from window top
+    let ypx = (1.0 - in.position.y) * u.screen_size.y * 0.5; // from window top
     let cell_y = ypx - floor(ypx / u.cell_size.y) * u.cell_size.y;
     if (in.attrs & 4u) != 0u {
         let under = cell_y > u.cell_size.y - 3.0 && cell_y < u.cell_size.y - 1.0;
