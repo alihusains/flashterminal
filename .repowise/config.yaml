@@ -5,3 +5,6 @@ distill:
 hooks:
   read_skeleton: true
   search_digest: true
+provider: ollama
+model: smtek/Qwen3.8-27B:Q3_K_M
+reasoning: auto
