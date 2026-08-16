@@ -175,14 +175,21 @@ impl FontLibrary {
                 return Some(f);
             }
         }
+        // Purpose-built coding fonts first: JetBrains Mono and Cascadia are
+        // designed specifically to disambiguate 0/O and 1/l/I (dotted zero,
+        // distinct glyph shapes) and increase x-height for long-session
+        // legibility — a documented, evidence-backed improvement over
+        // general-purpose monospace fonts. Menlo/Monaco/SF Mono remain as
+        // reliable fallbacks that ship on every Mac.
         let preferred = [
-            "Menlo",
-            "Monaco",
+            "JetBrains Mono",
+            "Cascadia Mono",
+            "Cascadia Code",
             "SFMono",
             "SF Mono",
+            "Menlo",
+            "Monaco",
             "DejaVu Sans Mono",
-            "Cascadia Mono",
-            "JetBrains Mono",
             "Fira Code",
             "Meslo",
             "Hack",

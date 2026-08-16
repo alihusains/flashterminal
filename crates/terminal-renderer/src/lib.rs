@@ -562,12 +562,26 @@ impl Renderer {
             .await
             .unwrap();
 
+        // Phase 5 UI audit: every color value in this codebase (DEFAULT_BG/
+        // DEFAULT_FG here, ANSI 256-color/true-color in `resolve_color`,
+        // the desktop app's chrome/state colors) is authored as a naive
+        // `channel / 255.0` float — there is no gamma encoding anywhere in
+        // this crate or in `shader.wgsl`. An sRGB *surface* format makes
+        // the GPU treat every value the shader writes as linear and
+        // auto-convert it to sRGB on present, which silently brightens
+        // every dark color (a "near-black" #13151C was actually displaying
+        // as #595961 — confirmed by decoding the surface's own output).
+        // This is why the whole UI looked washed out rather than the
+        // deep-contrast theme the color constants were clearly authored
+        // to produce. Preferring a non-sRGB format here makes what the
+        // shader writes what actually reaches the screen, matching how
+        // every color in this codebase has always been written.
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
             .formats
             .iter()
             .copied()
-            .find(|f| f.is_srgb())
+            .find(|f| !f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,

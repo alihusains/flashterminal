@@ -75,22 +75,39 @@ const AGENT_PERM_BAR_H: f32 = 26.0;
 const AGENT_PERM_BTN_W: f32 = 76.0;
 const AGENT_PERM_BTN_H: f32 = 18.0;
 
-const CHROME_BG: [f32; 4] = [0.07, 0.07, 0.09, 1.0];
-const CHROME_ACCENT: [f32; 4] = [0.22, 0.55, 0.95, 1.0];
-const CHROME_FG: [f32; 4] = [0.72, 0.74, 0.80, 1.0];
-const CHROME_FG_DIM: [f32; 4] = [0.45, 0.47, 0.52, 1.0];
+// Phase 5 UI audit palette (docs/phase5-ui-audit.md § Visual Design):
+// a near-black slate family (never pure black — extreme black/white
+// contrast causes OLED halation and eye strain on long sessions) with a
+// single blue accent and WCAG-AA-contrast state colors, each already
+// paired with a text label and a shape (dot), never color alone.
+/// Sidebar/tab-strip surface — a shade darker than the terminal's own
+/// `DEFAULT_BG` (terminal-renderer) for clear depth separation between
+/// chrome and content, both from the same slate family (not a mismatched
+/// neutral gray) to feel like one deliberate surface, not a generic panel.
+const CHROME_BG: [f32; 4] = [0.043, 0.070, 0.125, 1.0]; // #0B1220
+/// Tab strip: one step lighter than the sidebar — a "raised" surface.
+const TAB_STRIP_BG: [f32; 4] = [0.067, 0.094, 0.153, 1.0]; // #111827
+const CHROME_ACCENT: [f32; 4] = [0.231, 0.510, 0.965, 1.0]; // #3B82F6
+const CHROME_FG: [f32; 4] = [0.886, 0.910, 0.941, 1.0]; // #E2E8F0
+const CHROME_FG_DIM: [f32; 4] = [0.392, 0.455, 0.545, 1.0]; // #64748B
+/// Sidebar/terminal divider — subtle, not a hard line.
+const CHROME_BORDER: [f32; 4] = [0.145, 0.180, 0.247, 1.0]; // #253040
 const FOCUS_BORDER: [f32; 4] = [0.35, 0.65, 1.0, 0.9];
 
-/// Agent state badge colors (§16) — one per terminal state.
-const STATE_STARTING: [f32; 4] = [0.95, 0.76, 0.25, 1.0];
-const STATE_WORKING: [f32; 4] = [0.35, 0.85, 0.45, 1.0];
-const STATE_WAITING: [f32; 4] = [0.45, 0.60, 0.75, 1.0];
-const STATE_APPROVAL: [f32; 4] = [0.95, 0.55, 0.25, 1.0];
-const STATE_DONE: [f32; 4] = [0.45, 0.62, 0.45, 1.0];
-const STATE_FAILED: [f32; 4] = [0.90, 0.35, 0.35, 1.0];
-const STATE_STOPPED: [f32; 4] = [0.45, 0.47, 0.52, 1.0];
+/// Agent state badge colors (§16) — one per terminal state. Starting
+/// (amber) and Needs-Approval (orange) were previously close enough in
+/// hue to be hard to tell apart at a glance; widened the separation.
+/// Every state is still shown with its name in parentheses next to the
+/// dot (never color alone).
+const STATE_STARTING: [f32; 4] = [0.961, 0.620, 0.043, 1.0]; // #F59E0B amber
+const STATE_WORKING: [f32; 4] = [0.133, 0.773, 0.369, 1.0]; // #22C55E green
+const STATE_WAITING: [f32; 4] = [0.376, 0.647, 0.980, 1.0]; // #60A5FA blue
+const STATE_APPROVAL: [f32; 4] = [0.976, 0.451, 0.086, 1.0]; // #F97316 orange
+const STATE_DONE: [f32; 4] = [0.204, 0.827, 0.600, 1.0]; // #34D399 teal-green
+const STATE_FAILED: [f32; 4] = [0.937, 0.267, 0.267, 1.0]; // #EF4444 red
+const STATE_STOPPED: [f32; 4] = [0.392, 0.455, 0.545, 1.0]; // = CHROME_FG_DIM
 const PERM_BAR_BG: [f32; 4] = [0.28, 0.20, 0.06, 0.96];
-const AGENT_HEADER_BG: [f32; 4] = [0.11, 0.11, 0.14, 1.0];
+const AGENT_HEADER_BG: [f32; 4] = [0.067, 0.094, 0.153, 1.0]; // = TAB_STRIP_BG
 
 /// Agent chrome controls (§19). Pause intentionally has no control: the
 /// runtime does not fake a pause capability (engine docs), so the desktop
@@ -1543,17 +1560,28 @@ impl App {
         let w = SIDEBAR_W;
         let h = window_size.height as f32;
         renderer.chrome_rect(0.0, 0.0, w, h, CHROME_BG);
+        // 1px divider between the sidebar and the terminal content —
+        // subtle depth cue instead of two same-toned panels running edge
+        // to edge with nothing marking the boundary.
+        renderer.chrome_rect(w - 1.0, 0.0, 1.0, h, CHROME_BORDER);
         // Tab strip across the top (right of the sidebar).
         renderer.chrome_rect(
             w,
             0.0,
             window_size.width as f32 - w,
             TAB_STRIP_H,
-            [0.09, 0.09, 0.11, 1.0],
+            TAB_STRIP_BG,
+        );
+        renderer.chrome_rect(
+            w,
+            TAB_STRIP_H - 1.0,
+            window_size.width as f32 - w,
+            1.0,
+            CHROME_BORDER,
         );
 
         let active_ws = eng.active_workspace();
-        let mut y = 12.0_f32;
+        let mut y = 14.0_f32;
         renderer.chrome_text(10.0, y, "WORKSPACES", CHROME_FG_DIM);
         y += cell_h + 6.0;
         for ws in eng.workspaces() {
@@ -1565,7 +1593,8 @@ impl App {
             renderer.chrome_text(14.0, y, &ws.name, accent);
             y += cell_h + 4.0;
         }
-        y += cell_h;
+        y += cell_h * 1.6;
+        renderer.chrome_rect(10.0, y - cell_h * 0.7, w - 20.0, 1.0, CHROME_BORDER);
         renderer.chrome_text(10.0, y, "TABS", CHROME_FG_DIM);
         y += cell_h + 6.0;
         for tab in &active_ws.tabs {
@@ -1589,7 +1618,8 @@ impl App {
         }
 
         // Agent sessions of the active tab — state badge + info panel.
-        y += cell_h;
+        y += cell_h * 1.6;
+        renderer.chrome_rect(10.0, y - cell_h * 0.7, w - 20.0, 1.0, CHROME_BORDER);
         renderer.chrome_text(10.0, y, "AGENTS", CHROME_FG_DIM);
         y += cell_h + 6.0;
         // Workspace summary (§14): counts update live with agent state.
