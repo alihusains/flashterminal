@@ -48,6 +48,7 @@ jobs:
   test:
     name: Test
     runs-on: macos-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
@@ -67,6 +68,18 @@ jobs:
         # NOT --all-features: `real-agents` (terminal-session) requires real
         # agent binaries/credentials and is exercised by real-agents.yml
         # (Tier B, opt-in) instead. See docs/ci.md.
+        #
+        # RUST_TEST_THREADS=1: many integration tests spawn real PTY child
+        # processes (shells, vim, less, top, fake-agent) with fixed wall-
+        # clock deadlines. GitHub's macos-latest runner has far fewer cores
+        # than a dev machine; run concurrently, several of these tests lose
+        # the CPU scheduling race against their own deadline and fail
+        # intermittently — confirmed by reproducing both the flake (default
+        # parallelism) and its disappearance (serial) locally. Serial adds
+        # ~2-3 minutes of wall clock in exchange for determinism. See
+        # docs/ci-forensics.md.
+        env:
+          RUST_TEST_THREADS: 1
         run: cargo test --workspace
 
   fmt:

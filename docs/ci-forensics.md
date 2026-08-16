@@ -133,20 +133,52 @@ No `--ci` mechanism existed at all before this phase; no job/step timeouts
 existed on the Performance job; no artifacts were uploaded on failure.
 All three fixed — see `docs/ci.md`.
 
-## Local-only flake observed (not a CI issue)
+## Root cause, part 3: PTY-heavy tests never had a chance to flake before (confirmed, fixed)
 
+With both fixes above pushed (`b3919c1`, run `31942971604`), the `Test`
+job finally got *past* `agent_runtime.rs` for the first time in this
+repository's CI history — and immediately hit **four new failures**, all
+in `crates/terminal-session/tests/phase051.rs`: `malformed_bytes_through_pty`,
+`less_roundtrip`, `top_batch_and_interactive`, `vim_roundtrip`. These spawn
+real interactive programs (a shell, `vim`, `less`, `top`) through a real
+PTY with fixed wall-clock deadlines.
+
+This is the same class of local-only flake noted below
+(`malformed_bytes_through_pty`), but it turns out **not** to be
+local-machine-only: GitHub's `macos-latest` runner has far fewer cores than
+either dev machine used in this audit, and `cargo test`'s default
+parallelism (one thread per logical CPU) runs several of these real-process
+tests concurrently, oversubscribing a small runner and pushing individual
+tests over their own deadlines. It was never observed in the 11 historical
+runs simply because `agent_runtime.rs` (Root cause 1/2, above) always
+failed the `Test` job before the suite ever reached `phase051.rs`.
+
+Reproduced directly: `cargo test --workspace` with default parallelism on
+a 12-core machine still flaked on `phase051.rs` intermittently-to-often;
+the *identical* command with `RUST_TEST_THREADS=1` passed clean, twice,
+including every test in every crate (`4m28s` total). This is a resource-
+contention artifact of concurrent real-process scheduling, not a
+FlashTerminal correctness bug — no assertion, timeout, or test was
+weakened. Fixed: CI's `Test` step now sets `RUST_TEST_THREADS: 1`, trading
+~2-3 minutes of wall clock for determinism (the whole `Test` job's
+`timeout-minutes: 15` covers this with margin).
+
+## `malformed_bytes_through_pty` — initial local-only observation, later explained
+
+Before the `RUST_TEST_THREADS=1` fix above,
 `crates/terminal-session/tests/phase051.rs::malformed_bytes_through_pty`
-writes 64 KB of adversarial bytes through a real spawned shell PTY with a
-30 s deadline. Under `cargo test --workspace` **on this development
-machine only** (load average 3–6, ~780 concurrent processes from unrelated
-sessions) it fails intermittently-to-consistently; run in isolation
-(`cargo test -p terminal-session --test phase051 malformed_bytes_through_pty`)
-it passes every time. It has **never appeared in any of the 11 GitHub
-Actions runs inspected**. Classified per the wedge protocol in
-`docs/benchmark-reliability.md`: OS/scheduling contention artifact of this
-particular machine, not a FlashTerminal bug — left untouched (no timeout
-change, no assertion change) rather than weakened. Flagged here for
-visibility if it ever surfaces in actual CI.
+(64 KB of adversarial bytes through a real shell PTY, 30 s deadline) failed
+intermittently-to-often under `cargo test --workspace` on a 12-core
+development machine but passed every time in isolation. At that point it
+had never appeared in the 11 historical GitHub Actions runs, so it was
+provisionally classified as a local-machine contention artifact. Root
+cause 3 (above) supersedes that: it's the same "real-process test loses
+the CPU scheduling race under concurrent execution" pattern as the four
+`phase051.rs` failures that surfaced in CI once the suite finally got past
+`agent_runtime.rs` — not a machine-specific fluke, and now fixed by the
+same `RUST_TEST_THREADS=1` change rather than left as an open question.
+Classification protocol reference: `docs/benchmark-reliability.md`'s wedge
+dump / fixture-artifact-vs-product-bug steps.
 
 ## Repository hygiene (§24–§25)
 
