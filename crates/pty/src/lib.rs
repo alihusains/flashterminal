@@ -15,7 +15,7 @@
 //!   calling `take_writer` more than once) and stored in the session.
 
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, Child, CommandBuilder, ExitStatus, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -106,6 +106,13 @@ pub struct PtyManager {
     /// manager `Send + Sync` for `Arc` sharing across threads.
     pty_system: Mutex<Box<dyn portable_pty::PtySystem + Send>>,
     sessions: Mutex<HashMap<String, Arc<PtySession>>>,
+    /// `terminate()` removes a session from `sessions` (to free its fds
+    /// promptly) *before* any caller has a chance to `try_wait()` it — that
+    /// call would otherwise always see "session not found" and never learn
+    /// the exit code it just reaped. This holds the code `terminate()`
+    /// captured so a subsequent `try_wait()` on the same id still resolves
+    /// it instead of retrying against a session that no longer exists.
+    terminated_codes: Mutex<HashMap<String, Option<i32>>>,
 }
 
 impl PtyManager {
@@ -114,6 +121,7 @@ impl PtyManager {
         Ok(Self {
             pty_system: Mutex::new(pty_system),
             sessions: Mutex::new(HashMap::new()),
+            terminated_codes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -269,17 +277,21 @@ impl PtyManager {
     }
 
     /// Waits for the child process to exit (non-blocking check).
-    pub fn try_wait(&self, session_id: &str) -> Result<Option<ExitStatus>> {
-        let inner = self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned()
-            .context("session not found")?;
+    pub fn try_wait(&self, session_id: &str) -> Result<Option<i32>> {
+        let Some(inner) = self.sessions.lock().unwrap().get(session_id).cloned() else {
+            // Already terminated: `terminate()` removes the session from
+            // `sessions` but records what it reaped, so callers that raced
+            // it (the agent pump polling for the exit code right after a
+            // user-initiated stop) still get the real code instead of a
+            // hard error that looks like "no such session ever existed".
+            return match self.terminated_codes.lock().unwrap().get(session_id) {
+                Some(code) => Ok(*code),
+                None => Err(anyhow::anyhow!("session not found")),
+            };
+        };
         let mut child = inner.child.lock().unwrap();
         if let Some(child) = child.as_mut() {
-            Ok(child.try_wait()?)
+            Ok(child.try_wait()?.map(|status| status.exit_code() as i32))
         } else {
             Ok(None)
         }
@@ -354,16 +366,23 @@ impl PtyManager {
             }
         }
 
-        // Then kill + reap the direct child.
+        // Then kill + reap the direct child, capturing the exit code so a
+        // caller's `try_wait()` after this returns can still observe it.
+        let mut reaped_code = None;
         if let Some(mut child) = inner.child.lock().unwrap().take() {
             let _ = child.kill();
             for _ in 0..50 {
-                if child.try_wait()?.is_some() {
+                if let Some(status) = child.try_wait()? {
+                    reaped_code = Some(status.exit_code() as i32);
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
+        self.terminated_codes
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), reaped_code);
 
         // Close the fds so any blocked reader thread wakes up with EOF.
         // Bounded: if the reader is stuck (e.g. blocked on a full channel

@@ -1440,15 +1440,18 @@ fn process_chunk(
 }
 
 /// Waits (bounded) for the child to be reaped and returns its exit code.
+///
+/// Callers reach this in two cases: a natural exit (the session is still
+/// live in `PtyManager`, so this is a normal `try_wait` poll) or after a
+/// user-initiated `stop()` (which already called `PtyManager::terminate`,
+/// removing the live session but recording the code it reaped — `try_wait`
+/// resolves that immediately instead of erroring "session not found" and
+/// burning this whole retry budget on a lookup that can never succeed).
 fn poll_exit_code(pty: &PtyManager, session_id: &str) -> Option<i32> {
     for _ in 0..100 {
         match pty.try_wait(session_id) {
-            Ok(Some(status)) => {
-                // portable-pty 0.8: exit_code() is u32 and signal deaths
-                // report 1; the fake `crash` scenario exits 139 directly.
-                return Some(status.exit_code() as i32);
-            }
-            _ => {
+            Ok(Some(code)) => return Some(code),
+            Ok(None) | Err(_) => {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }

@@ -27,7 +27,40 @@ Check/Fmt/Clippy/Performance passed on every run once the one genuine
 compile-error commit (`31725794321`) was superseded. GitHub Actions has
 never gone green on this repository.
 
-## Root cause: unsynchronized fixture build (confirmed, fixed)
+## Root cause, part 2: `try_wait` always failed after `stop()` (confirmed, fixed)
+
+The `Once` fix below closed the build race, but a second push
+(`0fccea7`, run `31942502570`) still failed the same test — same symptom,
+now at a shifted line number: the 5 s wait for `AgentEvent::Exited` after
+`stop()` still timed out on the GitHub runner.
+
+Root cause: `PtyManager::terminate()` (`crates/pty/src/lib.rs`) removes the
+session from its `sessions` map *before* returning. `AgentRuntime::stop()`
+calls `terminate()` synchronously, then the agent's pump thread calls
+`poll_exit_code()`, which calls `PtyManager::try_wait()` — but the session
+id is already gone from the map, so every one of its 100 attempts (20 ms
+apart) returned `Err("session not found")`, and after the full 2 s budget
+it gave up and returned `None`. This path could **never** succeed: by
+construction, `terminate()` always runs before the pump's poll starts. That
+guaranteed 2 s tax (plus scheduling variance) is what pushed the test over
+its 5 s deadline under GitHub Actions' load, while usually — not
+always — finishing in time on a quieter local machine.
+
+This is a genuine product bug, not just a test-timing issue: every
+user-initiated stop was losing its real exit code and wasting 2 seconds to
+report `None` instead. Fixed: `PtyManager` now records the exit code
+`terminate()` reaped (or `None` if the child still wouldn't report one) in
+a small side-table, and `try_wait()` consults it as a fallback when the
+live session is already gone — resolving immediately with the real code
+instead of retrying a lookup that could never succeed.
+`try_wait()`'s return type simplified from `Option<ExitStatus>` to
+`Option<i32>` (its only two callers only ever used the raw code /
+existence, never other `ExitStatus` fields).
+
+Verified: `stop_transitions_to_stopped_and_stays` dropped from ~3.5–8 s
+(and a frequent timeout) to a consistent ~0.58 s across 5 clean runs.
+
+## Root cause, part 1: unsynchronized fixture build (confirmed, fixed)
 
 `ensure_fake_agent_built()` in `agent_runtime.rs` ran on every `#[test]`
 that needed the `fake-agent` fixture binary:
