@@ -73,7 +73,7 @@ Every significant Pull Request must pass the performance gate. The `ci.yml` work
 | Idle RAM | +2 MB |
 | 10 Panes RAM | +5 MB |
 | `batch_apply_p95_ms` (synthetic throughput, formerly mislabeled "Input Latency") | `current > baseline × 5` (see `docs/performance-benchmark-audit.md`) |
-| `input_to_apply_p95_ms` / `shell_echo_p95_ms` (real input latency) | flat `<= 8 ms` (the engineering budget itself — see below) |
+| `input_to_apply_p95_ms` / `shell_echo_p95_ms` (real input latency) | `<= 8 ms` locally; `<= 25 ms` on CI (GitHub's shared runner reproducibly runs 5–10× slower for real PTY I/O — see `docs/performance-audit-reconciliation.md`) |
 | Binary Size | +0.5 MB |
 
 **Two metrics now cover what "Input Latency (p95)" used to name ambiguously** — see `docs/performance-benchmarking.md` § Metric Taxonomy for the full picture:

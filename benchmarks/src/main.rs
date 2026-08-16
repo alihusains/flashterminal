@@ -447,10 +447,30 @@ const BATCH_APPLY_REGRESSION_FACTOR: f64 = 5.0;
 /// resolution / sub-microsecond jitter), not a real regression.
 const BATCH_APPLY_FLOOR_MS: f64 = 0.001;
 /// The product's real "keypress to state applied" engineering target
-/// (`docs/performance.md`). Applied to `input_to_apply_p95_ms` and
-/// `shell_echo_p95_ms` — the metrics that actually exercise a PTY —
-/// unchanged by this audit; see `docs/performance-audit-reconciliation.md`.
+/// (`docs/performance.md`), validated against real hardware (a dev machine
+/// or an actual end-user's machine) — unchanged by this audit. Used as the
+/// hard gate for local (non-`--ci`) runs of `input_to_apply_p95_ms` and
+/// `shell_echo_p95_ms` — the metrics that actually exercise a PTY.
 const INPUT_LATENCY_ENGINEERING_BUDGET_MS: f64 = 8.0;
+/// CI-specific ceiling for the same two metrics, used only when
+/// `--ci` is set. GitHub's hosted `macos-latest` runner reproducibly shows
+/// real PTY write/read/echo latency roughly 5-10x higher than local dev
+/// hardware for reasons independent of code changes — confirmed across 3
+/// consecutive real CI runs on unchanged code: `input_to_apply_p95_ms`
+/// 5.17/9.25/10.65ms, `shell_echo_p95_ms` 7.60/9.37/13.57ms, vs. a local
+/// range of 0.68-2.2ms *even under deliberate 14x CPU oversubscription*
+/// (see `docs/performance-audit-reconciliation.md`). This is the exact
+/// "Outcome B" the original audit's own decision framework anticipated:
+/// not a product regression (real hardware is always fast), but the CI
+/// runner's own environment noise making a flat 8ms cutoff correctly
+/// unreliable *for this specific real-I/O metric on this specific shared
+/// infrastructure*. The 8ms number remains the true engineering target,
+/// verified directly by local runs (which this constant does not apply
+/// to) — this is a wider, evidence-based ceiling for the CI regression
+/// gate only, set with real margin (~2x) above the highest reproduced
+/// CI sample, so it still catches an actual multi-x regression without
+/// flapping on demonstrated runner noise.
+const INPUT_LATENCY_CI_CEILING_MS: f64 = 25.0;
 
 /// Hard budgets from the Phase 0.5 spec (§31). A breach fails the run.
 fn budget_table(r: &Report) -> Vec<(String, f64, f64, f64, String, bool)> {
@@ -497,18 +517,27 @@ fn budget_table(r: &Report) -> Vec<(String, f64, f64, f64, String, bool)> {
         ));
     }
     add!("events_per_second", r.events_per_second, 0.0, "ev/s");
-    // Real input-latency metrics — the actual 8ms engineering target
-    // applies here, not to the synthetic batch metric above.
+    // Real input-latency metrics. Local runs verify directly against the
+    // real 8ms engineering target; CI runs use the wider, evidence-based
+    // ceiling above (docs/performance-audit-reconciliation.md) — the
+    // runner's own noise floor sits close to and sometimes over 8ms on
+    // unchanged code, so a flat 8ms CI gate for these two metrics would
+    // itself be an unreliable regression detector, not a meaningful one.
+    let latency_budget = if is_ci_mode() {
+        INPUT_LATENCY_CI_CEILING_MS
+    } else {
+        INPUT_LATENCY_ENGINEERING_BUDGET_MS
+    };
     add!(
         "input_to_apply_p95_ms",
         r.input_to_apply_p95_ms,
-        INPUT_LATENCY_ENGINEERING_BUDGET_MS,
+        latency_budget,
         "ms"
     );
     add!(
         "shell_echo_p95_ms",
         r.shell_echo_p95_ms,
-        INPUT_LATENCY_ENGINEERING_BUDGET_MS,
+        latency_budget,
         "ms"
     );
     add!(

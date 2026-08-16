@@ -34,7 +34,23 @@ None found. Both audits agree on the root cause and the recommendation (`REDESIG
 Proceed as an **extension**, not a redo:
 
 - Keep the existing timer-bug fix and baseline-relative gate for the synthetic batch metric — just rename it (`batch_apply_p95_ms`) to stop it from masquerading as input latency, per §7/§20.
-- Add real, CI-tracked `input_to_apply_p95_ms` and `shell_echo_p95_ms` metrics (promoting the existing standalone probes into the main `--ci` report), each gated against the actual 8ms engineering target — which they clear by roughly an order of magnitude.
+- Add real, CI-tracked `input_to_apply_p95_ms` and `shell_echo_p95_ms` metrics (promoting the existing standalone probes into the main `--ci` report), each gated against the actual 8ms engineering target locally — which they clear by roughly an order of magnitude on real hardware.
 - Complete the remaining unimplemented sections (multi-pane, multi-agent, versioned baseline, doc breadth) below.
 
 See `docs/performance-benchmarking.md` for the resulting design and `docs/performance-benchmark-audit.md` for the original forensic evidence (unchanged, still authoritative for what it covers).
+
+## Addendum: the real metrics needed their own CI-gate redesign too
+
+Pushing the above (commit `841aa57`) and watching 3 consecutive real GitHub Actions runs on unchanged code revealed the same class of problem the original audit found for `batch_apply_p95_ms`, now affecting the *real* metrics:
+
+| Run | `input_to_apply_p95_ms` | `shell_echo_p95_ms` |
+|---|---|---|
+| 1 | 10.65ms **(FAIL)** | 13.57ms **(FAIL)** |
+| 2 | 9.25ms **(FAIL)** | 9.37ms **(FAIL)** |
+| 3 | 5.17ms (ok) | 7.60ms (ok, close) |
+
+Local range across every test in this document (unloaded and under deliberate 14×-oversubscribed CPU contention) never exceeded **2.2ms**. GitHub's `macos-latest` runner reproducibly shows real PTY write/read/echo latency roughly 5–10× higher than local dev hardware, independent of code changes — this is "Outcome B" again, now for a metric that genuinely does measure input latency rather than a mislabeled one.
+
+**Not a product regression** (real hardware — the thing the 8ms budget is actually about — is always fast) and **not a measurement-methodology defect** (these metrics do exercise a real PTY, correctly). It is CI-runner environment noise, evidenced by 3 reproduced real runs, not assumed.
+
+**Fix**: `INPUT_LATENCY_CI_CEILING_MS = 25.0` (`benchmarks/src/main.rs`), applied only when `--ci` is set — local (non-CI) runs still gate directly against the real 8ms engineering target, so `docs/performance.md`'s product budget is verified for real, not silently abandoned. The CI ceiling was set with ~2× margin above the highest reproduced sample (13.57ms), keeping it a real regression detector (proven: an injected 35ms/sample delay still tripped `FAIL` at 45.05ms; removed, passed at 0.83ms) without flapping on the demonstrated runner noise band.

@@ -54,7 +54,9 @@ Local development hardware (Apple M4 Pro, 12 cores, 24GB) and GitHub's hosted `m
 These are deliberately two different things and are not required to be equal:
 
 - **Engineering budget** (`docs/performance.md`): the product target FlashTerminal is designed to meet — input latency p95 < 8ms. Unchanged by either audit; no evidence ever demonstrated it was the wrong target, only that the originally-tracked benchmark measured a different, unrelated pipeline stage.
-- **CI regression gate** (`benchmarks/src/main.rs::budget_table()`): the mechanism that fails a build. `input_to_apply_p95_ms`/`shell_echo_p95_ms` are gated directly against the 8ms engineering budget (they now genuinely measure that pipeline, with wide real margin). `batch_apply_p95_ms` uses a baseline-relative gate (current > baseline × 5, floor 0.001ms) since an absolute millisecond-scale cutoff has zero discriminating power against its true nanosecond scale.
+- **CI regression gate** (`benchmarks/src/main.rs::budget_table()`): the mechanism that fails a build, and it is *not* the same threshold as the engineering budget for every metric:
+  - `batch_apply_p95_ms` uses a baseline-relative gate (current > baseline × 5, floor 0.001ms) since an absolute millisecond-scale cutoff has zero discriminating power against its true nanosecond scale.
+  - `input_to_apply_p95_ms`/`shell_echo_p95_ms` are gated directly against the real 8ms engineering budget **on local runs** (where they clear it with wide margin, ~0.7–2ms even under deliberate contention) but against a wider, evidence-based `25ms` CI-only ceiling (`INPUT_LATENCY_CI_CEILING_MS`) on GitHub's runner — 3 reproduced real CI runs on unchanged code showed `5.17–13.57ms`, roughly 5–10× local, a genuine environment characteristic of the shared macOS runner's real PTY I/O, not a product regression or a measurement defect. See `docs/performance-audit-reconciliation.md` § Addendum for the evidence and the regression-test proof that the wider ceiling still catches a real regression.
 
 ## Versioned baseline
 
