@@ -32,11 +32,19 @@ agent binaries, no credentials, no interactive GUI. `cargo test --workspace`
 deliberately omits `--all-features` — the only feature it would add is
 `real-agents` (Tier B, below). `gpu-bench` (in `benchmarks`) is currently an
 inert placeholder feature with no `cfg` reference anywhere in the crate.
-Runs with `RUST_TEST_THREADS=1`: many integration tests spawn real PTY
-child processes with fixed deadlines, and GitHub's runner has too few
-cores to run them concurrently without some losing that race — see
-`docs/ci-forensics.md` for the reproduction. `timeout-minutes: 15` on the
-job covers the ~2-3 extra minutes serial execution costs.
+Runs with `TERM: xterm-256color` (workflow-level `env:`) and
+`RUST_TEST_THREADS=1` on the `Test` job:
+
+- **`TERM`**: several integration tests spawn `vim`/`less`/`top` through a
+  real PTY and assert they enter the terminfo alternate screen. GitHub job
+  steps run with no `TERM` set, so those programs correctly decline
+  alt-screen mode for what looks like an incapable terminal — every such
+  test failed on every run until this was set. Confirmed root cause: see
+  `docs/ci-forensics.md`.
+- **`RUST_TEST_THREADS=1`**: a smaller, separate contention issue —
+  several real-PTY tests running concurrently on a small runner can push
+  one past its own timeout. `timeout-minutes: 15` on the job covers the
+  ~2-3 extra minutes serial execution costs.
 
 **Tier B — optional integration** (`real-agents.yml`, `workflow_dispatch`
 only): exercises `terminal-session`'s `real-agents` feature against the

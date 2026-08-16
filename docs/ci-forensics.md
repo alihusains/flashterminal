@@ -133,35 +133,55 @@ No `--ci` mechanism existed at all before this phase; no job/step timeouts
 existed on the Performance job; no artifacts were uploaded on failure.
 All three fixed — see `docs/ci.md`.
 
-## Root cause, part 3: PTY-heavy tests never had a chance to flake before (confirmed, fixed)
+## Root cause, part 3: `TERM` unset on the runner — TUI tests never see alt-screen (confirmed, fixed)
 
-With both fixes above pushed (`b3919c1`, run `31942971604`), the `Test`
+With the first two fixes pushed (`b3919c1`, run `31942971604`), the `Test`
 job finally got *past* `agent_runtime.rs` for the first time in this
 repository's CI history — and immediately hit **four new failures**, all
 in `crates/terminal-session/tests/phase051.rs`: `malformed_bytes_through_pty`,
-`less_roundtrip`, `top_batch_and_interactive`, `vim_roundtrip`. These spawn
-real interactive programs (a shell, `vim`, `less`, `top`) through a real
-PTY with fixed wall-clock deadlines.
+`less_roundtrip`, `top_batch_and_interactive`, `vim_roundtrip`. None of
+this had ever been observed before simply because `agent_runtime.rs` (Root
+causes 1/2) always failed the `Test` job first.
 
-This is the same class of local-only flake noted below
-(`malformed_bytes_through_pty`), but it turns out **not** to be
-local-machine-only: GitHub's `macos-latest` runner has far fewer cores than
-either dev machine used in this audit, and `cargo test`'s default
-parallelism (one thread per logical CPU) runs several of these real-process
-tests concurrently, oversubscribing a small runner and pushing individual
-tests over their own deadlines. It was never observed in the 11 historical
-runs simply because `agent_runtime.rs` (Root cause 1/2, above) always
-failed the `Test` job before the suite ever reached `phase051.rs`.
+An initial hypothesis (CPU contention: many real-PTY tests running
+concurrently on a small runner) was plausible and *partially* correct —
+`RUST_TEST_THREADS=1` was pushed (`69b5ff4`) as a legitimate determinism
+improvement (it eliminates genuine same-binary thread contention and is
+kept) — but it did **not** fix the failure on the actual GitHub runner: the
+identical four tests failed again, this time fully serialized, each
+timing out on its own with no other test running concurrently.
 
-Reproduced directly: `cargo test --workspace` with default parallelism on
-a 12-core machine still flaked on `phase051.rs` intermittently-to-often;
-the *identical* command with `RUST_TEST_THREADS=1` passed clean, twice,
-including every test in every crate (`4m28s` total). This is a resource-
-contention artifact of concurrent real-process scheduling, not a
-FlashTerminal correctness bug — no assertion, timeout, or test was
-weakened. Fixed: CI's `Test` step now sets `RUST_TEST_THREADS: 1`, trading
-~2-3 minutes of wall clock for determinism (the whole `Test` job's
-`timeout-minutes: 15` covers this with margin).
+The actual log output pinpointed it: `less_roundtrip`'s captured grid
+showed `less` printing `WARNING: terminal is not fully functional` and
+never switching to the alternate screen; `vim_roundtrip` and
+`top_batch_and_interactive` showed `TUI never entered alternate screen`.
+These three tests assert `state.modes.alt_screen` becomes true — driven
+entirely by whether the spawned `vim`/`less`/`top` process emits the
+terminfo alt-screen escape sequence, which each program only does when its
+`TERM` reports a capable terminal. Grepping the codebase confirms
+`FlashTerminal` never sets `TERM` when spawning a session
+(`Session::spawn`/`spawn_with_options` pass through the inherited
+environment `+ env` additions — `crates/terminal-session/src/lib.rs`);
+GitHub Actions job steps run with no interactive TTY and no `TERM` set.
+
+Reproduced directly and unambiguously: `env -u TERM cargo test -p
+terminal-session --test phase051 roundtrip` locally reproduces the exact
+`less` warning and both `vim`/`less` failures; `env -u TERM
+TERM=xterm-256color cargo test ...` (same command, `TERM` forced) passes
+both in 3.46 s. `malformed_bytes_through_pty` doesn't touch `alt_screen` at
+all and is a separate, genuine timing/resource-contention flake, which
+`RUST_TEST_THREADS=1` addresses on its own terms.
+
+This is a CI *environment* gap (§10 of the repair spec: don't assume
+GitHub-hosted macOS matches the dev machine), not a FlashTerminal
+correctness bug and not something to "fix" in product code — a terminal
+emulator not forcing its own `TERM` on child shells is normal (the shell's
+login profile/interactive `TERM` setup is what would normally supply it;
+CI job steps have no such profile). Setting a capable `TERM` for the CI
+job is the correct scope: it makes the *test environment* match what any
+real interactive shell session already provides, without touching
+`crates/pty` or `crates/terminal-session` at all. Fixed: `ci.yml`'s
+top-level `env:` now sets `TERM: xterm-256color`.
 
 ## `malformed_bytes_through_pty` — initial local-only observation, later explained
 

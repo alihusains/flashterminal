@@ -8,6 +8,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Integration tests spawn real PTY sessions running vim/less/top and
+  # assert they enter the terminfo alternate screen. GitHub's job steps run
+  # with no TERM (or a minimal one) — those programs correctly decline to
+  # use alt-screen mode for a terminal that can't report a capability, so
+  # every such test failed on every run. See docs/ci-forensics.md.
+  TERM: xterm-256color
 
 # Minimal default permissions; individual steps escalate only where needed.
 permissions:
