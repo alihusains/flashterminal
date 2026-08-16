@@ -25,3 +25,12 @@ pty = { path = "../pty" }
 [features]
 default = []
 real-agents = []
+
+# Without this, `tests/real_agents.rs` is discovered and built like any
+# other integration test — the `real-agents` feature name is otherwise
+# purely aspirational, and the suite runs (and calls out to whatever real
+# agent binaries happen to be on PATH) under plain `cargo test --workspace`.
+[[test]]
+name = "real_agents"
+path = "tests/real_agents.rs"
+required-features = ["real-agents"]

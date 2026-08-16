@@ -9,22 +9,39 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Minimal default permissions; individual steps escalate only where needed.
+permissions:
+  contents: read
+
+# A new push/PR update supersedes any in-flight run for the same ref.
+# Pushes to main are never cancelled by a later push landing seconds later —
+# `main` only ever has one head at a time, so this scopes to PR churn.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # Tier A: deterministic CI. No network, no real AI agents, no credentials,
+  # no GPU/display — see docs/ci.md. These four jobs are independent and run
+  # in parallel for the fastest possible feedback.
   check:
     name: Check
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo registry
-        uses: actions/cache@v3
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-stable-
+            ${{ runner.os }}-cargo-
       - name: Cargo check
         run: cargo check --workspace
 
@@ -32,25 +49,31 @@ jobs:
     name: Test
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo registry
-        uses: actions/cache@v3
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-stable-
+            ${{ runner.os }}-cargo-
       - name: Run tests
-        run: cargo test --workspace --all-features
+        # NOT --all-features: `real-agents` (terminal-session) requires real
+        # agent binaries/credentials and is exercised by real-agents.yml
+        # (Tier B, opt-in) instead. See docs/ci.md.
+        run: cargo test --workspace
 
   fmt:
     name: Rustfmt
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -62,38 +85,125 @@ jobs:
     name: Clippy
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-  performance:
-    name: Performance Check
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo registry
-        uses: actions/cache@v3
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-clippy-
+            ${{ runner.os }}-cargo-
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  release-build:
+    name: Release Build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-
+      - name: Cargo build --release --workspace
+        run: cargo build --release --workspace
+
+  desktop-build:
+    name: Desktop Build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-desktop-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-desktop-
+            ${{ runner.os }}-cargo-
+      - name: Cargo build --release -p desktop
+        # Build-only: this runner has no display, so the app is never
+        # launched here. See docs/ci.md / desktop-validation.yml (future).
+        run: cargo build --release -p desktop
+
+  performance:
+    name: Performance Check
+    runs-on: macos-latest
+    timeout-minutes: 20
+    # contents:read (default) plus pull-requests:write for the PR comment
+    # step below. Fork PRs still only get a read-only token from GitHub
+    # regardless of this grant; the comment step handles that gracefully.
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-perf-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-perf-
+            ${{ runner.os }}-cargo-
       - name: Build release benchmark
+        timeout-minutes: 10
         run: cargo build --release -p benchmarks
       - name: Run performance benchmarks
         id: perf
+        timeout-minutes: 5
+        # --ci: compare against the committed baseline.json; never rewrite
+        # it (see docs/ci.md). A timeout here is a CI FAILURE, not a pass.
+        # `set -o pipefail` is required: without it, `cargo run | tee` only
+        # reports tee's exit code, so a failing/erroring benchmark run is
+        # silently reported as a passing step (this masked a real bug —
+        # see docs/ci-forensics.md).
         run: |
-          cargo run --release -p benchmarks 2>&1 | tee /tmp/perf_report.txt
+          set -o pipefail
+          cargo run --release -p benchmarks -- --ci 2>&1 | tee /tmp/perf_report.txt
+      - name: Upload performance report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-report
+          path: |
+            /tmp/perf_report.txt
+            docs/performance-report.md
+          retention-days: 14
+          if-no-files-found: warn
       - name: Comment PR with performance results
         if: github.event_name == 'pull_request' && always() && steps.perf.outcome != 'skipped'
-        uses: actions/github-script@v7
+        # Fork PRs don't get a write-scoped token for this step; failing to
+        # comment must never fail an otherwise-successful benchmark.
+        continue-on-error: true
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
@@ -118,9 +228,15 @@ jobs:
             } else {
               table = '```\n' + report.slice(-2000) + '\n```';
             }
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `## Performance Check\n${table}\n\nSee the full report in \`docs/performance-report.md\`.`
-            })
+            try {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `## Performance Check\n${table}\n\nSee the full report in \`docs/performance-report.md\`.`
+              });
+            } catch (err) {
+              // Fork PRs: GITHUB_TOKEN has no write access to the base repo.
+              console.log('Could not post PR comment (likely a fork PR); logging report instead.');
+              console.log(table);
+            }

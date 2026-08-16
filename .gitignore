@@ -1,2 +1,10 @@
 # Build artifacts
 target/
+
+# Generated tool caches — indexes/analysis output, not source, regenerated
+# locally by each tool on demand. See docs/ci-forensics.md §24-25.
+.repowise/
+graphify-out/
+
+# macOS
+.DS_Store

@@ -16,17 +16,28 @@ use terminal_session::execution::{AgentEvent, AgentState, ExecutionId};
 use terminal_session::launch::AgentLaunchConfig;
 use terminal_session::provider::ProviderRegistry;
 
+/// `#[test]` functions in this file run concurrently on separate threads
+/// within the same process. Without this guard, every test that needs the
+/// `fake-agent` binary races an unsynchronized "check, then `cargo build`"
+/// against every other test: one thread can observe the binary missing,
+/// start its own build, and attempt to spawn it before that build's rename
+/// into `target/debug` completes elsewhere — an ENOENT that reproduces
+/// intermittently both locally and in CI. `Once` guarantees exactly one
+/// build runs and every other caller blocks until it finishes.
 fn ensure_fake_agent_built() {
-    if terminal_session::adapters::fake::FakeAgentAdapter::resolve_binary().is_ok() {
-        return;
-    }
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "fake-agent"])
-        .current_dir(format!("{manifest}/../.."))
-        .status()
-        .expect("cargo available for building fake-agent");
-    assert!(status.success(), "failed to build fake-agent");
+    static BUILD_ONCE: std::sync::Once = std::sync::Once::new();
+    BUILD_ONCE.call_once(|| {
+        if terminal_session::adapters::fake::FakeAgentAdapter::resolve_binary().is_ok() {
+            return;
+        }
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "-p", "fake-agent"])
+            .current_dir(format!("{manifest}/../.."))
+            .status()
+            .expect("cargo available for building fake-agent");
+        assert!(status.success(), "failed to build fake-agent");
+    });
 }
 
 fn launch(definition_id: &str, args: Vec<&str>) -> AgentLaunchConfig {

@@ -316,6 +316,14 @@ fn save_baseline(r: &Report) {
     std::fs::write(&path, json).expect("failed to write baseline.json");
 }
 
+/// `--ci`: compare against the committed baseline and never write it back.
+/// Local (default) mode updates `baseline.json` after every run so the next
+/// local run has a fresh comparison point; CI must not mutate committed
+/// state, so it only reads the baseline that ships in the repo.
+fn is_ci_mode() -> bool {
+    std::env::args().any(|a| a == "--ci")
+}
+
 trait MetricGetter {
     fn metric(&self, name: &str) -> Option<f64>;
 }
@@ -406,7 +414,13 @@ fn main() {
     let mut breaches = Vec::new();
     for (name, cur, base, budget, unit, breached) in &rows {
         let delta = cur - base;
-        let status = if *breached { "FAIL" } else { "ok" };
+        let status = if cur.is_nan() {
+            "UNAVAILABLE"
+        } else if *breached {
+            "FAIL"
+        } else {
+            "ok"
+        };
         if *breached {
             breaches.push(name.clone());
         }
@@ -449,7 +463,12 @@ fn main() {
     std::fs::write(&report_path, md).expect("failed to write docs/performance-report.md");
     println!("\nWrote {}", report_path.display());
 
-    save_baseline(&report);
+    if is_ci_mode() {
+        println!("\n--ci: baseline.json is committed state, not overwritten by CI runs.");
+    } else {
+        save_baseline(&report);
+        println!("\nUpdated {}", baseline_path().display());
+    }
 
     if !breaches.is_empty() {
         eprintln!("\nERROR: hard budget breached: {}", breaches.join(", "));

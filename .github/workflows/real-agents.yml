@@ -1,0 +1,37 @@
+name: Real Agents (opt-in)
+
+# Tier B: optional integration. Exercises the `real-agents` feature against
+# actual agent CLIs (claude-code, codex, opencode, pi). These require
+# network access and, for meaningful (non-SKIPPED) runs, credentials and the
+# agent binaries pre-installed on the runner — neither is assumed here.
+# Never runs on push/PR; trigger manually when validating agent integration.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  real-agents:
+    name: Real Agent Matrix
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-real-agents-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-real-agents-
+            ${{ runner.os }}-cargo-
+      - name: Run real-agent matrix
+        # Prints SKIPPED (not FAILED) per agent when its binary isn't on
+        # PATH — see crates/terminal-session/tests/real_agents.rs.
+        run: cargo test -p terminal-session --features real-agents --test real_agents -- --nocapture

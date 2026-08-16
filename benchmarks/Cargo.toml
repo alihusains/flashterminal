@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+# Disambiguates `cargo run -p benchmarks`: src/bin/*.rs adds several other
+# binaries to this package, so `cargo run` alone is otherwise ambiguous.
+default-run = "benchmarks"
 
 [dependencies]
 terminal-core = { path = "../crates/terminal-core" }
