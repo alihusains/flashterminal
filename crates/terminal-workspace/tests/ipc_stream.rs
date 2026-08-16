@@ -371,8 +371,14 @@ fn slow_ipc_client_is_disconnected_and_engine_keeps_running() {
     );
     // The server must have closed the connection: drain whatever the kernel
     // already buffered for the wedged client, then reads must fail (EOF).
+    // A fixed attempt count used to be enough to drain the backlog and hit
+    // EOF, back when Output was coalesced (few messages ever reached the
+    // socket). Output is now delivered individually and losslessly (ADR
+    // 0021) — a wedged client legitimately has far more buffered frames to
+    // read through before disconnect, so bound this by wall clock instead.
     let mut saw_close = false;
-    for _ in 0..64 {
+    let read_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < read_deadline {
         match read_frame(&mut stream) {
             Ok(_) => continue,
             Err(_) => {
@@ -385,5 +391,88 @@ fn slow_ipc_client_is_disconnected_and_engine_keeps_running() {
         saw_close,
         "server must close the connection after disconnecting the subscriber"
     );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// End-to-end regression for the confirmed EventBus output-loss bug (ADR
+/// 0021, `docs/ci-forensics.md`): a real fake-agent process → PTY → pump →
+/// EventBus → Unix socket, emitting 1,000 distinguishable lines rapidly (the
+/// `streaming` scenario), must deliver every one to the IPC client. Unlike
+/// the synthetic EventBus-level tests in `tests/eventbus.rs`, this exercises
+/// the actual chunk boundaries and flush cadence that originally caused the
+/// loss — `Output` events at this layer bundle whatever lines a given PTY
+/// read chunk contained, so losslessness is checked over the concatenated
+/// text, not a 1:1 event-per-line count.
+#[test]
+fn agent_output_stream_is_lossless_end_to_end() {
+    if !fake_agent_available() {
+        eprintln!("SKIPPED: fake-agent binary not built (cargo build -p fake-agent)");
+        return;
+    }
+    let path = tmp_socket("streaming");
+    let engine = Arc::new(Mutex::new(Multiplexer::new().unwrap()));
+    ipc::serve(Arc::clone(&engine), &path).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    engine.lock().unwrap().ensure_workspace();
+
+    let mut stream = UnixStream::connect(&path).unwrap();
+    subscribe(&mut stream, EventFilter::agent_only()).unwrap();
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    drain_loop(Arc::clone(&engine), Arc::clone(&stop));
+
+    // `AgentSpawnPane`/`AgentSpawn` over the wire always launch a
+    // definition's default arguments (`vec![]`) — the IPC protocol has no
+    // way to pass `--scenario streaming`, and adding one would be new
+    // product functionality, out of scope here. Spawn directly through the
+    // same `Multiplexer::spawn_agent_session` the IPC handler itself calls
+    // (`crates/terminal-workspace/src/ipc.rs`), so everything downstream —
+    // EventBus publish/flush, IPC delivery — is still the real path this
+    // test is meant to exercise.
+    let execution_id = {
+        let mut eng = engine.lock().unwrap();
+        eng.spawn_agent_session(
+            agent_launch("streaming", &std::env::temp_dir().to_string_lossy()),
+            80,
+            24,
+        )
+        .unwrap()
+        .0
+    };
+
+    let events = collect_until_exit(&mut stream, &execution_id, Duration::from_secs(30));
+    use terminal_session::execution::AgentEvent;
+    let mut text = String::new();
+    for ev in &events {
+        if let AgentEvent::Output { text: chunk } = ev {
+            text.push_str(chunk);
+        }
+    }
+    let mut missing = Vec::new();
+    for i in 1..=1000 {
+        if !text.contains(&format!("Stream line {i}")) {
+            missing.push(i);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} of 1000 stream lines never reached the IPC client (first few missing: {:?})",
+        missing.len(),
+        &missing[..missing.len().min(10)]
+    );
+    // Order: each line's position in the concatenated text must be
+    // increasing (no reordering across chunk boundaries).
+    let mut last_pos = 0usize;
+    for i in 1..=1000 {
+        let marker = format!("Stream line {i}");
+        let pos = text.find(&marker).unwrap();
+        assert!(
+            pos >= last_pos,
+            "line {i} arrived out of order (position {pos} < previous {last_pos})"
+        );
+        last_pos = pos;
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = std::fs::remove_file(&path);
 }

@@ -114,10 +114,14 @@ agent process ──► PTY master ──► [reader + parser thread]  (same pip
   (focused uncapped / 4096 / 512) as terminal sessions — agent floods cannot
   starve interactive panes (2B.1 starvation test: focused-input p95 < 8 ms
   under 5 heavy agents).
-- **Event streaming (2B.1 §24–27)**: `subscribe`/`unsubscribe` over the IPC
-  Unix socket with per-channel filters; per-subscriber bounded queues,
-  coalescing, structured drops, stall-detection disconnect, and a socket
-  write timeout — a slow client can never block the engine.
+- **Event streaming (2B.1 §24–27; delivery semantics fixed by ADR 0021)**:
+  `subscribe`/`unsubscribe` over the IPC Unix socket with per-channel
+  filters; per-subscriber bounded queues, explicit lossless-vs-coalescible
+  delivery semantics per event type (`docs/agent-events.md`),
+  stall-detection disconnect, and a socket write timeout — a slow client
+  can never block the engine, and a healthy one never silently loses
+  agent output (previously, output was coalesced and droppable — a
+  confirmed bug, see `docs/ci-forensics.md`).
 - **Security boundary**: keys live only in the OS keychain; everything else
   holds `keychain://flashterminal/<provider>` references; `Redactor` masks
   registered secrets + known shapes at output/errors/IPC/persistence;

@@ -195,7 +195,7 @@ real interactive shell session already provides, without touching
 `crates/pty` or `crates/terminal-session` at all. Fixed: `ci.yml`'s
 top-level `env:` now sets `TERM: xterm-256color`.
 
-## Root cause, part 4: orchestration event-coalescing races (found, NOT fixed — out of scope)
+## Root cause, part 4: orchestration event-coalescing races (found, later fixed — see below)
 
 After the `TERM` fix landed and one full green run was confirmed
 (`31944416318`), a docs-only follow-up commit (`0740cda`, no code change)
@@ -225,16 +225,20 @@ output across syscalls) and the engine's flush cadence, both of which are
 CPU-scheduling-dependent and therefore differ between this development
 machine and GitHub's runner.
 
-**Not fixed in this phase.** A correct fix here means changing how
-`AgentEvent::Output` coalescing works (e.g. concatenating text across a
-flush window instead of replacing) — that's a change to the orchestration
-engine's event-delivery architecture, not a CI script, benchmark, or test
-fixture. The repair spec for this phase is explicit: don't modify terminal
-architecture, don't start Phase 5. This is real, and it's the correct kind
-of thing this audit should surface — but it belongs to a dedicated
-investigation into `EventBus` output-coalescing semantics, not a
-workflow-level CI fix. Flagged here for that follow-up; not patched around
-with a test change that would just paper over the same underlying race.
+**Not fixed in this phase** (deliberately deferred — this was a CI-repair
+pass, and the correct fix touches orchestration event-delivery
+architecture, not a CI script). **Fixed in the dedicated follow-up phase
+that this finding was flagged for**: see `docs/adr/0021-event-delivery-semantics.md`
+and `docs/agent-events.md`. Summary: `AgentEvent::Output` was reclassified
+from coalesced+droppable to lossless+ordered — every event is now
+delivered to every subscriber individually and in publish order, removing
+the `pending_output` coalescing map entirely. Verified: both previously
+flaky tests, plus the whole `phase3d` suite, now pass consistently across
+repeated runs (5/5 clean locally under CI-matching `TERM=xterm-256color
+RUST_TEST_THREADS=1`); a new dedicated regression suite
+(`crates/terminal-workspace/tests/eventbus.rs`) and a real end-to-end IPC
+test (`tests/ipc_stream.rs::agent_output_stream_is_lossless_end_to_end`)
+lock the fix in.
 
 ## `malformed_bytes_through_pty` — initial local-only observation, later explained
 

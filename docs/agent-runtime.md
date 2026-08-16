@@ -100,8 +100,15 @@ Failed | Crashed | Stopped`
 
 ## Fairness & throughput
 
-- Agent output uses the same batching + per-execution coalescing as
-  terminal sessions; the event bus uses bounded subscriber queues with
-  drop / coalesce / disconnect slow-client policies.
+- Agent output is delivered losslessly and in order through `EventBus` —
+  fixed in ADR 0021 after a confirmed bug where per-execution output
+  coalescing silently dropped real output published within the same drain
+  frame. State/lifecycle events remain lossless as before; only genuinely
+  coalescible metadata (activity heuristics, usage counters) may still be
+  dropped under backpressure. See `docs/agent-events.md` for the full
+  classification table and `docs/adr/0021-event-delivery-semantics.md`.
+  The event bus still uses bounded subscriber queues with a
+  drop/disconnect slow-client policy — a stalled or saturated subscriber
+  is disconnected, never allowed to block the engine.
 - 2B.1 stress evidence (10 agents + 2 interactive panes, starvation
   p95 < 8 ms, memory scaling 1–20 agents): `benchmarks/src/bin/agent_stress.rs`.

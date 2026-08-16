@@ -1,32 +1,49 @@
-//! Unified application event bus (Phase 2B.1 §24–27).
+//! Unified application event bus (Phase 2B.1 §24–27; delivery semantics
+//! fixed and made explicit per ADR 0021).
 //!
 //! ```text
 //! AgentRuntime ─▶ ApplicationEvent ─▶ EventBus ─▶ Subscriber queues ─▶ IPC client / desktop
 //! ```
 //!
 //! The engine publishes [`ApplicationEvent`]s (agent lifecycle, pane
-//! changes, session exits, notifications) into the bus once per drain
-//! frame. Subscribers — the desktop UI and IPC clients — receive events
-//! over **bounded** queues, so a slow consumer can never block the engine
-//! (§27):
+//! changes, session exits, notifications) into the bus, potentially several
+//! per drain frame, then flushes once per frame. Subscribers — the desktop
+//! UI and IPC clients — receive events over **bounded** queues, so a slow
+//! consumer can never block the engine (§27). Every event is classified by
+//! [`DeliverySemantics`] (see `docs/adr/0021-event-delivery-semantics.md`
+//! and `docs/agent-events.md` for the full table):
 //!
-//! * Output events are **coalesced** (latest-wins per execution) and then
-//!   **dropped** if the subscriber's queue is full.
-//! * State/control events (state changes, permission prompts, exits) are
-//!   never dropped; instead a subscriber that cannot keep up has its
-//!   remaining queue drained and is **disconnected** (removed) so the
-//!   engine stays unblocked.
+//! * **Lossless** events (agent output, errors, permission prompts, state
+//!   changes, task/plan lifecycle, exits) are delivered to every connected
+//!   subscriber **in publish order, individually — never merged, never
+//!   silently dropped**. A subscriber that cannot keep up is not blocked
+//!   and does not corrupt the stream either: its queue is left to fill,
+//!   and if it stays saturated or stalled it is **disconnected** (removed)
+//!   so the engine stays unblocked. Loss only ever happens by an explicit,
+//!   observable disconnect — never a silent per-event drop.
+//! * **Coalescible** events (activity heuristics, usage counters, low-value
+//!   collaboration metadata) may be dropped individually under backpressure
+//!   — a newer one already suffices in place of an older one. These use
+//!   the ordinary bounded-queue drop counter, not the disconnect policy.
 //! * A subscriber whose queue stays non-empty across many flushes (its
 //!   receiver is not draining — e.g. an IPC writer blocked on a full socket
-//!   buffer) is likewise **disconnected**: the drop counters only fire on
-//!   overflow, so the stall rule is the backstop for wedged writers (§27).
+//!   buffer) is disconnected regardless of category: the drop counters
+//!   only fire on overflow, so the stall rule is the backstop for wedged
+//!   writers (§27).
+//!
+//! Prior to this fix, `AgentEvent::Output` was coalesced (only the latest
+//! per execution survived from one flush to the next) and treated as
+//! droppable — a real, observed bug: several `Output` events published
+//! within the same drain frame (a single frame can drain many PTY chunks
+//! for a focused pane) collapsed into one, silently discarding agent output
+//! a subscriber never saw. `Output` is now `Lossless`; the coalescing map
+//! that caused this is gone.
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Mutex;
 
-use terminal_session::execution::{AgentEvent, ApplicationEvent, ExecutionId};
+use terminal_session::execution::{AgentEvent, ApplicationEvent};
 use terminal_session::orchestration::TaskEvent;
 
 /// Maximum events buffered per subscriber before the slow-client policy
@@ -120,43 +137,65 @@ impl EventFilter {
     }
 }
 
-/// Events that must never be dropped for a live subscriber: losing one of
-/// these would hide a user-visible state change or a security prompt.
-fn is_critical(event: &ApplicationEvent) -> bool {
+/// How an [`ApplicationEvent`] may be delivered — see ADR 0021 and
+/// `docs/agent-events.md` for the full audited table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliverySemantics {
+    /// Must reach every connected subscriber, individually, in publish
+    /// order. Never merged with another event, never silently dropped. A
+    /// subscriber that cannot keep up is disconnected (never blocked, never
+    /// fed a corrupted/incomplete stream).
+    Lossless,
+    /// May be dropped individually under backpressure — a subsequent event
+    /// of the same kind already supersedes it, so losing an old one is
+    /// harmless. Counted (`dropped_non_critical`) but never disconnects a
+    /// subscriber on its own.
+    Coalescible,
+}
+
+/// Classifies delivery semantics for every event type. This is the single
+/// place that decision is made — nothing else in `EventBus` special-cases
+/// an event kind.
+fn delivery_semantics(event: &ApplicationEvent) -> DeliverySemantics {
+    use DeliverySemantics::{Coalescible, Lossless};
     match event {
+        // Agent output/errors/state/prompts/exit are all semantically
+        // significant to whoever is watching this execution — none may be
+        // silently lost. (`Output` was `Coalescible` before this fix; that
+        // was the bug — see the module doc comment.)
         ApplicationEvent::AgentEvent {
             event:
                 AgentEvent::StateChanged { .. }
                 | AgentEvent::PermissionRequested { .. }
                 | AgentEvent::Completed
                 | AgentEvent::Exited { .. }
-                | AgentEvent::Error { .. },
+                | AgentEvent::Error { .. }
+                | AgentEvent::Output { .. },
             ..
-        } => true,
+        } => Lossless,
         ApplicationEvent::PaneCreated { .. }
         | ApplicationEvent::PaneClosed { .. }
         | ApplicationEvent::SessionExited { .. }
-        | ApplicationEvent::WorkspaceChanged => true,
+        | ApplicationEvent::WorkspaceChanged => Lossless,
+        // Process-started/usage/activity are high-frequency heuristic or
+        // counter-like updates; a newer one supersedes an older one.
         ApplicationEvent::AgentEvent {
             event:
-                AgentEvent::Output { .. }
-                | AgentEvent::Started
-                | AgentEvent::UsageUpdated { .. }
-                | AgentEvent::Activity { .. },
+                AgentEvent::Started | AgentEvent::UsageUpdated { .. } | AgentEvent::Activity { .. },
             ..
-        } => false,
+        } => Coalescible,
         // Task lifecycle events are state changes — never dropped.
         ApplicationEvent::TaskEvent {
             event: TaskEvent::TaskArtifactCreated { .. },
-        } => false,
-        ApplicationEvent::TaskEvent { .. } => true,
+        } => Coalescible,
+        ApplicationEvent::TaskEvent { .. } => Lossless,
         // Planner events are low-frequency lifecycle transitions (approval
         // gates, execution start) — never dropped for a live subscriber.
-        ApplicationEvent::PlannerEvent { .. } => true,
+        ApplicationEvent::PlannerEvent { .. } => Lossless,
         // Phase 3D: synthesis/replan signals are state changes; findings
         // and consumption are high-frequency metadata (droppable).
         ApplicationEvent::SynthesisCompleted { .. }
-        | ApplicationEvent::WorkflowNeedsReplan { .. } => true,
+        | ApplicationEvent::WorkflowNeedsReplan { .. } => Lossless,
         // Phase 3E: approval gates, supersession, invalidations and
         // escalations are state changes — never dropped. Budget-risk
         // warnings are state too (they gate continuation).
@@ -168,15 +207,21 @@ fn is_critical(event: &ApplicationEvent) -> bool {
         | ApplicationEvent::TaskInvalidated { .. }
         | ApplicationEvent::ArtifactInvalidated { .. }
         | ApplicationEvent::BudgetRisk { .. }
-        | ApplicationEvent::HumanEscalation { .. } => true,
-        ApplicationEvent::ReplanRequested { .. } => false,
+        | ApplicationEvent::HumanEscalation { .. } => Lossless,
+        ApplicationEvent::ReplanRequested { .. } => Coalescible,
         ApplicationEvent::ArtifactCreated { .. }
         | ApplicationEvent::ReviewFindingCreated { .. }
         | ApplicationEvent::SynthesisStarted { .. }
-        | ApplicationEvent::ArtifactConsumed { .. } => false,
+        | ApplicationEvent::ArtifactConsumed { .. } => Coalescible,
         // Phase 3F: STOP ALL / PAUSE ALL are state changes — never dropped.
-        ApplicationEvent::WorkflowStopped { .. } | ApplicationEvent::WorkflowPaused { .. } => true,
+        ApplicationEvent::WorkflowStopped { .. } | ApplicationEvent::WorkflowPaused { .. } => {
+            Lossless
+        }
     }
+}
+
+fn is_critical(event: &ApplicationEvent) -> bool {
+    delivery_semantics(event) == DeliverySemantics::Lossless
 }
 
 /// Per-subscriber slow-client state. All mutations happen under the bus
@@ -185,8 +230,6 @@ struct Subscriber {
     id: u64,
     filter: EventFilter,
     tx: Sender<ApplicationEvent>,
-    /// Latest output event per execution, delivered on flush (coalescing).
-    pending_output: HashMap<ExecutionId, ApplicationEvent>,
     /// Consecutive critical sends that failed to enqueue.
     critical_drops: u64,
     /// Non-critical events dropped since the last flush (output storms).
@@ -195,6 +238,14 @@ struct Subscriber {
     stalled_flushes: u64,
     /// Queue depth at the start of the previous flush (stall comparison).
     last_q_before: usize,
+    /// Events successfully enqueued to this subscriber since the last
+    /// flush. `publish` delivers immediately now (no batching deferred to
+    /// flush time), so an unchanged queue depth alone no longer implies a
+    /// stalled receiver — depth naturally holds steady between flushes for
+    /// a healthy subscriber too if nothing new happened to arrive in that
+    /// window. What actually distinguishes "genuinely not draining" is: the
+    /// depth held steady *and* nothing new was even offered to it either.
+    sent_since_flush: u64,
     /// Receiver was dropped by the client (no more sends will succeed).
     disconnected: bool,
 }
@@ -203,7 +254,9 @@ impl Subscriber {
     fn try_enqueue(&mut self, event: ApplicationEvent) {
         if self.filter.matches(&event) {
             match self.tx.try_send(event.clone()) {
-                Ok(()) => {}
+                Ok(()) => {
+                    self.sent_since_flush += 1;
+                }
                 Err(TrySendError::Full(_)) => {
                     if is_critical(&event) {
                         self.critical_drops += 1;
@@ -257,11 +310,11 @@ impl EventBus {
             id,
             filter,
             tx,
-            pending_output: HashMap::new(),
             critical_drops: 0,
             dropped_non_critical: 0,
             stalled_flushes: 0,
             last_q_before: 0,
+            sent_since_flush: 0,
             disconnected: false,
         });
         (id, rx)
@@ -294,62 +347,50 @@ impl EventBus {
             .collect()
     }
 
-    /// Publishes one event to every matching subscriber (never blocks).
-    /// Output events are coalesced; critical events that cannot enqueue are
-    /// counted and eventually disconnect the subscriber.
+    /// Publishes one event to every matching subscriber, immediately and in
+    /// call order (never blocks). Every event is delivered individually —
+    /// see [`DeliverySemantics`]; nothing is coalesced or deferred here.
+    /// `Lossless` events that cannot enqueue are counted and eventually
+    /// disconnect the subscriber (`flush`); `Coalescible` events that
+    /// cannot enqueue are counted and simply dropped.
     pub fn publish(&self, event: ApplicationEvent) {
         let mut subs = self.subscribers.lock().unwrap();
         for sub in subs.iter_mut() {
-            if !sub.filter.matches(&event) {
-                continue;
-            }
-            // Output events: keep the latest per execution in the coalesce
-            // slot and deliver on the next flush — a burst of output from
-            // one agent becomes one subscriber message.
-            if let ApplicationEvent::AgentEvent {
-                event: AgentEvent::Output { .. },
-                execution_id,
-            } = &event
-            {
-                sub.pending_output
-                    .insert(execution_id.clone(), event.clone());
-                continue;
-            }
             sub.try_enqueue(event.clone());
         }
     }
 
-    /// Flushes coalesced output into subscriber queues; applies the
-    /// slow-client policy: subscribers that repeatedly failed to enqueue
-    /// critical events — that dropped too many coalesced output batches in
-    /// a row, or whose queue stayed non-empty across many flushes (receiver
-    /// blocked, e.g. IPC write wedged on a full socket) — are disconnected
-    /// (their receivers close).
+    /// Applies the slow-client policy: subscribers that repeatedly failed
+    /// to enqueue lossless events — that dropped too many coalescible
+    /// events in a row, or whose queue stayed non-empty across many
+    /// flushes (receiver blocked, e.g. IPC write wedged on a full socket)
+    /// — are disconnected (their receivers close). `publish` already
+    /// delivers everything immediately, so this call does not itself move
+    /// any events; it only evaluates and applies that policy.
     ///
-    /// The engine calls this once per drain frame (no per-event latency on
-    /// the IPC path beyond the frame tick).
+    /// The engine calls this once per drain frame.
     pub fn flush(&self) -> usize {
         let mut subs = self.subscribers.lock().unwrap();
         let mut removed: Vec<usize> = Vec::new();
         for (i, sub) in subs.iter_mut().enumerate() {
-            // Stall detection: the receiver's queue depth at the start of
-            // the flush, before this frame's coalesced output is enqueued.
-            // A wedged writer (IPC blocked on a full socket) leaves the
-            // depth frozen at the same non-zero value across flushes; a
-            // healthy subscriber's queue is empty (drained between frames)
-            // or visibly changing, which resets the counter.
+            // Stall detection: the queue depth is unchanged since the last
+            // flush *and* nothing new was even successfully enqueued in
+            // that window — so the receiver read exactly zero events over
+            // an entire flush interval despite there being a backlog to
+            // read. A wedged writer (IPC blocked on a full socket) shows
+            // this every flush, indefinitely. A subscriber that's merely
+            // between publishes (nothing new to send) also has
+            // `sent_since_flush == 0`, but then `q_before` is whatever it
+            // already drained down to — the two conditions only coincide,
+            // flush after flush, for a receiver that truly never reads.
             let q_before = sub.tx.len();
-            let outputs: Vec<ApplicationEvent> =
-                sub.pending_output.drain().map(|(_, e)| e).collect();
-            for ev in outputs {
-                sub.try_enqueue(ev);
-            }
-            if q_before > 0 && q_before == sub.last_q_before {
+            if q_before > 0 && q_before == sub.last_q_before && sub.sent_since_flush == 0 {
                 sub.stalled_flushes += 1;
             } else {
                 sub.stalled_flushes = 0;
             }
             sub.last_q_before = q_before;
+            sub.sent_since_flush = 0;
             if sub.critical_drops >= MAX_CRITICAL_DROPS
                 || sub.dropped_non_critical >= MAX_DROPPED_OUTPUT_BATCHES
                 || sub.stalled_flushes >= MAX_STALLED_FLUSHES
@@ -380,7 +421,7 @@ pub struct Subscription {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use terminal_session::execution::AgentState;
+    use terminal_session::execution::{AgentState, ExecutionId};
 
     fn state_event(eid: &ExecutionId) -> ApplicationEvent {
         ApplicationEvent::AgentEvent {
@@ -407,7 +448,11 @@ mod tests {
     }
 
     #[test]
-    fn output_events_coalesce_per_execution() {
+    fn output_events_are_lossless_and_ordered() {
+        // Regression test for the confirmed bug (docs/ci-forensics.md,
+        // ADR 0021): Output used to be coalesced — only the latest per
+        // execution survived a flush. It must now be delivered
+        // individually, in publish order, with none lost.
         let mut bus = EventBus::new();
         let (_, rx) = bus.subscribe(EventFilter::all());
         let eid = ExecutionId::new();
@@ -420,20 +465,18 @@ mod tests {
             });
         }
         bus.flush();
-        let mut got = 0;
-        let mut last_text = String::new();
+        let mut got = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            got += 1;
             if let ApplicationEvent::AgentEvent {
                 event: AgentEvent::Output { text },
                 ..
             } = ev
             {
-                last_text = text;
+                got.push(text);
             }
         }
-        assert_eq!(got, 1, "100 output events must coalesce into one");
-        assert_eq!(last_text, "line 99");
+        let expected: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+        assert_eq!(got, expected, "every output event must survive, in order");
     }
 
     #[test]
@@ -472,9 +515,10 @@ mod tests {
                 text: "line".into(),
             },
         });
+        // publish() already enqueued it; this flush only establishes the
+        // stall-detection baseline (`last_q_before`).
         bus.flush();
-        bus.flush();
-        assert_eq!(bus.subscriber_count(), 1, "one flush enqueues the output");
+        assert_eq!(bus.subscriber_count(), 1, "publish already enqueued it");
         for _ in 0..MAX_STALLED_FLUSHES - 1 {
             bus.flush();
             assert_eq!(
