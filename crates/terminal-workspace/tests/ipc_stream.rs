@@ -65,7 +65,7 @@ fn collect_until_exit(
                 let ApplicationEvent::AgentEvent {
                     execution_id,
                     event,
-                } = event
+                } = *event
                 else {
                     continue;
                 };

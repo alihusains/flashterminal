@@ -233,6 +233,96 @@ pub enum Request {
     SetWorktreeBudget {
         max_worktrees: usize,
     },
+    // --- Phase 3D: collaboration surface (3d.md §3–§22, §44–§45) ---
+    ArtifactList,
+    ArtifactGet {
+        artifact_id: String,
+    },
+    ArtifactPayload {
+        artifact_id: String,
+    },
+    ArtifactLineage,
+    /// Select artifacts by producing task (deterministic, bounded).
+    ArtifactSelect {
+        task_id: Option<TaskId>,
+        max_results: usize,
+    },
+    /// Record a reviewer's report; returns the aggregated consensus.
+    TaskAddReviewReport {
+        task_id: TaskId,
+        report: terminal_session::collaboration::ReviewReport,
+    },
+    TaskReviewConsensus {
+        task_id: TaskId,
+    },
+    /// §14–§15 deterministic synthesis over explicitly selected inputs.
+    Synthesize {
+        task_ids: Vec<TaskId>,
+        artifact_ids: Vec<String>,
+    },
+    /// §44 structured replan signals.
+    ReplanSignals,
+    /// §45 human replan — new plan requires approval (never silent).
+    Replan {
+        goal: String,
+    },
+    // --- Phase 3E (3e.md §40–§41) ---
+    /// All replan proposals awaiting human decision.
+    ReplanList,
+    /// One proposal (full plan + version + diff).
+    ReplanInspect {
+        replan_id: String,
+    },
+    /// Approve a replan — the only path that applies it.
+    ReplanApprove {
+        replan_id: String,
+    },
+    /// Reject a replan — original workflow intact.
+    ReplanReject {
+        replan_id: String,
+        reason: String,
+    },
+    /// Edit a proposed replan (revalidation follows).
+    ReplanEdit {
+        replan_id: String,
+        changes: Vec<terminal_session::planning::PlanEditChange>,
+    },
+    /// Immutable plan version history (v1 → v2 → v3).
+    WorkflowHistory {
+        workflow_id: String,
+    },
+    /// Human intervention records (escalations + invalidations).
+    WorkflowInterventions {
+        workflow_id: String,
+    },
+    /// Explicit task invalidation (human-gated).
+    InvalidateTask {
+        task_id: TaskId,
+        reason: String,
+        evidence: Vec<String>,
+        approved: bool,
+    },
+    /// Explicit artifact invalidation (record preserved).
+    InvalidateArtifact {
+        artifact_id: String,
+        reason: String,
+        evidence: Vec<String>,
+    },
+    /// Replan limits + autonomy policy + metrics (§24, §31, §34).
+    AdaptiveStatus,
+    // --- Phase 3F (3f.md §32–§34): global workflow controls + audit ---
+    /// §32 STOP ALL — stops every agent session + cancels active tasks;
+    /// human-pending decisions are preserved.
+    StopAll,
+    /// §33 PAUSE ALL — blocks new work from starting (scheduler spawns,
+    /// manual agent spawns, replans) while preserving current state.
+    PauseAll,
+    /// §33 RESUME ALL — lifts the pause.
+    ResumeAll,
+    /// §34 live workflow state summary (counts + estimated cost).
+    WorkflowSummary,
+    /// §31 every object that currently needs a human decision.
+    AttentionItems,
 }
 
 /// Application → client responses.
@@ -330,6 +420,64 @@ pub enum Response {
     WorktreeBudget {
         budget: terminal_session::worktrees::WorktreeBudget,
     },
+    // --- Phase 3D responses (metadata only, never payloads in events) ---
+    Artifacts {
+        artifacts: Vec<terminal_session::artifacts::ArtifactRecord>,
+    },
+    Artifact {
+        artifact: Option<terminal_session::artifacts::ArtifactRecord>,
+    },
+    ArtifactPayload {
+        artifact_id: String,
+        payload: Option<Vec<u8>>,
+    },
+    ArtifactLineage {
+        lineage: terminal_session::artifacts::ArtifactLineage,
+    },
+    ReviewConsensus {
+        aggregation: Option<terminal_session::collaboration::ReviewAggregation>,
+    },
+    Synthesis {
+        result: terminal_session::collaboration::SynthesisResult,
+    },
+    ReplanSignals {
+        signals: Vec<(String, String, u64)>,
+    },
+    // --- Phase 3E responses (§40–§41) ---
+    // Boxed: ProposedReplan/PlanVersion carry full plan snapshots and the
+    // IPC enum must stay small (clippy `large_enum_variant`).
+    ReplanList {
+        proposals: Vec<Box<terminal_session::adaptive::ProposedReplan>>,
+    },
+    ReplanInspect {
+        proposal: Option<Box<terminal_session::adaptive::ProposedReplan>>,
+        version: Option<Box<terminal_session::adaptive::PlanVersion>>,
+    },
+    WorkflowHistory {
+        versions: Vec<Box<terminal_session::adaptive::PlanVersion>>,
+    },
+    WorkflowInterventions {
+        escalations: Vec<terminal_session::adaptive::HumanEscalation>,
+        task_invalidations: Vec<terminal_session::adaptive::TaskInvalidation>,
+        artifact_invalidations: Vec<terminal_session::adaptive::ArtifactInvalidation>,
+    },
+    AdaptiveStatus {
+        limits: terminal_session::adaptive::ReplanLimits,
+        limit_reached: bool,
+        autonomy: terminal_session::adaptive::AutonomyPolicy,
+        metrics: terminal_session::adaptive::ReplanMetrics,
+        quality: terminal_session::adaptive::PlannerQualityMetrics,
+    },
+    // --- Phase 3F (3f.md §32–§34): global workflow controls + audit ---
+    StopAll {
+        report: crate::engine::StopAllReport,
+    },
+    WorkflowSummary {
+        summary: crate::engine::WorkflowSummary,
+    },
+    AttentionItems {
+        items: crate::engine::AttentionItems,
+    },
     Err {
         message: String,
     },
@@ -409,9 +557,10 @@ pub enum Event {
         pane_id: PaneId,
     },
     /// A raw application-bus event (Phase 2B.1 §24–27). All payloads are
-    /// redacted at the source — the bus never carries credentials.
+    /// redacted at the source — the bus never carries credentials. Boxed
+    /// to keep the IPC enum small (clippy `large_enum_variant`).
     Application {
-        event: ApplicationEvent,
+        event: Box<ApplicationEvent>,
     },
 }
 
@@ -957,6 +1106,155 @@ pub fn handle(engine: &mut crate::engine::Multiplexer, req: Request) -> Response
                 message: "worktree budget updated".into(),
             }
         }
+        Request::ArtifactList => Response::Artifacts {
+            artifacts: engine.artifact_list(),
+        },
+        Request::ArtifactGet { artifact_id } => Response::Artifact {
+            artifact: engine.artifact_get(&artifact_id),
+        },
+        Request::ArtifactPayload { artifact_id } => Response::ArtifactPayload {
+            artifact_id: artifact_id.clone(),
+            payload: engine.artifact_payload(&artifact_id),
+        },
+        Request::ArtifactLineage => Response::ArtifactLineage {
+            lineage: engine.artifact_lineage(),
+        },
+        Request::ArtifactSelect {
+            task_id,
+            max_results,
+        } => Response::Artifacts {
+            artifacts: engine.artifact_select(&terminal_session::artifacts::ArtifactSelector {
+                task_id,
+                max_results,
+                ..Default::default()
+            }),
+        },
+        Request::TaskAddReviewReport { task_id, report } => {
+            let aggregation = engine.record_review_report(&task_id, &report);
+            Response::ReviewConsensus {
+                aggregation: Some(aggregation),
+            }
+        }
+        Request::TaskReviewConsensus { task_id } => Response::ReviewConsensus {
+            aggregation: engine.task_review_consensus(&task_id),
+        },
+        Request::Synthesize {
+            task_ids,
+            artifact_ids,
+        } => match engine.synthesize(None, None, &task_ids, &artifact_ids) {
+            Ok(result) => Response::Synthesis { result },
+            Err(e) => Response::err(e),
+        },
+        Request::ReplanSignals => Response::ReplanSignals {
+            signals: engine.replan_signals(),
+        },
+        Request::Replan { goal } => match engine.replan_workflow(&goal) {
+            Ok(_id) => Response::Ok {
+                message: "replan requested — new plan awaits approval".into(),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::ReplanList => Response::ReplanList {
+            proposals: engine.replan_list().into_iter().map(Box::new).collect(),
+        },
+        Request::ReplanInspect { replan_id } => {
+            let proposal = engine.replan_get(&replan_id).map(Box::new);
+            let version = engine
+                .workflow_history()
+                .into_iter()
+                .rev()
+                .find(|v| v.plan_id == proposal.as_ref().map(|p| p.id.clone()).unwrap_or_default())
+                .or_else(|| engine.workflow_history().last().cloned())
+                .map(Box::new);
+            Response::ReplanInspect { proposal, version }
+        }
+        Request::ReplanApprove { replan_id } => match engine.replan_approve(&replan_id) {
+            Ok(()) => Response::Ok {
+                message: "replan approved — awaiting execution".into(),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::ReplanReject { replan_id, reason } => {
+            match engine.replan_reject(&replan_id, &reason) {
+                Ok(()) => Response::Ok {
+                    message: "replan rejected — original workflow intact".into(),
+                },
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::ReplanEdit { replan_id, changes } => {
+            match engine.replan_edit(&replan_id, &changes) {
+                Ok(()) => Response::Ok {
+                    message: "replan edited — re-validated".into(),
+                },
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::WorkflowHistory { .. } => Response::WorkflowHistory {
+            versions: engine
+                .workflow_history()
+                .into_iter()
+                .map(Box::new)
+                .collect(),
+        },
+        Request::WorkflowInterventions { .. } => Response::WorkflowInterventions {
+            escalations: engine.workflow_interventions(),
+            task_invalidations: engine.task_invalidations(),
+            artifact_invalidations: engine.artifact_invalidations(),
+        },
+        Request::InvalidateTask {
+            task_id,
+            reason,
+            evidence,
+            approved,
+        } => match engine.invalidate_task(&task_id, &reason, evidence, approved) {
+            Ok(_) => Response::Ok {
+                message: format!("task {task_id} invalidated"),
+            },
+            Err(e) => Response::err(e),
+        },
+        Request::InvalidateArtifact {
+            artifact_id,
+            reason,
+            evidence,
+        } => match engine.invalidate_artifact(&artifact_id, &reason, evidence) {
+            Ok(()) => Response::Ok {
+                message: format!("artifact {artifact_id} invalidated (preserved)"),
+            },
+            Err(e) => Response::err(e),
+        },
+        Request::AdaptiveStatus => {
+            let (limits, limit_reached) = engine.replan_limits();
+            Response::AdaptiveStatus {
+                limits,
+                limit_reached,
+                autonomy: engine.autonomy_policy(),
+                metrics: engine.replan_metrics(),
+                quality: engine.planner_quality_metrics(),
+            }
+        }
+        // --- Phase 3F (3f.md §32–§34) ---
+        Request::StopAll => Response::StopAll {
+            report: engine.stop_all(),
+        },
+        Request::PauseAll => {
+            engine.set_workflow_paused(true);
+            Response::Ok {
+                message: "workflow paused — no new work starts".into(),
+            }
+        }
+        Request::ResumeAll => {
+            engine.set_workflow_paused(false);
+            Response::Ok {
+                message: "workflow resumed".into(),
+            }
+        }
+        Request::WorkflowSummary => Response::WorkflowSummary {
+            summary: engine.workflow_summary(),
+        },
+        Request::AttentionItems => Response::AttentionItems {
+            items: engine.attention_items(),
+        },
     }
 }
 
@@ -1007,9 +1305,10 @@ pub fn serve(
                             loop {
                                 match rx.recv_timeout(std::time::Duration::from_millis(250)) {
                                     Ok(event) => {
-                                        let frame =
-                                            serde_json::to_vec(&Event::Application { event })
-                                                .unwrap_or_default();
+                                        let frame = serde_json::to_vec(&Event::Application {
+                                            event: Box::new(event),
+                                        })
+                                        .unwrap_or_default();
                                         if write_msg(&mut stream, &frame).is_err() {
                                             break;
                                         }
@@ -1266,6 +1565,70 @@ mod tests {
         // Cleanup over an empty manager reports success.
         let cleanup = roundtrip(&path, &Request::WorktreeCleanup).unwrap();
         assert!(matches!(cleanup, Response::Ok { .. }));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phase 3F (§32–§34): STOP ALL / PAUSE ALL / RESUME ALL / workflow
+    /// summary / attention items round-trip over the socket. No agents are
+    /// running, so stop-all reports an empty but well-formed report.
+    #[test]
+    fn socket_phase3f_controls_and_audit() {
+        let engine = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::engine::Multiplexer::new().unwrap(),
+        ));
+        let path = std::env::temp_dir().join(format!("ft-ipc-3f-{}.sock", std::process::id()));
+        serve(engine, &path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // §34 summary: empty workflow, not paused.
+        let summary = roundtrip(&path, &Request::WorkflowSummary).unwrap();
+        match &summary {
+            Response::WorkflowSummary { summary } => {
+                assert_eq!(summary.workflows, 0);
+                assert_eq!(summary.running, 0);
+                assert!(!summary.paused);
+            }
+            _ => panic!("expected workflow summary response"),
+        }
+
+        // §31 attention: nothing needs a human yet.
+        let attention = roundtrip(&path, &Request::AttentionItems).unwrap();
+        match &attention {
+            Response::AttentionItems { items } => {
+                assert!(items.agents.is_empty());
+                assert!(items.review_tasks.is_empty());
+                assert!(items.replans.is_empty());
+                assert_eq!(items.total, 0);
+            }
+            _ => panic!("expected attention items response"),
+        }
+
+        // §33 pause → resume — the gate flips and the summary reports it.
+        let pause = roundtrip(&path, &Request::PauseAll).unwrap();
+        assert!(matches!(pause, Response::Ok { .. }));
+        let summary = roundtrip(&path, &Request::WorkflowSummary).unwrap();
+        assert!(matches!(
+            summary,
+            Response::WorkflowSummary { summary } if summary.paused
+        ));
+        let resume = roundtrip(&path, &Request::ResumeAll).unwrap();
+        assert!(matches!(resume, Response::Ok { .. }));
+        let summary = roundtrip(&path, &Request::WorkflowSummary).unwrap();
+        assert!(matches!(
+            summary,
+            Response::WorkflowSummary { summary } if !summary.paused
+        ));
+
+        // §32 stop-all with nothing running: well-formed empty report.
+        let stop = roundtrip(&path, &Request::StopAll).unwrap();
+        match &stop {
+            Response::StopAll { report } => {
+                assert_eq!(report.agents_stopped, 0);
+                assert_eq!(report.tasks_stopped, 0);
+                assert_eq!(report.preserved_decisions, 0);
+            }
+            _ => panic!("expected stop all response"),
+        }
         let _ = std::fs::remove_file(&path);
     }
 }

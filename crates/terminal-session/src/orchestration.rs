@@ -191,6 +191,21 @@ pub struct Artifact {
     pub created_by_task: Option<TaskId>,
     #[serde(default)]
     pub metadata: Vec<(String, String)>,
+    // --- Phase 3D (3d.md §4): artifact identity + provenance. Every field
+    // is engine-stamped (never agent-controlled) and secret-free (§35). ---
+    /// The agent definition that produced this artifact.
+    #[serde(default)]
+    pub created_by_agent: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    /// Producer worktree path (for repository artifacts).
+    #[serde(default)]
+    pub worktree: Option<String>,
+    /// Revision (commit) the artifact was produced at.
+    #[serde(default)]
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub created_at_ms: u64,
 }
 
 pub fn new_artifact_id() -> String {
@@ -308,6 +323,9 @@ pub enum TaskErrorKind {
     AuthenticationFailure,
     PermissionFailure,
     BudgetExceeded,
+    /// Phase 3D §9: a declared input artifact is unavailable — the task is
+    /// Blocked until a human resolves it (retry/replan).
+    ArtifactMissing,
     MissingAgentDefinition,
     Unknown,
 }
@@ -377,6 +395,17 @@ pub struct TaskResult {
     /// (clippy::large_enum_variant).
     #[serde(default)]
     pub diff_summary: Option<Box<DiffSummary>>,
+    // --- Phase 3D (3d.md §13): structured results. Deterministic where
+    // possible; never requires an LLM to produce them. ---
+    /// Bounded key/value metrics (e.g. tests passed, duration).
+    #[serde(default)]
+    pub metrics: Vec<(String, String)>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+    #[serde(default)]
+    pub recommendations: Vec<String>,
 }
 
 impl TaskResult {
@@ -405,6 +434,10 @@ impl Default for TaskResult {
             branch: None,
             worktree: None,
             diff_summary: None,
+            metrics: Vec::new(),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+            recommendations: Vec::new(),
         }
     }
 }
@@ -947,11 +980,38 @@ impl TaskGraph {
         out
     }
 
-    fn producer_of(&self, artifact_id: &str) -> Option<TaskId> {
+    pub fn producer_of(&self, artifact_id: &str) -> Option<TaskId> {
         self.tasks
             .iter()
             .find(|t| t.output_artifacts.iter().any(|a| a.id == artifact_id))
             .map(|t| t.id.clone())
+    }
+
+    /// True when `task` (transitively) depends on `dep` — the access grant
+    /// for artifact consumption (3d.md §40: dependency grants access).
+    pub fn is_dependency(&self, task: &TaskId, dep: &TaskId) -> bool {
+        if task == dep {
+            return false;
+        }
+        // Walk the dependency edges forward from `task`; reaching `dep`
+        // proves the transitive relationship.
+        let mut stack: Vec<TaskId> = vec![task.clone()];
+        let mut seen: std::collections::HashSet<TaskId> = std::collections::HashSet::new();
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            let Some(&idx) = self.index.get(&current) else {
+                continue;
+            };
+            for d in &self.tasks[idx].dependencies {
+                if d == dep {
+                    return true;
+                }
+                stack.push(d.clone());
+            }
+        }
+        false
     }
 }
 
@@ -1060,6 +1120,10 @@ impl Default for TaskPolicy {
 pub struct SchedulerView {
     /// Only tasks the scheduler considers Running appear here.
     pub running: HashMap<TaskId, RuntimeAgentView>,
+    /// Phase 3D §9: tasks whose declared input artifacts are unavailable
+    /// (task id → reason). Populated by the engine from the artifact
+    /// store; the scheduler blocks such tasks instead of starting them.
+    pub artifact_blocked: HashMap<TaskId, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1068,6 +1132,19 @@ pub struct RuntimeAgentView {
     pub exit_code: Option<i32>,
     pub work: Option<AgentWork>,
     pub estimated_cost_cents: Option<u64>,
+    /// True when the underlying process has exited (reader thread observed
+    /// EOF). The pump thread transitions `state` to a terminal state on its
+    /// own schedule, so `exited == true` with a non-terminal `state` means
+    /// the transition is still in flight (3a §48 determinism).
+    pub exited: bool,
+}
+
+/// True for states the scheduler treats as settled terminal outcomes.
+fn is_terminal_state(state: AgentState) -> bool {
+    matches!(
+        state,
+        AgentState::Completed | AgentState::Failed | AgentState::Crashed | AgentState::Stopped
+    )
 }
 
 /// Deterministic commands the scheduler issues; the engine executes them
@@ -1218,6 +1295,11 @@ pub struct TaskScheduler {
     /// Event outbox — drained by the engine each tick.
     #[serde(skip)]
     outbox: Vec<TaskEvent>,
+    /// When the settle-deferral first became active (3a §48 determinism),
+    /// bounding how long terminal transitions wait on a still-`Starting`
+    /// sibling. None while no deferral is in flight.
+    #[serde(skip)]
+    defer_since_ms: Option<u64>,
 }
 
 impl TaskScheduler {
@@ -1235,6 +1317,7 @@ impl TaskScheduler {
             actual_cost_cents: 0,
             trace: Vec::new(),
             outbox: Vec::new(),
+            defer_since_ms: None,
         }
     }
 
@@ -1312,12 +1395,16 @@ impl TaskScheduler {
         if status != TaskStatus::Pending && status != TaskStatus::Blocked {
             return;
         }
-        // Budget-blocked tasks stay blocked until a human retries (§37).
+        // Budget-blocked and artifact-blocked tasks stay blocked until a
+        // human resolves them (§37, 3d.md §9 — never silently continued).
         if status == TaskStatus::Blocked
             && task
                 .error
                 .as_ref()
-                .map(|e| e.kind == TaskErrorKind::BudgetExceeded)
+                .map(|e| {
+                    e.kind == TaskErrorKind::BudgetExceeded
+                        || e.kind == TaskErrorKind::ArtifactMissing
+                })
                 .unwrap_or(false)
         {
             return;
@@ -1358,12 +1445,20 @@ impl TaskScheduler {
     /// 2. re-classifies Pending/Blocked tasks;
     /// 3. starts queued tasks up to `max_parallel_tasks` ∩ `max_agents`,
     ///    gated by the cost budget.
-    pub fn step(&mut self, view: &SchedulerView) -> Vec<SchedulerCommand> {
+    ///
+    /// `allow_spawns == false` (Phase 3F §33 PAUSE ALL) runs the observations
+    /// and classification but returns no spawn commands: queued tasks stay
+    /// Ready inside the queue — no optimistic Running transition, no attempt
+    /// or budget accounting — and Resume simply runs them.
+    pub fn step(&mut self, view: &SchedulerView, allow_spawns: bool) -> Vec<SchedulerCommand> {
         let mut cmds = Vec::new();
         self.observe_running(view);
         let ids: Vec<TaskId> = self.graph.list_task_ids();
         for id in ids {
             self.classify_pending(&id);
+        }
+        if !allow_spawns {
+            return cmds;
         }
         while self.running.len()
             + cmds
@@ -1398,6 +1493,26 @@ impl TaskScheduler {
                     continue;
                 }
             }
+            // Phase 3D §9: artifact readiness — a task with a declared
+            // input artifact that is unavailable is Blocked, never silently
+            // continued. The engine stamps `artifact_blocked` from the
+            // artifact store; the scheduler enforces it (§8–§9).
+            if let Some(reason) = view.artifact_blocked.get(&id) {
+                if let Some(task) = self.graph.get_task_mut(&id) {
+                    if task.transition(TaskStatus::Blocked).is_ok() {
+                        task.error = Some(TaskError::new(
+                            TaskErrorKind::ArtifactMissing,
+                            FailureClass::TaskFailure,
+                            reason.clone(),
+                        ));
+                        self.emit(TaskEvent::TaskBlocked {
+                            task_id: id.clone(),
+                            reason: reason.clone(),
+                        });
+                    }
+                }
+                continue;
+            }
             let Some(task) = self.graph.get_task_mut(&id) else {
                 continue;
             };
@@ -1417,8 +1532,68 @@ impl TaskScheduler {
         cmds
     }
 
+    /// How long terminal transitions wait for a co-started sibling that is
+    /// still `Starting` (spawned but its process not yet observed exiting)
+    /// before settling anyway. Generous vs. the ~25ms fork/exec jitter seen
+    /// under load, but bounded so a genuinely slow-starting task can never
+    /// stall completions indefinitely.
+    const DEFER_SETTLE_BOUND_MS: u64 = 100;
+
     fn observe_running(&mut self, view: &SchedulerView) {
         let running = std::mem::take(&mut self.running);
+        let now = now_ms();
+        // 3a §48 determinism: two agents whose processes die in the same
+        // instant can be observed in *different* engine frames — the reader
+        // thread observes EOF on its own schedule and the pump thread
+        // transitions the agent state on its own schedule, both of which
+        // under load can lag a frame behind the actual exit — flipping the
+        // schedule trace run-to-run. Defer ALL terminal transitions this
+        // frame so near-simultaneous exits settle together, deterministically.
+        // Two sub-cases:
+        //   1. a task has exited (reader EOF *or* authoritative `try_wait`)
+        //      but its pump state hasn't settled yet — the process is gone,
+        //      so the pump settles within a frame;
+        //   2. a task is freshly spawned (`Created`/`Starting`, not yet
+        //      exited) while another running task is terminal-ready — under
+        //      load the sibling's fork/exec can delay its exit by a frame,
+        //      so hold for [`DEFER_SETTLE_BOUND_MS`] before settling.
+        let any_exited_unsettled = running.iter().any(|(task_id, _)| {
+            view.running
+                .get(task_id)
+                .map(|a| a.exited && !is_terminal_state(a.state))
+                .unwrap_or(false)
+        });
+        let any_starting_unexited = running.iter().any(|(task_id, _)| {
+            view.running
+                .get(task_id)
+                .map(|a| !a.exited && matches!(a.state, AgentState::Created | AgentState::Starting))
+                .unwrap_or(false)
+        });
+        let any_terminal_ready = running.iter().any(|(task_id, _)| {
+            view.running
+                .get(task_id)
+                .map(|a| is_terminal_state(a.state))
+                .unwrap_or(false)
+        });
+        let defer = if any_exited_unsettled {
+            true
+        } else if any_starting_unexited && any_terminal_ready {
+            // Bounded: only while the co-started sibling is still within
+            // the settle window; a sibling that stays `Starting` (e.g. a
+            // long-running silent process) must not stall completions.
+            match self.defer_since_ms {
+                Some(t) => now.saturating_sub(t) < Self::DEFER_SETTLE_BOUND_MS,
+                None => true,
+            }
+        } else {
+            false
+        };
+        if defer {
+            self.defer_since_ms.get_or_insert(now);
+            self.running.extend(running);
+            return;
+        }
+        self.defer_since_ms = None;
         for (task_id, eid) in running {
             let Some(agent) = view.running.get(&task_id) else {
                 // Session vanished underneath us — honest failure, never a
@@ -1513,6 +1688,11 @@ impl TaskScheduler {
                     description: "observed change".to_string(),
                     created_by_task: Some(task_id.clone()),
                     metadata: vec![("auto".to_string(), "true".to_string())],
+                    created_by_agent: Some(task.assigned_agent.clone()),
+                    workspace_id: Some(task.workspace_id.clone()),
+                    worktree: task.worktree_id.clone(),
+                    revision: task.result.as_ref().and_then(|r| r.result_revision.clone()),
+                    created_at_ms: now_ms(),
                 };
                 artifacts.push(art.clone());
                 task.output_artifacts.push(art.clone());
@@ -1549,6 +1729,21 @@ impl TaskScheduler {
                 branch: None,
                 worktree: None,
                 diff_summary: None,
+                // Phase 3D §13: structured fields — deterministic, bounded.
+                // `metrics` carries observed counts; warnings/errors/
+                // recommendations are populated by reviewers/synthesis or
+                // left empty (never LLM-generated summaries).
+                metrics: vec![
+                    ("attempts".to_string(), task.attempt_count.to_string()),
+                    (
+                        "files_changed".to_string(),
+                        work.files_changed.len().to_string(),
+                    ),
+                    ("commands_run".to_string(), work.commands.len().to_string()),
+                ],
+                warnings: Vec::new(),
+                errors: Vec::new(),
+                recommendations: Vec::new(),
             };
             task.result = Some(result.clone());
             (needs_review, result, artifact_events)
@@ -1821,11 +2016,30 @@ impl TaskScheduler {
 
     /// §52 persistence export — versioned, bounded, no secrets. Live queue /
     /// running state is never persisted; `import_persisted` rebuilds it
-    /// deterministically.
+    /// deterministically. Arguments and environment values are redacted on
+    /// the exported copy (§35): registered secrets never reach disk, while
+    /// live records keep their original arguments for retry fidelity
+    /// (mirrors `AgentLaunchConfig::redact`).
     pub fn export_persisted(&self) -> PersistedSchedulerState {
+        let mut graph = self.graph.clone();
+        for id in graph.list_task_ids() {
+            let Some(task) = graph.get_task_mut(&id) else {
+                continue;
+            };
+            task.arguments = task
+                .arguments
+                .iter()
+                .map(|a| crate::redact::Redactor::redact(a))
+                .collect();
+            task.environment = task
+                .environment
+                .iter()
+                .map(|(k, v)| (k.clone(), crate::redact::Redactor::redact(v)))
+                .collect();
+        }
         PersistedSchedulerState {
             version: PERSISTED_SCHEDULER_VERSION,
-            graph: self.graph.clone(),
+            graph,
             policy: self.policy.clone(),
             actual_cost_cents: self.actual_cost_cents,
         }

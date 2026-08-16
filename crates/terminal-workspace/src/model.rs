@@ -139,4 +139,31 @@ pub struct PersistedState {
     /// through the scheduler's task ids (§50).
     #[serde(default)]
     pub worktrees: Option<Vec<terminal_session::worktrees::WorktreeRecord>>,
+    /// Phase 3D §35: artifact metadata (never payloads — payloads are
+    /// re-read from the producer worktrees on demand). Survives restarts.
+    #[serde(default)]
+    pub artifacts: Option<Vec<terminal_session::artifacts::ArtifactRecord>>,
+    /// Phase 3D §35: review reports + replan signals survive restarts.
+    #[serde(default)]
+    pub review_reports: Option<
+        std::collections::HashMap<String, Vec<terminal_session::collaboration::ReviewReport>>,
+    >,
+    #[serde(default)]
+    pub replan_signals: Option<Vec<(String, String, u64)>>,
+    /// Phase 3E §42: adaptive orchestration state — replan signals, plan
+    /// versions + diffs, approvals/rejections, invalidations, escalations,
+    /// limits, policy and metrics. Audit history stays durable.
+    #[serde(default)]
+    pub adaptive: Option<terminal_session::adaptive::PersistedAdaptiveState>,
+    /// Phase 4 §17/§25: the audit trail survives restarts (bounded,
+    /// redacted — never credentials). Restored through
+    /// [`terminal_session::audit::AuditTrail::from_events`].
+    #[serde(default)]
+    pub audit: Option<Vec<terminal_session::audit::AuditEvent>>,
+    /// Phase 4 §13/§15/§25: persisted policy — autonomy level, filesystem
+    /// scope, network/secret/budget policy, budget ledger and pending
+    /// approvals (approved actions re-verify identity/hash/expiry at honor
+    /// time; a pending approval is never auto-executed after restart).
+    #[serde(default)]
+    pub policy: Option<terminal_session::policy::PersistedPolicyState>,
 }

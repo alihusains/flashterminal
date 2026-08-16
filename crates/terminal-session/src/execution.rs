@@ -120,6 +120,115 @@ pub enum ApplicationEvent {
     PlannerEvent {
         event: crate::planning::PlannerEvent,
     },
+    // --- Phase 3D (3d.md §28): collaboration events. Metadata only —
+    // large payloads never ride the event bus (§27). ---
+    /// An artifact was registered in the artifact store.
+    ArtifactCreated {
+        artifact_id: String,
+        task_id: Option<String>,
+        kind: String,
+        description: String,
+    },
+    /// A review finding was recorded.
+    ReviewFindingCreated {
+        finding: crate::collaboration::ReviewFinding,
+    },
+    /// Deterministic synthesis started.
+    SynthesisStarted {
+        synthesis_id: String,
+        task_ids: Vec<String>,
+    },
+    /// Synthesis completed (metadata + result, never private reasoning).
+    /// Boxed: `SynthesisResult` is the largest Phase 3D payload and the
+    /// event enum must stay small (clippy `large_enum_variant`).
+    SynthesisCompleted {
+        result: Box<crate::collaboration::SynthesisResult>,
+    },
+    /// A task consumed an artifact from a dependency.
+    ArtifactConsumed {
+        task_id: String,
+        artifact_id: String,
+    },
+    /// A workflow needs human replanning (3d.md §44) — a structured
+    /// signal, never an autonomous replan.
+    WorkflowNeedsReplan {
+        workflow_id: String,
+        cause: String,
+        detail: String,
+    },
+    // --- Phase 3E (3e.md §39): adaptive orchestration events. Metadata
+    // only — large payloads never ride the event bus. ---
+    /// A replanning request was raised (signal recorded).
+    ReplanRequested {
+        signal_id: String,
+        workflow_id: String,
+        trigger: String,
+        severity: String,
+    },
+    /// The planner proposed a revised plan (awaits human approval).
+    ReplanProposed {
+        replan_id: String,
+        workflow_id: String,
+        version: u32,
+        reason: String,
+    },
+    /// A human edited the proposed replan (revalidation follows).
+    ReplanEdited {
+        replan_id: String,
+        workflow_id: String,
+        version: u32,
+    },
+    /// A replan was approved and applied to the graph.
+    ReplanApproved {
+        replan_id: String,
+        workflow_id: String,
+        version: u32,
+    },
+    /// A replan was rejected — the original workflow remains intact.
+    ReplanRejected {
+        replan_id: String,
+        workflow_id: String,
+        reason: String,
+    },
+    /// A plan version was superseded by a newer one (v1 → v2).
+    PlanSuperseded {
+        superseded_version: u32,
+        new_version: u32,
+    },
+    /// A completed task was explicitly invalidated (human-approved).
+    TaskInvalidated {
+        task_id: String,
+        reason: String,
+    },
+    /// An artifact was invalidated (old record preserved for lineage).
+    ArtifactInvalidated {
+        artifact_id: String,
+        reason: String,
+    },
+    /// Projected workflow cost approaches/exceeds the budget.
+    BudgetRisk {
+        workflow_id: String,
+        spent_cents: u64,
+        budget_cents: Option<u64>,
+        estimated_remaining_cents: Option<u64>,
+    },
+    /// Automation could not safely continue — human attention required.
+    HumanEscalation {
+        escalation_id: String,
+        workflow_id: String,
+        reason: String,
+    },
+    // --- Phase 3F (§32–§33): global human controls. Metadata only. ---
+    /// STOP ALL was executed (agents stopped, pending execution cancelled,
+    /// state preserved).
+    WorkflowStopped {
+        workflow_id: String,
+    },
+    /// PAUSE ALL / resume — new work blocked / unblocked.
+    WorkflowPaused {
+        paused: bool,
+        workflow_id: String,
+    },
 }
 
 /// Semantic events specific to agent sessions.

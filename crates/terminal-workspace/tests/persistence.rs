@@ -208,3 +208,128 @@ fn launch_redaction_covers_args_and_env() {
         "references survive redaction"
     );
 }
+
+/// Phase 4 §25: a pending approval and the budget ledger survive an
+/// application restart; the persisted state never contains secrets; and a
+/// restored approval is still integrity-bound (identity, hash, expiry).
+#[test]
+fn restart_preserves_pending_approval_and_budget() {
+    use terminal_session::policy::{Action, BudgetDimension, PolicyContext};
+
+    let path = tmp_state("approval-restart");
+    let secret = "sk-ant-SENTINEL_APPROVAL_RESTART_0000";
+
+    let (approval_id, hash) = {
+        let mut m = Multiplexer::new().unwrap();
+        m.ensure_workspace();
+        // Budget ledger is mutated (spent commands) before the crash.
+        m.policy_state_mut()
+            .budget
+            .record(BudgetDimension::CommandCount, 42);
+        // A require-approval action is pending when the app dies.
+        let mut ctx = PolicyContext::new("wf-restart");
+        ctx.agent_id = Some("agent-a".into());
+        let action = Action::Shell(format!("echo {secret} > /tmp/leak"));
+        let hash = terminal_session::policy::action_hash("shell", &["echo *"]);
+        let eval = m.evaluate_action(&action, &ctx);
+        assert_eq!(
+            eval.decision,
+            terminal_session::policy::PolicyDecision::RequireApproval,
+            "shell redirection must require approval"
+        );
+        let id = m.request_policy_approval(&eval, &ctx, &hash);
+        assert_eq!(m.policy_state().approvals.pending_count(), 1);
+        // Persist (as a save/crash would).
+        let state = m.snapshot_state();
+        let file = serde_json::to_string(&state).unwrap();
+        assert!(
+            !file.contains(secret),
+            "pending approval leaked the secret into persisted state"
+        );
+        let _ = persist::save(&state, &path);
+        (id, hash)
+    };
+
+    // "Restart the application": fresh engine restores policy + approvals.
+    let state = persist::load(&path).unwrap();
+    let mut m2 = Multiplexer::new().unwrap();
+    m2.restore(state);
+
+    // Budget survived the restart.
+    assert_eq!(
+        m2.policy_state()
+            .budget
+            .value(BudgetDimension::CommandCount),
+        42,
+        "budget counters must survive restart"
+    );
+    // The pending approval survived as *pending* — never auto-executed.
+    assert_eq!(m2.policy_state().approvals.pending_count(), 1);
+    let audit = m2.audit_trail();
+    assert!(
+        audit
+            .of_kind(terminal_session::audit::AuditEventKind::ApprovalRequested)
+            .iter()
+            .any(|e| e.action.contains("restored after restart")),
+        "restore must surface restored approvals in the audit trail"
+    );
+    // Granting + honoring the restored approval re-verifies integrity.
+    m2.grant_policy_approval(&approval_id, "Ali").unwrap();
+    assert_eq!(m2.policy_state().approvals.pending_count(), 0);
+    m2.policy_state_mut()
+        .approvals
+        .honor(&approval_id, "wf-restart", Some("agent-a"), &hash)
+        .expect("restored approval honors when identity+hash match");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Phase 4 §17: the audit trail survives restarts and keeps answering
+/// "why did FlashTerminal do this?" after an application restart.
+#[test]
+fn restart_preserves_audit_trail() {
+    let path = tmp_state("audit-restart");
+
+    let first_plan = {
+        let mut m = Multiplexer::new().unwrap();
+        m.ensure_workspace();
+        let id = m.audit_kind(
+            terminal_session::audit::AuditEventKind::PlanCreated,
+            "wf-audit",
+            "plan v1: implement oauth",
+            "planner",
+        );
+        m.audit_kind(
+            terminal_session::audit::AuditEventKind::PlanApproved,
+            "wf-audit",
+            "plan v1 approved",
+            "user",
+        );
+        let state = m.snapshot_state();
+        persist::save(&state, &path).unwrap();
+        id
+    };
+
+    let state = persist::load(&path).unwrap();
+    let mut m2 = Multiplexer::new().unwrap();
+    m2.restore(state);
+
+    let events = m2.audit_records();
+    assert!(
+        events.iter().any(|e| e.id == first_plan),
+        "original audit records must survive restart (got {} events)",
+        events.len()
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == terminal_session::audit::AuditEventKind::PlanApproved),
+        "plan-approved record must survive restart"
+    );
+    // The explain surface still works after restart.
+    assert!(
+        m2.audit_explain(&first_plan).is_some(),
+        "audit_explain must work after restart"
+    );
+    let _ = std::fs::remove_file(&path);
+}

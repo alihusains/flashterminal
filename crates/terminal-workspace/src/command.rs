@@ -68,6 +68,19 @@ pub enum Command {
     RejectSelectedTask,
     /// Attaches a live agent pane to the selected task's execution.
     OpenSelectedTaskAgent,
+    // --- Phase 3F: global controls + auditability (3f.md §28–§34) ---
+    /// STOP ALL — stops agents, active workflows and pending execution.
+    StopAll,
+    /// PAUSE ALL — blocks new work from starting, preserves state.
+    PauseAll,
+    /// Resume from PAUSE ALL.
+    ResumeAll,
+    /// Toggles the "NEEDS YOU" right panel (approval center, §31).
+    ToggleApprovalCenter,
+    /// Opens the workflow timeline overlay (audit trail, §28–§30).
+    Timeline,
+    /// Opens the workflow state summary overlay (§34).
+    WorkflowSummary,
 }
 
 /// A key chord: optional modifiers + a printable key name (e.g. "d", "w",
@@ -131,6 +144,12 @@ impl Command {
             Command::ApproveSelectedTask => "Approve Selected Task",
             Command::RejectSelectedTask => "Reject Selected Task",
             Command::OpenSelectedTaskAgent => "Open Selected Task Agent",
+            Command::StopAll => "STOP ALL — stop agents and workflows",
+            Command::PauseAll => "PAUSE ALL — block new work",
+            Command::ResumeAll => "Resume ALL — unblock new work",
+            Command::ToggleApprovalCenter => "Approval Center (NEEDS YOU)",
+            Command::Timeline => "Show Workflow Timeline",
+            Command::WorkflowSummary => "Show Workflow Summary",
         }
     }
 }
@@ -176,6 +195,14 @@ impl KeyChord {
             key: key.to_string(),
         }
     }
+    pub fn ctrl_alt_shift(key: &str) -> Self {
+        Self {
+            ctrl: true,
+            alt: true,
+            shift: true,
+            key: key.to_string(),
+        }
+    }
 }
 
 /// Default Phase 1 bindings (macOS-style: Cmd = ctrl here since winit on
@@ -213,6 +240,14 @@ pub fn default_bindings() -> Vec<(KeyChord, Command)> {
         (KeyChord::ctrl_alt("c"), Command::CancelSelectedTask),
         (KeyChord::ctrl_alt("x"), Command::RetrySelectedTask),
         (KeyChord::ctrl_alt("p"), Command::OpenSelectedTaskAgent),
+        // --- Phase 3F: global controls (§32–§33) + auditability (§28–§34).
+        // ctrl+alt+shift to stay clear of the Phase 2C/3A chords above. ---
+        (KeyChord::ctrl_alt_shift("s"), Command::StopAll),
+        (KeyChord::ctrl_alt_shift("p"), Command::PauseAll),
+        (KeyChord::ctrl_alt_shift("r"), Command::ResumeAll),
+        (KeyChord::ctrl_alt_shift("c"), Command::ToggleApprovalCenter),
+        (KeyChord::ctrl_alt_shift("t"), Command::Timeline),
+        (KeyChord::ctrl_alt_shift("w"), Command::WorkflowSummary),
     ]
 }
 

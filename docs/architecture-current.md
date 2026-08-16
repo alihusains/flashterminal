@@ -1,4 +1,4 @@
-# Current Architecture (Phase 1 + Phase 2 / 2B.1 + Phase 2C)
+# Current Architecture (Phase 1 → Phase 3E)
 
 This document describes the FlashTerminal architecture as implemented at the
 end of Phase 1, updated with the Phase 2 (multi-agent infrastructure),
@@ -232,6 +232,108 @@ completion ──► git-generated DiffSummary + TaskResult provenance
   Docs: `docs/phase3c.md`, `docs/worktrees.md`,
   `docs/execution-environments.md`, `docs/review-and-merge.md`, ADRs
   0012/0013.
+
+## Artifact Collaboration (Phase 3D)
+
+Phase 3D (`artifacts.rs` + `collaboration.rs`) turns the isolated task set
+into an artifact-mediated workflow — no direct agent messaging:
+
+```text
+task ──► agent ──► artifact (engine-stamped, redacted, bounded)
+                      │
+   dependent task ────┘ declares input_artifacts (readiness-gated)
+      │  materialized grant into its own worktree before spawn (§11)
+      ▼
+   independent reviewers ──► deterministic consensus (§20–§21)
+      ▼
+   synthesis over explicitly selected results + artifacts (§14)
+      ▼
+   human approval / replan signal ──► human replan (§44–§45)
+```
+
+- **`ArtifactStore`** (`terminal-session::artifacts`): `artifact://` ids,
+  provenance-stamped `Artifact` (task/agent/workspace/worktree/revision),
+  bounded + redacted payloads, `ArtifactSelector`, `ArtifactLineage`
+  (producers/consumers/task_outputs), `ArtifactAccessPolicy`, retention
+  (default Keep), `ArtifactMaterializer` for cross-worktree handoffs.
+- **`collaboration.rs`**: `ReviewFinding` (severity ladder Info→Critical,
+  first-class artifact), `ReviewReport`, `ReviewPolicy` + deterministic
+  `ReviewAggregator` (NeedsReview/Critical/ApprovedCandidate), and
+  `ResultSynthesizer` → `SynthesisResult` + `SynthesisProvenance` that
+  rejects hallucinated artifact ids (§54).
+- **Orchestration**: structured `TaskResult` (metrics, warnings, errors,
+  recommendations), `TaskErrorKind::ArtifactMissing` for the readiness
+  gate (missing grants → `Blocked`, never silent), `input_artifacts`.
+- **Engine glue** (`terminal-workspace`): `register_task_artifacts` from
+  the deterministic diff at completion, materialization-before-spawn,
+  review reports/consensus, `synthesize`, `signal_replan` /
+  `replan_workflow` (new plan → `NeedsApproval`), `PersistedState`
+  artifacts/review_reports/replan_signals, new `ApplicationEvent`s
+  (ArtifactCreated/Consumed, ReviewFindingCreated, ReplanSignaled).
+- **Surfaces**: IPC artifact/review/synthesis/replan request set + CLI
+  `terminal artifact list|get|select|lineage`, `review …`, `synthesize …`,
+  `replan …`, `task …` output-artifact support.
+- **Validation**: `tests/phase3d` (12 tests: creation/metadata/selection,
+  lineage, cross-worktree consumption, readiness block, access control,
+  structured results + consensus, synthesis + hallucination rejection,
+  redaction, restart recovery, replan signal + human replan) + IPC test.
+  Docs: `docs/phase3d.md`, `docs/artifacts.md`,
+  `docs/review-findings.md`, `docs/result-synthesis.md`,
+  `docs/agent-collaboration.md`, ADRs 0014/0015.
+
+## Adaptive Orchestration (Phase 3E)
+
+Phase 3E (`adaptive.rs`) adds controlled replanning — the planner may
+*propose* a revised plan; it never mutates or executes the workflow (§2):
+
+```text
+evidence (failures, tests, findings, conflicts, budget)
+   ↓
+ReplanSignal (§4) ── deterministic WorkflowEvaluator (§6–§7)
+   ↓
+PlannerRequest (mode=Replan, bounded ReplanContext §10–§11)
+   ↓
+ProposedReplan + PlanDiff (§12, §14) ── immutable PlanVersion history v1→v2→v3 (§13)
+   ↓
+PlanValidator (§21) ── Human approve / edit (revalidate) / reject (§15–§17)
+   ↓
+TaskGraph migration (completed work preserved §18; explicit, approved
+invalidations §19–§20)
+```
+
+- **`adaptive.rs`** (`terminal-session`): `ReplanTrigger` taxonomy (§3),
+  `ReplanSignal` (severity/evidence/persisted, §4–§5), `WorkflowEvaluator`
+  (deterministic rules: test failure, critical finding, missing artifact,
+  merge conflict, budget, repeated retry, §7), dedup key + cooldown
+  (§8–§9), `ProposedReplan`/`PlanDiff`/`PlanVersion` (§12–§14),
+  `TaskInvalidation`/`ArtifactInvalidation` (§19–§20, old artifacts
+  preserved), `AutonomyPolicy` Manual/Assisted/Automatic (Automatic
+  disabled, §34–§37), `ReplanLimits` (`max_replans`=5, cooldown=30s,
+  §9/§31), `HumanEscalation` (§33), `ReplanMetrics` +
+  `PlannerQualityMetrics` (§24–§25).
+- **Engine glue** (`terminal-workspace`): `AdaptiveState`, per-frame
+  evaluator snapshot (task/review/conflict/budget), `record_replan_signal`
+  (dedup + cooldown + `ReplanRequested` event), `replan_workflow`
+  (proposal + version + diff), `replan_approve/reject/edit` (revalidate on
+  edit), `invalidate_task` (human-gated) / `invalidate_artifact`,
+  `workflow_history` / `workflow_interventions`, loop protection + human
+  escalation, merge-conflict → signal hook, `PersistedState.adaptive`
+  (§42), new `ApplicationEvent`s (ReplanProposed/Approved/Rejected/Edited,
+  PlanSuperseded, TaskInvalidated, ArtifactInvalidated, BudgetRisk,
+  HumanEscalation, §39).
+- **Surfaces**: IPC `replan list|inspect|approve|reject|edit`,
+  `workflow history|interventions`, `invalidate-task|artifact`,
+  `adaptive status` + CLI `terminal replan list|show|approve|reject`,
+  `terminal workflow history|interventions`, `terminal adaptive`,
+  `terminal invalidate-task|invalidate-artifact` (§40–§41).
+- **Validation**: `tests/phase3e` (11 tests: failing-tests adaptive flow,
+  critical-finding, rejection leaves workflow intact, edit revalidation,
+  task/artifact invalidation, replan-limit loop protection + escalation,
+  budget risk, merge-conflict trigger, persistence, malicious planner
+  rejection, signal coalescing) + `adaptive.rs` unit tests.
+  Docs: `docs/phase3e.md`, `docs/adaptive-orchestration.md`,
+  `docs/replanning.md`, `docs/workflow-history.md`,
+  `docs/human-escalation.md`, ADR 0016.
 
 ## Verified Budgets (Phase 0.5 + Phase 1)
 

@@ -26,16 +26,25 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context as _;
 use anyhow::Result;
 use arboard::Clipboard;
 use terminal_renderer::{CursorStyle, Renderer, ViewportRender};
 use terminal_workspace::command::{Command, CommandRegistry, KeyChord};
-use terminal_workspace::engine::AgentDashboard;
+use terminal_workspace::engine::{AgentDashboard, AttentionItems, StopAllReport, WorkflowSummary};
 use terminal_workspace::ipc;
 use terminal_workspace::model::SplitDirection;
-use terminal_workspace::terminal_session::agent::{AgentSnapshot, PermissionDecision};
+use terminal_workspace::terminal_session::adaptive::{HumanEscalation, PlanVersion, ReplanSignal};
+use terminal_workspace::terminal_session::agent::{
+    AgentDefinition, AgentSnapshot, PermissionDecision,
+};
 use terminal_workspace::terminal_session::execution::ExecutionId;
+use terminal_workspace::terminal_session::launch::AgentLaunchConfig;
 use terminal_workspace::terminal_session::orchestration::Task;
+use terminal_workspace::terminal_session::planning::{
+    parse_plan_response, PlanEditChange, PlannerConfig, PlannerError, PlannerProvider,
+    PlannerRequest, ProposedPlan,
+};
 use terminal_workspace::terminal_session::work::{AgentFilter, AgentHealthRow};
 use terminal_workspace::{Multiplexer, Rect};
 use winit::{
@@ -51,6 +60,10 @@ const GLYPH_CACHE_BUDGET: usize = 8 * 1024 * 1024;
 const BLINK_INTERVAL_MS: u64 = 500;
 const SIDEBAR_W: f32 = 200.0;
 const TAB_STRIP_H: f32 = 28.0;
+/// Phase 3F §34: bottom status bar (workflow summary + global controls).
+const STATUS_BAR_H: f32 = 26.0;
+/// Phase 3F §31: "NEEDS YOU" right panel width when open.
+const NEEDS_YOU_W: f32 = 240.0;
 
 /// Agent pane chrome (§15): header height reserved above the viewport.
 const AGENT_HEADER_H: f32 = 24.0;
@@ -96,6 +109,37 @@ enum OverlayMode {
     ProviderSetup,
     /// Phase 3A (§55): minimal task dashboard.
     Tasks,
+}
+
+/// Phase 3F §31: what the approval center is showing (one item at a time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApprovalKind {
+    Replan(String),
+    Task(String),
+    Agent(String),
+}
+
+/// Phase 3F §31: fully-resolved details backing the approval center modal.
+/// Built fresh under a short engine lock at draw time; actions go through
+/// the engine helpers, never here.
+#[derive(Debug, Clone)]
+enum ApprovalDetail {
+    Replan {
+        reason: String,
+        changes: Vec<String>,
+        cost: Option<u64>,
+        prev_cost: Option<u64>,
+    },
+    Task {
+        title: String,
+        summary: String,
+        files: usize,
+        commands: usize,
+    },
+    Agent {
+        name: String,
+        attention: Option<String>,
+    },
 }
 
 /// Provider setup state (Phase 2C §28).
@@ -269,6 +313,27 @@ struct App {
     /// Agent for the create-task form (defaults to the always-registered
     /// fake-agent; unknown refs fail with a graph error on submit).
     task_create_agent: String,
+    /// Phase 3F §31: "NEEDS YOU" right panel visibility.
+    needs_you_open: bool,
+    /// Phase 3F §31: approval center item currently under review.
+    approval_kind: Option<ApprovalKind>,
+    /// Phase 3F §31: "edit replan" capture mode (typing a new step title).
+    approval_edit_mode: bool,
+    approval_edit_text: String,
+    /// Phase 3F §28–§30: workflow timeline overlay visibility.
+    timeline_open: bool,
+    /// Phase 3F §34: workflow summary overlay visibility.
+    summary_open: bool,
+    /// Phase 3F §32: STOP ALL confirmation is armed (first click/keypress
+    /// asserts the intent; the second executes).
+    stop_all_armed: bool,
+    /// Phase 3F §5: demo workspace mode (`--demo` / FLASHTERMINAL_DEMO=1).
+    demo_mode: bool,
+    /// Demo tab id synced to its overlay (Workflow → tasks, Timeline →
+    /// timeline) — re-synced on every tab change.
+    demo_last_tab: Option<String>,
+    /// Last STOP ALL report (shown in the status bar until the next event).
+    last_stop_report: Option<StopAllReport>,
 }
 
 /// Dashboard filter for the task overlay (Phase 3A.1 §6 palette completeness).
@@ -332,6 +397,16 @@ impl App {
             task_create_open: false,
             task_create_title: String::new(),
             task_create_agent: "fake-agent".to_string(),
+            needs_you_open: false,
+            approval_kind: None,
+            approval_edit_mode: false,
+            approval_edit_text: String::new(),
+            timeline_open: false,
+            summary_open: false,
+            stop_all_armed: false,
+            demo_mode: false,
+            demo_last_tab: None,
+            last_stop_report: None,
         }
     }
 
@@ -370,7 +445,11 @@ impl App {
     }
 
     /// Saves the workspace structure (best-effort; failures are logged).
+    /// Demo mode never persists — its state lives in a temp repo only.
     fn persist(&self) {
+        if self.demo_mode {
+            return;
+        }
         let path = terminal_workspace::persist::default_state_path();
         if let Ok(eng) = self.engine.lock() {
             if let Err(e) = eng.save(&path) {
@@ -483,6 +562,20 @@ impl App {
                 | Command::OpenSelectedTaskAgent
         ) {
             self.dispatch_task_command(cmd);
+            return;
+        }
+        // Phase 3F: global controls + auditability (§28–§34). These own
+        // their UI state and lock the engine inside the helper.
+        if matches!(
+            cmd,
+            Command::StopAll
+                | Command::PauseAll
+                | Command::ResumeAll
+                | Command::ToggleApprovalCenter
+                | Command::Timeline
+                | Command::WorkflowSummary
+        ) {
+            self.dispatch_control_command(cmd);
             return;
         }
         let result: anyhow::Result<()> = {
@@ -649,6 +742,184 @@ impl App {
         self.persist();
     }
 
+    /// Phase 3F §28–§34: global controls + auditability commands. UI state
+    /// only; engine locks are short-lived inside each helper.
+    fn dispatch_control_command(&mut self, cmd: &Command) {
+        match cmd {
+            Command::StopAll => {
+                if self.stop_all_armed {
+                    // Second activation executes; first one only arms.
+                    let report = {
+                        let mut eng = self.engine.lock().expect("engine lock");
+                        eng.stop_all()
+                    };
+                    self.last_stop_report = Some(report.clone());
+                    self.stop_all_armed = false;
+                    self.needs_you_open = false;
+                    self.approval_kind = None;
+                    tracing::info!(
+                        "STOP ALL executed: {} agents, {} tasks stopped, {} decisions preserved",
+                        report.agents_stopped,
+                        report.tasks_stopped,
+                        report.preserved_decisions
+                    );
+                } else {
+                    self.stop_all_armed = true;
+                }
+                self.persist();
+            }
+            Command::PauseAll => {
+                let mut eng = self.engine.lock().expect("engine lock");
+                eng.set_workflow_paused(true);
+                self.persist();
+            }
+            Command::ResumeAll => {
+                let mut eng = self.engine.lock().expect("engine lock");
+                eng.set_workflow_paused(false);
+                self.persist();
+            }
+            Command::ToggleApprovalCenter => {
+                self.needs_you_open = !self.needs_you_open;
+                if !self.needs_you_open {
+                    self.approval_kind = None;
+                }
+            }
+            Command::Timeline => {
+                self.timeline_open = !self.timeline_open;
+                if self.timeline_open {
+                    self.summary_open = false;
+                }
+            }
+            Command::WorkflowSummary => {
+                self.summary_open = !self.summary_open;
+                if self.summary_open {
+                    self.timeline_open = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Phase 3F §31: opens the approval center on a specific item.
+    fn open_approval(&mut self, kind: ApprovalKind) {
+        self.approval_kind = Some(kind);
+        self.approval_edit_mode = false;
+        self.approval_edit_text.clear();
+    }
+
+    /// Phase 3F §31: approves the item in the approval center.
+    fn approve_current(&mut self) {
+        let Some(kind) = self.approval_kind.clone() else {
+            return;
+        };
+        let label = match &kind {
+            ApprovalKind::Replan(_) => "replan",
+            ApprovalKind::Task(_) => "task",
+            ApprovalKind::Agent(_) => "agent",
+        };
+        let result: anyhow::Result<()> = match kind {
+            ApprovalKind::Replan(id) => {
+                let mut eng = self.engine.lock().expect("engine lock");
+                eng.replan_approve(&id).map_err(anyhow::Error::from)
+            }
+            ApprovalKind::Task(id) => {
+                let mut eng = self.engine.lock().expect("engine lock");
+                eng.resolve_task_review(&id, true)
+                    .map_err(anyhow::Error::from)
+            }
+            ApprovalKind::Agent(eid) => {
+                let eng = self.engine.lock().expect("engine lock");
+                eng.agent_runtime()
+                    .respond_permission(&ExecutionId(eid), PermissionDecision::Allow)
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.approval_kind = None;
+                self.persist();
+            }
+            Err(e) => tracing::debug!("approve {label} failed: {e}"),
+        }
+    }
+
+    /// Phase 3F §31: rejects the item in the approval center.
+    fn reject_current(&mut self) {
+        let Some(kind) = self.approval_kind.clone() else {
+            return;
+        };
+        let label = match &kind {
+            ApprovalKind::Replan(_) => "replan",
+            ApprovalKind::Task(_) => "task",
+            ApprovalKind::Agent(_) => "agent",
+        };
+        let result: anyhow::Result<()> = match kind {
+            ApprovalKind::Replan(id) => {
+                let mut eng = self.engine.lock().expect("engine lock");
+                eng.replan_reject(&id, "rejected in approval center")
+                    .map_err(anyhow::Error::from)
+            }
+            ApprovalKind::Task(id) => {
+                let mut eng = self.engine.lock().expect("engine lock");
+                eng.resolve_task_review(&id, false)
+                    .map_err(anyhow::Error::from)
+            }
+            ApprovalKind::Agent(eid) => {
+                let eng = self.engine.lock().expect("engine lock");
+                eng.agent_runtime()
+                    .respond_permission(&ExecutionId(eid), PermissionDecision::Deny)
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.approval_kind = None;
+                self.persist();
+            }
+            Err(e) => tracing::debug!("reject {label} failed: {e}"),
+        }
+    }
+
+    /// Phase 3F §31: applies a typed-in plan edit (new step title) to the
+    /// replan in the approval center.
+    fn apply_approval_edit(&mut self) {
+        let (Some(ApprovalKind::Replan(id)), title) = (
+            self.approval_kind.clone(),
+            self.approval_edit_text.trim().to_string(),
+        ) else {
+            return;
+        };
+        if title.is_empty() {
+            self.approval_edit_mode = false;
+            return;
+        }
+        // AddStep appends a new step; set its title (the last step id of
+        // the edited proposal). Revalidation runs inside replan_edit.
+        let result: anyhow::Result<()> = {
+            let mut eng = self.engine.lock().expect("engine lock");
+            let added_id = eng
+                .replan_get(&id)
+                .and_then(|p| p.plan.steps.into_iter().last().map(|s| s.id));
+            let mut changes = vec![PlanEditChange::AddStep {
+                after_step_id: None,
+            }];
+            if let Some(sid) = added_id {
+                changes.push(PlanEditChange::SetTitle {
+                    step_id: sid,
+                    title: title.to_string(),
+                });
+            }
+            eng.replan_edit(&id, &changes).map_err(anyhow::Error::from)
+        };
+        match result {
+            Ok(()) => {
+                self.approval_edit_mode = false;
+                self.approval_edit_text.clear();
+                tracing::info!("replan {id} edited: added step {title}");
+            }
+            Err(e) => tracing::debug!("replan edit failed: {e}"),
+        }
+        self.persist();
+    }
+
     /// Phase 3A task commands (§43, §55 — minimal UI): each locks the
     /// engine itself, so `&mut self` helpers never alias a live guard.
     fn dispatch_task_command(&mut self, cmd: &Command) {
@@ -796,13 +1067,22 @@ impl App {
         })
     }
 
-    /// The window content rect minus chrome (sidebar + tab strip).
+    /// The window content rect minus chrome (sidebar + tab strip, and
+    /// Phase 3F status bar + optional "NEEDS YOU" panel).
     fn content_rect(&self, window_size: PhysicalSize<u32>) -> Rect {
+        let mut width = window_size.width.saturating_sub(SIDEBAR_W as u32);
+        let height = window_size
+            .height
+            .saturating_sub(TAB_STRIP_H as u32)
+            .saturating_sub(STATUS_BAR_H as u32);
+        if self.needs_you_open {
+            width = width.saturating_sub(NEEDS_YOU_W as u32);
+        }
         Rect {
             x: SIDEBAR_W as i32,
             y: TAB_STRIP_H as i32,
-            width: window_size.width.saturating_sub(SIDEBAR_W as u32),
-            height: window_size.height.saturating_sub(TAB_STRIP_H as u32),
+            width,
+            height,
         }
     }
 
@@ -813,6 +1093,44 @@ impl App {
             .map(|w| w.inner_size())
             .unwrap_or_default();
         let content = self.content_rect(window_size);
+
+        // 0. Demo mode (§5): each tab owns a surface — re-syncing the
+        //    overlays when the active tab changes.
+        if self.demo_mode {
+            let (active_tab, title) = {
+                let eng = self.engine.lock().expect("engine lock");
+                let ws = eng.active_workspace();
+                let id = ws.active_tab.clone();
+                let title = id
+                    .as_ref()
+                    .and_then(|i| ws.tabs.iter().find(|t| &t.id == i))
+                    .map(|t| t.title.clone());
+                (id, title)
+            };
+            if active_tab.as_ref() != self.demo_last_tab.as_ref() {
+                self.demo_last_tab = active_tab;
+                match title.as_deref() {
+                    Some("Workflow") => {
+                        self.overlay_mode = Some(OverlayMode::Tasks);
+                        self.task_filter = TaskFilter::All;
+                        self.task_create_open = false;
+                        self.task_detail_open = false;
+                        self.timeline_open = false;
+                        self.summary_open = false;
+                    }
+                    Some("Timeline") => {
+                        self.overlay_mode = None;
+                        self.timeline_open = true;
+                        self.summary_open = false;
+                    }
+                    _ => {
+                        self.overlay_mode = None;
+                        self.timeline_open = false;
+                        self.summary_open = false;
+                    }
+                }
+            }
+        }
 
         // 1. Drain all sessions (fairness-aware, batched) — §27, §28.
         let changed = {
@@ -1094,6 +1412,121 @@ impl App {
                 }
             }
         }
+        // Phase 3F §31–§34 chrome: status bar (always), NEEDS YOU panel,
+        // approval center, timeline, summary. Data is gathered under a
+        // short engine lock, then drawn with a disjoint renderer borrow.
+        if let Some(renderer) = self.renderer.as_mut() {
+            let (summary, attention, last_stop) = {
+                let eng = self.engine.lock().expect("engine lock");
+                (
+                    eng.workflow_summary(),
+                    eng.attention_items(),
+                    self.last_stop_report.clone(),
+                )
+            };
+            App::draw_status_bar(
+                renderer,
+                window_size,
+                &summary,
+                attention.total,
+                self.stop_all_armed,
+                last_stop.as_ref(),
+            );
+            // Panel + modals are skipped while full overlays own the screen.
+            if self.overlay_mode.is_none() && !self.palette_open && !self.diagnostics_visible {
+                if self.needs_you_open && self.approval_kind.is_none() {
+                    App::draw_needs_you_panel(
+                        renderer,
+                        window_size,
+                        &attention,
+                        self.approval_kind.as_ref(),
+                    );
+                }
+                if let Some(kind) = self.approval_kind.clone() {
+                    let detail = {
+                        let eng = self.engine.lock().expect("engine lock");
+                        App::build_approval_detail(&eng, &kind)
+                    };
+                    if let Some(detail) = detail {
+                        App::draw_approval_center(
+                            renderer,
+                            window_size,
+                            &detail,
+                            self.approval_edit_mode,
+                            &self.approval_edit_text,
+                        );
+                    } else {
+                        // The item was resolved elsewhere; close the modal.
+                        self.approval_kind = None;
+                        self.approval_edit_mode = false;
+                    }
+                } else if self.timeline_open {
+                    let (versions, signals, escalations) = {
+                        let eng = self.engine.lock().expect("engine lock");
+                        (
+                            eng.workflow_history(),
+                            eng.adaptive_signals(),
+                            eng.workflow_interventions(),
+                        )
+                    };
+                    App::draw_timeline(renderer, window_size, &versions, &signals, &escalations);
+                } else if self.summary_open {
+                    let (summary, attention_total) = {
+                        let eng = self.engine.lock().expect("engine lock");
+                        (eng.workflow_summary(), eng.attention_items().total)
+                    };
+                    App::draw_summary(renderer, window_size, &summary, attention_total);
+                }
+            }
+        }
+    }
+
+    /// Phase 3F §31: resolves a needs-you item into full modal details.
+    /// Read-only (never mutates engine state).
+    fn build_approval_detail(eng: &Multiplexer, kind: &ApprovalKind) -> Option<ApprovalDetail> {
+        match kind {
+            ApprovalKind::Replan(id) => {
+                let p = eng.replan_get(id)?;
+                let prev_cost = eng
+                    .workflow_history()
+                    .last()
+                    .and_then(|v| v.plan.estimated_cost_cents);
+                Some(ApprovalDetail::Replan {
+                    reason: p.reason,
+                    changes: p.changes,
+                    cost: p.estimated_cost_cents,
+                    prev_cost,
+                })
+            }
+            ApprovalKind::Task(id) => {
+                let t = eng.task_get(id)?;
+                let (summary, files, commands) = t
+                    .result
+                    .as_ref()
+                    .map(|r| (r.summary.clone(), r.files_changed.len(), r.commands.len()))
+                    .unwrap_or_default();
+                Some(ApprovalDetail::Task {
+                    title: t.title.clone(),
+                    summary,
+                    files,
+                    commands,
+                })
+            }
+            ApprovalKind::Agent(eid) => {
+                let s = eng.agent_runtime().get_session(&ExecutionId(eid.clone()))?;
+                Some(ApprovalDetail::Agent {
+                    name: s.display_name.clone(),
+                    attention: s.attention.map(|a| {
+                        match a {
+                            terminal_workspace::terminal_session::work::AttentionReason::PermissionRequested => "awaiting permission".to_string(),
+                            terminal_workspace::terminal_session::work::AttentionReason::NeedsInput => "awaiting input".to_string(),
+                            terminal_workspace::terminal_session::work::AttentionReason::ErrorIntervention => "error — needs intervention".to_string(),
+                            terminal_workspace::terminal_session::work::AttentionReason::Ambiguous => "ambiguous decision".to_string(),
+                        }
+                    }),
+                })
+            }
+        }
     }
 
     /// Sidebar (§17): workspaces on top, tabs of the active workspace below,
@@ -1355,8 +1788,107 @@ impl App {
     }
 
     /// Chrome hit-testing: agent controls, permission bar, sidebar agent
-    /// rows. Returns true when a chrome element consumed the click.
+    /// rows, Phase 3F status bar + NEEDS YOU rows + approval center.
+    /// Returns true when a chrome element consumed the click.
     fn chrome_click(&mut self, pos: winit::dpi::PhysicalPosition<f64>) -> bool {
+        // 0. Phase 3F modals win over everything underneath. While typing a
+        //    plan edit the modal consumes all clicks (no accidental
+        //    resolution via button geometry).
+        if self.approval_edit_mode {
+            return true;
+        }
+        if self.approval_kind.is_some() {
+            let (cw, _) = self
+                .renderer
+                .as_ref()
+                .map(|r| r.cell_size())
+                .unwrap_or((0.0, 0.0));
+            if cw > 0.0 {
+                let window_size = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.inner_size())
+                    .unwrap_or_default();
+                let w = (56.0_f32 * cw).min(640.0_f32);
+                let h = (18.0_f32
+                    * self
+                        .renderer
+                        .as_ref()
+                        .map(|r| r.cell_size().1)
+                        .unwrap_or(0.0))
+                .min(420.0_f32);
+                let x = (window_size.width as f32 - w) / 2.0;
+                let y = (window_size.height as f32 - h) / 2.0;
+                let (approve, edit, reject) = self.approval_buttons((x, y, w));
+                if approve.contains(pos.x, pos.y) {
+                    self.approve_current();
+                } else if edit.contains(pos.x, pos.y) {
+                    if matches!(self.approval_kind, Some(ApprovalKind::Replan(_))) {
+                        self.approval_edit_mode = true;
+                        self.approval_edit_text.clear();
+                    }
+                } else if reject.contains(pos.x, pos.y) {
+                    self.reject_current();
+                }
+            }
+            return true;
+        }
+        if self.timeline_open || self.summary_open {
+            // Pure display modals: consume clicks so nothing beneath
+            // changes while the audit view is up.
+            return true;
+        }
+        // 1. Phase 3F bottom status bar: NEEDS YOU toggle, Pause/Resume ALL,
+        //    STOP ALL (two-step arm/execute).
+        if let Some(window) = &self.window {
+            let ws = window.inner_size();
+            let (needs, pause, stop) = self.status_bar_hits(ws);
+            if needs.contains(pos.x, pos.y) {
+                self.needs_you_open = !self.needs_you_open;
+                if !self.needs_you_open {
+                    self.approval_kind = None;
+                }
+                return true;
+            }
+            if pause.contains(pos.x, pos.y) {
+                // Pause/Resume based on current state (§33).
+                let paused = self.engine.lock().expect("engine lock").workflow_paused();
+                let cmd = if paused {
+                    Command::ResumeAll
+                } else {
+                    Command::PauseAll
+                };
+                self.run_command(&cmd);
+                return true;
+            }
+            if stop.contains(pos.x, pos.y) {
+                let cmd = Command::StopAll;
+                self.run_command(&cmd);
+                return true;
+            }
+        }
+        // 2. NEEDS YOU right panel rows → approval center.
+        if self.needs_you_open {
+            let (items, window_size) = {
+                let eng = self.engine.lock().expect("engine lock");
+                (
+                    eng.attention_items(),
+                    self.window
+                        .as_ref()
+                        .map(|w| w.inner_size())
+                        .unwrap_or_default(),
+                )
+            };
+            for (i, r) in self.needs_you_rows(window_size, &items).iter().enumerate() {
+                if r.contains(pos.x, pos.y) {
+                    if let Some(kind) = App::approval_item_at(&items, i) {
+                        self.open_approval(kind);
+                    }
+                    return true;
+                }
+            }
+        }
+        // 3. Existing chrome: agent controls, permission bars, sidebar rows.
         let picked = self
             .agent_hits
             .iter()
@@ -1608,6 +2140,620 @@ impl App {
         self.task_detail_open = false;
         self.task_create_open = false;
         self.task_filter = TaskFilter::All;
+        self.approval_kind = None;
+        self.approval_edit_mode = false;
+        self.approval_edit_text.clear();
+        self.timeline_open = false;
+        self.summary_open = false;
+    }
+
+    /// Phase 3F status-bar hit rects (drawn + click-tested per frame).
+    fn status_bar_hits(&self, window_size: PhysicalSize<u32>) -> (Rect, Rect, Rect) {
+        let w = window_size.width as i32;
+        let y = window_size.height as i32 - STATUS_BAR_H as i32;
+        let needs = Rect {
+            x: SIDEBAR_W as i32 + 8,
+            y: y + 4,
+            width: 150,
+            height: 18,
+        };
+        let stop = Rect {
+            x: w - 92,
+            y: y + 4,
+            width: 84,
+            height: 18,
+        };
+        let pause = Rect {
+            x: stop.x - 106,
+            y: y + 4,
+            width: 100,
+            height: 18,
+        };
+        (needs, pause, stop)
+    }
+
+    /// Phase 3F §31: "NEEDS YOU" row hit rects (one per drawn attention
+    /// item: ≤4 agents, ≤4 review tasks, ≤4 replans — row order matches
+    /// `draw_needs_you_panel` exactly).
+    fn needs_you_rows(&self, window_size: PhysicalSize<u32>, items: &AttentionItems) -> Vec<Rect> {
+        let x = window_size.width.saturating_sub(NEEDS_YOU_W as u32) as i32 + 10;
+        let y = TAB_STRIP_H as i32 + 34;
+        let row_h = 20;
+        let mut out = Vec::new();
+        let rows = items
+            .agents
+            .len()
+            .min(4)
+            .saturating_add(items.review_tasks.len().min(4))
+            .saturating_add(items.replans.len().min(4));
+        for i in 0..rows {
+            out.push(Rect {
+                x,
+                y: y + (i as i32) * row_h,
+                width: NEEDS_YOU_W as u32 - 20,
+                height: row_h as u32 - 2,
+            });
+        }
+        out
+    }
+
+    /// Phase 3F §31: the needs-you item at row `idx` (same enumerating
+    /// order as the panel: agents, review tasks, replans).
+    fn approval_item_at(items: &AttentionItems, idx: usize) -> Option<ApprovalKind> {
+        if let Some(a) = items.agents.iter().take(4).nth(idx) {
+            return Some(ApprovalKind::Agent(a.execution_id.0.clone()));
+        }
+        let offset = items.agents.len().min(4);
+        if let Some(t) = items
+            .review_tasks
+            .iter()
+            .take(4)
+            .nth(idx.checked_sub(offset)?)
+        {
+            return Some(ApprovalKind::Task(t.task_id.clone()));
+        }
+        let offset = offset + items.review_tasks.len().min(4);
+        items
+            .replans
+            .iter()
+            .take(4)
+            .nth(idx.checked_sub(offset)?)
+            .map(|p| ApprovalKind::Replan(p.replan_id.clone()))
+    }
+
+    /// Phase 3F §31 modal: which button rects the approval center shows.
+    /// Mirrors the geometry in `draw_approval_center`.
+    fn approval_buttons(&self, center: (f32, f32, f32)) -> (Rect, Rect, Rect) {
+        let (x, y, w) = center;
+        let by = y + w * 0.62;
+        let bw = 76.0;
+        let bh = 20.0;
+        (
+            Rect {
+                x: (x + 12.0) as i32,
+                y: by as i32,
+                width: bw as u32,
+                height: bh as u32,
+            },
+            Rect {
+                x: (x + 12.0 + bw + 8.0) as i32,
+                y: by as i32,
+                width: bw as u32,
+                height: bh as u32,
+            },
+            Rect {
+                x: (x + w - bw - 12.0) as i32,
+                y: by as i32,
+                width: bw as u32,
+                height: bh as u32,
+            },
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3F §31–§34: approval center, NEEDS YOU panel, timeline,
+    // workflow summary + status bar. All drawn in chrome space; text
+    // width is estimated monospace (cell_w × chars).
+    // ------------------------------------------------------------------
+
+    /// §34: bottom status bar — live workflow summary + global controls.
+    fn draw_status_bar(
+        renderer: &mut Renderer,
+        window_size: PhysicalSize<u32>,
+        summary: &WorkflowSummary,
+        attention: usize,
+        stop_armed: bool,
+        last_stop: Option<&StopAllReport>,
+    ) {
+        let w = window_size.width as f32;
+        let y = window_size.height as f32 - STATUS_BAR_H;
+        renderer.chrome_rect(0.0, y, w, STATUS_BAR_H, CHROME_BG);
+        renderer.chrome_border(0.0, y, w, STATUS_BAR_H, 1.0, [0.16, 0.16, 0.20, 1.0]);
+        let (cw, _) = renderer.cell_size();
+        let line = App::summary_line_static(summary, attention);
+        renderer.chrome_text(SIDEBAR_W + 10.0, y + 6.0, &line, CHROME_FG);
+        // NEEDS YOU badge.
+        let bx = SIDEBAR_W + 10.0 + line.chars().count().min(120) as f32 * cw + 16.0;
+        let badge = if attention > 0 {
+            format!("● NEEDS YOU ({attention})")
+        } else {
+            "NEEDS YOU".to_string()
+        };
+        renderer.chrome_text(
+            bx,
+            y + 6.0,
+            &badge,
+            if attention > 0 {
+                STATE_APPROVAL
+            } else {
+                CHROME_FG_DIM
+            },
+        );
+        // Pause/Resume + STOP ALL (right-anchored).
+        let pause_label = if summary.paused {
+            "▶ Resume ALL"
+        } else {
+            "⏸ Pause ALL"
+        };
+        renderer.chrome_text(w - 92.0 - 100.0 + 4.0, y + 6.0, pause_label, CHROME_FG);
+        if stop_armed {
+            renderer.chrome_text(w - 84.0 + 4.0, y + 6.0, "STOP ALL?", STATE_FAILED);
+        } else {
+            renderer.chrome_text(w - 76.0 + 4.0, y + 6.0, "■ STOP ALL", STATE_FAILED);
+        }
+        if let Some(r) = last_stop {
+            renderer.chrome_text(
+                SIDEBAR_W + 10.0 + line.chars().count().min(120) as f32 * cw + 16.0,
+                y + 6.0,
+                &format!(
+                    "STOPPED {} agents · {} tasks · {} decisions kept",
+                    r.agents_stopped, r.tasks_stopped, r.preserved_decisions
+                ),
+                CHROME_FG_DIM,
+            );
+        }
+    }
+
+    fn summary_line_static(s: &WorkflowSummary, attention: usize) -> String {
+        let mut parts = vec![
+            format!(
+                "{} workflow{}",
+                s.workflows,
+                if s.workflows == 1 { "" } else { "s" }
+            ),
+            format!("{} running", s.running),
+        ];
+        if s.waiting > 0 {
+            parts.push(format!("{} waiting", s.waiting));
+        }
+        if attention > 0 {
+            parts.push(format!("{} needs you", attention));
+        }
+        if s.completed_today > 0 {
+            parts.push(format!("{} done today", s.completed_today));
+        }
+        if s.failed > 0 {
+            parts.push(format!("{} failed", s.failed));
+        }
+        parts.push(format!("${:.2}", s.estimated_cost_cents as f64 / 100.0));
+        if s.paused {
+            parts.push("PAUSED".to_string());
+        }
+        parts.join(" · ")
+    }
+
+    /// §31: the "NEEDS YOU" right panel — everything awaiting a human.
+    fn draw_needs_you_panel(
+        renderer: &mut Renderer,
+        window_size: PhysicalSize<u32>,
+        items: &AttentionItems,
+        selected: Option<&ApprovalKind>,
+    ) {
+        let w = NEEDS_YOU_W;
+        let x = window_size.width as f32 - w;
+        let y = TAB_STRIP_H;
+        let h = window_size.height as f32 - TAB_STRIP_H - STATUS_BAR_H;
+        renderer.chrome_rect(x, y, w, h, [0.09, 0.09, 0.12, 1.0]);
+        renderer.chrome_border(x, y, w, h, 1.0, [0.2, 0.2, 0.26, 1.0]);
+        renderer.chrome_text(x + 10.0, y + 8.0, "NEEDS YOU", CHROME_ACCENT);
+        renderer.chrome_text(
+            x + 10.0,
+            y + 26.0,
+            &format!(
+                "{} item{}",
+                items.total,
+                if items.total == 1 { "" } else { "s" }
+            ),
+            CHROME_FG_DIM,
+        );
+        let mut row_y = y + 46.0;
+        for a in items.agents.iter().take(4) {
+            renderer.chrome_text(
+                x + 10.0,
+                row_y,
+                &truncate(&format!("◉ {} — permission", a.display_name), 27),
+                STATE_APPROVAL,
+            );
+            row_y += 18.0;
+        }
+        for t in items.review_tasks.iter().take(4) {
+            renderer.chrome_text(
+                x + 10.0,
+                row_y,
+                &truncate(&format!("✓ {} — review", t.title), 27),
+                STATE_APPROVAL,
+            );
+            row_y += 18.0;
+        }
+        for p in items.replans.iter().take(4) {
+            renderer.chrome_text(
+                x + 10.0,
+                row_y,
+                &truncate(&format!("⇄ Replan — {}", p.reason), 27),
+                STATE_APPROVAL,
+            );
+            row_y += 18.0;
+        }
+        if items.total == 0 {
+            renderer.chrome_text(
+                x + 10.0,
+                row_y,
+                "Nothing needs you right now.",
+                CHROME_FG_DIM,
+            );
+            renderer.chrome_text(
+                x + 10.0,
+                row_y + 18.0,
+                "Running agents stay green-side.",
+                CHROME_FG_DIM,
+            );
+        }
+        let _ = selected;
+        renderer.chrome_text(
+            x + 10.0,
+            y + h - 22.0,
+            "Click an item to review · ⌥⇧C closes",
+            CHROME_FG_DIM,
+        );
+    }
+
+    /// §31: the approval center modal — one decision at a time.
+    fn draw_approval_center(
+        renderer: &mut Renderer,
+        window_size: PhysicalSize<u32>,
+        detail: &ApprovalDetail,
+        edit_mode: bool,
+        edit_text: &str,
+    ) {
+        let (cw, ch) = renderer.cell_size();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        let w = (56.0_f32 * cw).min(640.0_f32);
+        let h = (18.0_f32 * ch).min(420.0_f32);
+        let x = (window_size.width as f32 - w) / 2.0;
+        let y = (window_size.height as f32 - h) / 2.0;
+        renderer.chrome_rect(
+            0.0,
+            0.0,
+            window_size.width as f32,
+            window_size.height as f32,
+            [0.0, 0.0, 0.0, 0.55],
+        );
+        renderer.chrome_rect(x, y, w, h, [0.11, 0.11, 0.15, 1.0]);
+        renderer.chrome_border(x, y, w, h, 1.0, CHROME_ACCENT);
+        renderer.chrome_text(x + 12.0, y + 8.0, "NEEDS YOU — review", CHROME_ACCENT);
+        let mut yy = y + 30.0;
+        match detail {
+            ApprovalDetail::Replan {
+                reason,
+                changes,
+                cost,
+                prev_cost,
+                ..
+            } => {
+                renderer.chrome_text(
+                    x + 12.0,
+                    yy,
+                    &format!("Replan · {}", truncate(reason, 52)),
+                    CHROME_FG,
+                );
+                yy += ch;
+                for change in changes.iter().take(6) {
+                    renderer.chrome_text(x + 16.0, yy, &format!("+ {change}"), CHROME_FG);
+                    yy += ch;
+                }
+                match (prev_cost, cost) {
+                    (Some(a), Some(b)) if a != b => {
+                        renderer.chrome_text(
+                            x + 12.0,
+                            yy,
+                            &format!(
+                                "Budget: ${:.2} → ${:.2}",
+                                *a as f64 / 100.0,
+                                *b as f64 / 100.0
+                            ),
+                            STATE_WORKING,
+                        );
+                        yy += ch;
+                    }
+                    (_, Some(b)) => {
+                        renderer.chrome_text(
+                            x + 12.0,
+                            yy,
+                            &format!("Budget: ${:.2}", *b as f64 / 100.0),
+                            CHROME_FG,
+                        );
+                        yy += ch;
+                    }
+                    _ => {}
+                }
+                renderer.chrome_text(
+                    x + 12.0,
+                    yy,
+                    "Approval edits are re-validated before execution.",
+                    CHROME_FG_DIM,
+                );
+                yy += ch;
+                if edit_mode {
+                    renderer.chrome_text(
+                        x + 12.0,
+                        yy,
+                        &format!("New step title: {edit_text}▏"),
+                        STATE_STARTING,
+                    );
+                }
+            }
+            ApprovalDetail::Task {
+                title,
+                summary,
+                files,
+                commands,
+                ..
+            } => {
+                renderer.chrome_text(x + 12.0, yy, &format!("Task · {title}"), CHROME_FG);
+                yy += ch;
+                renderer.chrome_text(x + 12.0, yy, &format!("Summary: {summary}"), CHROME_FG);
+                yy += ch;
+                renderer.chrome_text(
+                    x + 12.0,
+                    yy,
+                    &format!("{files} files changed · {commands} commands"),
+                    CHROME_FG_DIM,
+                );
+                yy += ch;
+                renderer.chrome_text(
+                    x + 12.0,
+                    yy,
+                    "Approving accepts the result; rejecting marks the task failed.",
+                    CHROME_FG_DIM,
+                );
+            }
+            ApprovalDetail::Agent {
+                name, attention, ..
+            } => {
+                renderer.chrome_text(x + 12.0, yy, &format!("Agent · {name}"), CHROME_FG);
+                yy += ch;
+                match attention {
+                    Some(a) => {
+                        renderer.chrome_text(x + 12.0, yy, &format!("Needs: {a}"), STATE_APPROVAL);
+                        yy += ch;
+                    }
+                    None => {
+                        renderer.chrome_text(
+                            x + 12.0,
+                            yy,
+                            "Waiting on a permission decision.",
+                            STATE_APPROVAL,
+                        );
+                        yy += ch;
+                    }
+                }
+                renderer.chrome_text(
+                    x + 12.0,
+                    yy,
+                    "Allow grants the request; Deny rejects it and the agent keeps running.",
+                    CHROME_FG_DIM,
+                );
+            }
+        }
+        // Buttons.
+        let (ax, by, bw, bh) = (x + 12.0, y + h - 34.0, 76.0, 20.0);
+        renderer.chrome_rect(ax, by, bw, bh, [0.2, 0.42, 0.26, 1.0]);
+        renderer.chrome_text(ax + 10.0, by + 4.0, "Approve", [0.0, 0.0, 0.0, 1.0]);
+        renderer.chrome_rect(ax + bw + 10.0, by, bw, bh, [0.16, 0.16, 0.22, 1.0]);
+        renderer.chrome_text(ax + bw + 22.0, by + 4.0, "Edit", CHROME_FG);
+        let rx = x + w - bw - 12.0;
+        renderer.chrome_rect(rx, by, bw, bh, [0.50, 0.2, 0.2, 1.0]);
+        renderer.chrome_text(rx + 12.0, by + 4.0, "Reject", [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// §28–§30: workflow timeline — plan versions + replan signals +
+    /// escalations. Reads entirely from pre-gathered engine records.
+    fn draw_timeline(
+        renderer: &mut Renderer,
+        window_size: PhysicalSize<u32>,
+        versions: &[PlanVersion],
+        signals: &[ReplanSignal],
+        escalations: &[HumanEscalation],
+    ) {
+        let (cw, ch) = renderer.cell_size();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        let w = (92.0_f32 * cw).min(980.0_f32);
+        let h = (22.0_f32 * ch).min(520.0_f32);
+        let x = (window_size.width as f32 - w) / 2.0;
+        let y = (window_size.height as f32 - h) / 2.0;
+        renderer.chrome_rect(
+            0.0,
+            0.0,
+            window_size.width as f32,
+            window_size.height as f32,
+            [0.0, 0.0, 0.0, 0.6],
+        );
+        renderer.chrome_rect(x, y, w, h, [0.11, 0.11, 0.15, 1.0]);
+        renderer.chrome_border(x, y, w, h, 1.0, CHROME_ACCENT);
+        renderer.chrome_text(x + 12.0, y + 8.0, "Workflow timeline", CHROME_ACCENT);
+        renderer.chrome_text(
+            x + 12.0,
+            y + 26.0,
+            "Plan versions · replan signals · escalations — chronological, no hidden reasoning.",
+            CHROME_FG_DIM,
+        );
+        let mut yy = y + 48.0;
+        let mut line = 0;
+        for v in versions.iter().rev().take(8) {
+            if line >= 14 {
+                break;
+            }
+            let d = v.diff_from_previous.as_ref();
+            let diff_txt = match d {
+                Some(d) => format!(
+                    "+{} −{} ~{} {}",
+                    d.added.len(),
+                    d.removed.len(),
+                    d.modified.len(),
+                    d.changed_budget
+                        .map(|(a, b)| format!(
+                            "· ${}→${}",
+                            a.unwrap_or(0) / 100,
+                            b.unwrap_or(0) / 100
+                        ))
+                        .unwrap_or_default()
+                ),
+                None => String::new(),
+            };
+            let status = if v.superseded_by.is_some() {
+                "superseded"
+            } else if v.approved {
+                "approved"
+            } else {
+                "pending"
+            };
+            renderer.chrome_text(
+                x + 12.0,
+                yy,
+                &format!(
+                    "Plan v{} · {} · {} · {status}",
+                    v.version,
+                    truncate(&v.goal, 34),
+                    diff_txt,
+                ),
+                if v.approved { STATE_DONE } else { CHROME_FG },
+            );
+            yy += ch;
+            line += 1;
+        }
+        for s in signals.iter().rev().take(4) {
+            if line >= 14 {
+                break;
+            }
+            renderer.chrome_text(
+                x + 12.0,
+                yy,
+                &format!(
+                    "Signal · {} · {} — {}",
+                    s.severity.label(),
+                    s.trigger.as_str(),
+                    truncate(&s.reason, 40)
+                ),
+                STATE_WORKING,
+            );
+            yy += ch;
+            line += 1;
+        }
+        for e in escalations.iter().rev().take(4) {
+            if line >= 14 {
+                break;
+            }
+            renderer.chrome_text(
+                x + 12.0,
+                yy,
+                &format!(
+                    "Escalation · {} — {}",
+                    truncate(&e.what_happened, 30),
+                    e.options.join(" / ")
+                ),
+                STATE_FAILED,
+            );
+            yy += ch;
+            line += 1;
+        }
+        if line == 0 {
+            renderer.chrome_text(x + 12.0, yy, "No workflow activity yet.", CHROME_FG_DIM);
+        }
+        renderer.chrome_text(
+            x + 12.0,
+            y + h - 22.0,
+            "Why did FlashTerminal replan? — the Signal rows carry trigger + severity + evidence.",
+            CHROME_FG_DIM,
+        );
+    }
+
+    /// §34: workflow state summary overlay.
+    fn draw_summary(
+        renderer: &mut Renderer,
+        window_size: PhysicalSize<u32>,
+        summary: &WorkflowSummary,
+        attention: usize,
+    ) {
+        let (cw, ch) = renderer.cell_size();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        let w = (44.0_f32 * cw).min(480.0_f32);
+        let h = (11.0_f32 * ch).min(300.0_f32);
+        let x = (window_size.width as f32 - w) / 2.0;
+        let y = (window_size.height as f32 - h) / 2.0;
+        renderer.chrome_rect(
+            0.0,
+            0.0,
+            window_size.width as f32,
+            window_size.height as f32,
+            [0.0, 0.0, 0.0, 0.55],
+        );
+        renderer.chrome_rect(x, y, w, h, [0.11, 0.11, 0.15, 1.0]);
+        renderer.chrome_border(x, y, w, h, 1.0, CHROME_ACCENT);
+        renderer.chrome_text(x + 14.0, y + 10.0, "Workflow state", CHROME_ACCENT);
+        let mut yy = y + 34.0;
+        let rows = [
+            ("Workflows", summary.workflows.to_string()),
+            ("Running", summary.running.to_string()),
+            ("Waiting", summary.waiting.to_string()),
+            ("Needs approval", summary.needs_approval.to_string()),
+            ("Completed today", summary.completed_today.to_string()),
+            ("Failed", summary.failed.to_string()),
+            (
+                "Estimated cost",
+                format!("${:.2}", summary.estimated_cost_cents as f64 / 100.0),
+            ),
+            ("Attention items", attention.to_string()),
+        ];
+        for (label, value) in &rows {
+            renderer.chrome_text(x + 14.0, yy, &format!("{label}:"), CHROME_FG);
+            renderer.chrome_text(
+                x + w
+                    - 14.0
+                    - label.len().saturating_sub(4).max(6) as f32 * cw
+                    - value.chars().count() as f32 * cw,
+                yy,
+                value,
+                CHROME_ACCENT,
+            );
+            yy += ch;
+        }
+        let paused = summary.paused;
+        renderer.chrome_text(
+            x + 14.0,
+            yy,
+            if paused {
+                "PAUSED — no new work starts until Resume ALL."
+            } else {
+                "Active — new work can start."
+            },
+            if paused { STATE_APPROVAL } else { STATE_DONE },
+        );
     }
 
     /// Draws the command palette overlay (§37): live-query filtered command
@@ -2270,13 +3416,66 @@ impl App {
         }
         // 1. Handle overlay keys first.
         if event.logical_key == NamedKey::Escape {
-            // Esc unwinds: create form → task detail → all overlays.
-            if self.task_create_open {
+            // Esc unwinds: approval edit → approval center → timeline /
+            // summary → needs-you panel → create form → task detail →
+            // all overlays.
+            if self.approval_edit_mode {
+                self.approval_edit_mode = false;
+                self.approval_edit_text.clear();
+            } else if self.approval_kind.is_some() {
+                self.approval_kind = None;
+            } else if self.timeline_open {
+                self.timeline_open = false;
+            } else if self.summary_open {
+                self.summary_open = false;
+            } else if self.needs_you_open {
+                self.needs_you_open = false;
+            } else if self.task_create_open {
                 self.task_create_open = false;
             } else if self.task_detail_open {
                 self.task_detail_open = false;
             } else {
                 self.close_overlays();
+            }
+            return;
+        }
+        // 1a. Approval center: typing a plan edit, or one-key decisions.
+        if self.approval_edit_mode {
+            match &event.logical_key {
+                Key::Named(NamedKey::Enter) => {
+                    self.apply_approval_edit();
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.approval_edit_text.pop();
+                }
+                Key::Character(_) => {
+                    if let Some(text) = &event.text {
+                        self.approval_edit_text.push_str(text);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.approval_kind.is_some() {
+            if let Key::Character(c) = &event.logical_key {
+                // y/n act on the item in the center (approval first,
+                // reject last — §31).
+                match c.as_str() {
+                    "y" => {
+                        self.approve_current();
+                    }
+                    "n" => {
+                        self.reject_current();
+                    }
+                    "e" => {
+                        if matches!(self.approval_kind, Some(ApprovalKind::Replan(_))) {
+                            self.approval_edit_mode = true;
+                            self.approval_edit_text.clear();
+                        }
+                    }
+                    _ => {}
+                }
             }
             return;
         }
@@ -2566,9 +3765,265 @@ fn key_sequence(key: &Key, app_keys: bool, ctrl: bool, alt: bool) -> Option<Vec<
     Some(seq)
 }
 
+/// Phase 3F §5: deterministic demo planner — canned, valid plan JSON
+/// (same contract as the Phase 3E mock planner) so replan proposals,
+/// the timeline and the approval center show real-graph content with no
+/// LLM involved.
+struct DemoPlanner {
+    responses: std::sync::Mutex<std::collections::VecDeque<String>>,
+}
+
+impl DemoPlanner {
+    fn new() -> Self {
+        let plan = r#"{"goal":"Demo workflow: finish the landing page","tasks":[
+            {"id":"step-1","title":"Polish hero section","description":"demo fixture","agent":"fake-agent","depends_on":[]},
+            {"id":"step-2","title":"Fix the failing build","description":"demo fixture","agent":"fake-agent","depends_on":["step-1"]}
+        ],"estimated_cost_cents":45}"#;
+        Self {
+            responses: std::sync::Mutex::new(std::collections::VecDeque::from([plan.to_string()])),
+        }
+    }
+}
+
+impl PlannerProvider for DemoPlanner {
+    fn provider_id(&self) -> &str {
+        "demo-planner"
+    }
+
+    fn generate(
+        &self,
+        _request: &PlannerRequest,
+        _config: &PlannerConfig,
+    ) -> Result<ProposedPlan, PlannerError> {
+        let Some(raw) = self.responses.lock().unwrap().pop_front() else {
+            return Err(PlannerError::InvalidResponse {
+                message: "demo planner exhausted".to_string(),
+            });
+        };
+        parse_plan_response(&raw)
+    }
+}
+
+fn git(repo: &std::path::Path, args: &[&str]) -> anyhow::Result<()> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Phase 3F §5: demo workspace (`--demo` / `FLASHTERMINAL_DEMO=1`).
+///
+/// Builds a self-explaining workspace in a fresh temp git repo:
+/// * four agent tabs (Approval / Working / Completed / Failed) running the
+///   deterministic `fake-agent` fixtures under provider-looking names;
+/// * a Workflow tab with a real task graph (completion, review-gated,
+///   long-running) — open it to watch the scheduler;
+/// * a Timeline tab (plan versions + replan signals);
+/// * a pending replan proposal so the NEEDS YOU panel, approval center and
+///   timeline have live content at startup.
+///
+/// All state lives in the temp repo; demo mode never persists to
+/// `~/.flashterminal/state.json`.
+fn setup_demo(engine: &Arc<Mutex<Multiplexer>>) -> anyhow::Result<()> {
+    let fake_bin =
+        terminal_workspace::terminal_session::adapters::fake::FakeAgentAdapter::resolve_binary()
+            .context(
+                "demo mode needs the fake-agent binary — build it with `cargo build -p fake-agent`",
+            )?;
+    let fake_path = fake_bin.to_string_lossy().to_string();
+
+    // Fresh git project (task isolation runs inside worktrees).
+    let root = std::env::temp_dir().join(format!("flashterminal-demo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(root.join("README.md"), "# FlashTerminal Demo\n")?;
+    git(&root, &["init", "-q", "-b", "main"])?;
+    git(&root, &["add", "."])?;
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=demo",
+            "-c",
+            "user.email=demo@demo",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+    )?;
+    let root_s = root.to_string_lossy().to_string();
+
+    let mut eng = engine.lock().expect("engine lock");
+    eng.create_workspace("FlashTerminal Demo", &root_s)?;
+    eng.set_planner_provider(Box::new(DemoPlanner::new()));
+
+    // Provider-looking definitions backed by the fake-agent binary (never
+    // real CLIs — deterministic and safe; §5 self-explaining demo).
+    for (id, display) in [
+        ("demo-claude-code", "Claude Code (demo)"),
+        ("demo-codex", "Codex (demo)"),
+        ("demo-opencode", "OpenCode (demo)"),
+        ("demo-pi", "Pi (demo)"),
+    ] {
+        eng.agent_runtime_mut()
+            .registry_mut()
+            .register(AgentDefinition {
+                id: id.to_string(),
+                name: id.to_string(),
+                display_name: display.to_string(),
+                command: fake_path.clone(),
+                args: Vec::new(),
+                protocol: "cli".to_string(),
+                documentation_url: None,
+                install_hint: Some("cargo build -p fake-agent".to_string()),
+            });
+    }
+
+    // Tab layout: first tab exists from create_workspace — rename it and
+    // spawn its demo agent; then one new tab per remaining surface.
+    let agent_tabs: Vec<(&str, &str, Vec<String>)> = vec![
+        (
+            "Approval",
+            "demo-claude-code",
+            vec!["--scenario".into(), "approval".into()],
+        ),
+        (
+            "Working",
+            "demo-codex",
+            vec![
+                "--scenario".into(),
+                "working".into(),
+                "--duration".into(),
+                "120".into(),
+            ],
+        ),
+        (
+            "Completed",
+            "demo-opencode",
+            vec!["--scenario".into(), "completion".into()],
+        ),
+        (
+            "Failed",
+            "demo-pi",
+            vec!["--scenario".into(), "failure".into()],
+        ),
+    ];
+    type TabSpec = (String, Option<(String, Vec<String>)>);
+    let mut first = true;
+    let mut titles: Vec<TabSpec> = Vec::new();
+    for (title, def, args) in agent_tabs {
+        titles.push((title.to_string(), Some((def.to_string(), args))));
+    }
+    titles.push(("Workflow".to_string(), None));
+    titles.push(("Timeline".to_string(), None));
+    for (title, agent) in titles {
+        if !first {
+            eng.new_tab()?;
+        }
+        first = false;
+        if let Some((def, args)) = agent {
+            let mut launch = AgentLaunchConfig::new(def, &root_s);
+            launch.arguments = args;
+            eng.split_pane_agent(SplitDirection::Vertical, launch)?;
+        }
+        let tab_id = eng
+            .active_workspace()
+            .active_tab
+            .clone()
+            .context("demo: no active tab")?;
+        for t in &mut eng.active_workspace_mut().tabs {
+            if t.id == tab_id {
+                t.title = title.clone();
+            }
+        }
+    }
+
+    // Workflow tab: real task graph, started immediately (deterministic
+    // fake fixtures: completion, review-gated modify, long-running).
+    let ws_id = eng.active_workspace().id.clone();
+    let ship = eng.task_create(
+        &ws_id,
+        "Ship the README",
+        "Demo: write the project README.",
+        "fake-agent",
+        &[],
+        false,
+    )?;
+    let review = eng.task_create(
+        &ws_id,
+        "Review the demo feature",
+        "Demo: apply review-gated changes to demo.md.",
+        "fake-agent",
+        &[],
+        true,
+    )?;
+    eng.task_add_arguments(
+        &review,
+        &[
+            "--write-file",
+            "demo.md",
+            "--set-content",
+            "# Demo feature\nshipped\n",
+        ],
+    )?;
+    eng.task_set_environment(
+        &ship,
+        &[("FAKE_AGENT_SCENARIO".to_string(), "completion".to_string())],
+    )?;
+    eng.task_set_environment(
+        &review,
+        &[("FAKE_AGENT_SCENARIO".to_string(), "modify".to_string())],
+    )?;
+    let _long = eng.task_create(
+        &ws_id,
+        "Long-running migration",
+        "Demo: keep a task running for two minutes.",
+        "fake-agent",
+        &[],
+        false,
+    )?;
+    eng.task_add_arguments(&_long, &["--duration", "120"])?;
+    eng.task_set_environment(
+        &_long,
+        &[(
+            "FAKE_AGENT_SCENARIO".to_string(),
+            "long-running".to_string(),
+        )],
+    )?;
+    eng.task_run();
+
+    // Timeline + approval center seed: a pending replan proposal (Plan v1,
+    // pending) plus a replan signal. Replan first — replan_workflow clears
+    // outstanding signals; the signal then rides on top of the version.
+    eng.replan_workflow("Demo workflow: finish the landing page")?;
+    eng.signal_replan("demo", "Demo workflow needs a decision — replan v1 pending");
+
+    tracing::info!("demo workspace ready at {root_s}");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    tracing::info!("Starting FlashTerminal (Phase 1 multiplexer)...");
+
+    // Phase 3F §5: `--demo` (or FLASHTERMINAL_DEMO=1) builds a
+    // self-explaining workspace backed by deterministic fake fixtures.
+    let demo = std::env::args().any(|a| a == "--demo")
+        || std::env::var("FLASHTERMINAL_DEMO")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+    if demo {
+        tracing::info!("Starting FlashTerminal in DEMO mode (deterministic fake fixtures)");
+    } else {
+        tracing::info!("Starting FlashTerminal (Phase 1 multiplexer)...");
+    }
 
     let engine = Arc::new(Mutex::new(Multiplexer::new()?));
     let event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event().build()?;
@@ -2587,7 +4042,19 @@ fn main() -> Result<()> {
         *engine.lock().expect("engine lock") = Multiplexer::with_wake(Some(wake))?;
     }
 
-    App::init_engine(&engine);
+    if demo {
+        // Fresh demo workspace in a temp git repo; real user state is never
+        // loaded or overwritten.
+        match setup_demo(&engine) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::error!("demo setup failed ({e}); starting without demo");
+                App::init_engine(&engine);
+            }
+        }
+    } else {
+        App::init_engine(&engine);
+    }
 
     // IPC control surface for the CLI (and future automation).
     let socket = ipc::default_socket_path();
@@ -2598,6 +4065,7 @@ fn main() -> Result<()> {
 
     let mut app = App::new(engine);
     app.wake_proxy = Some(event_loop.create_proxy());
+    app.demo_mode = demo;
 
     // First-run experience (§26): show the empty state when no agent
     // sessions exist yet. Esc dismisses it for the session.
@@ -2606,7 +4074,7 @@ fn main() -> Result<()> {
             let eng = app.engine.lock().expect("engine lock");
             eng.agent_runtime().session_count() > 0
         };
-        if !has_agents {
+        if !has_agents && !app.demo_mode {
             app.open_empty_state();
         }
     }

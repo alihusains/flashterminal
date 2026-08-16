@@ -49,6 +49,17 @@ pub fn now_ms() -> u64 {
 // §3–§8 requests, context, configuration
 // ---------------------------------------------------------------------------
 
+/// Planner request mode (3e.md §11): an initial plan vs a replan. For a
+/// replan the request carries the current workflow, trigger, evidence and
+/// remaining work inside `context`/`intent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannerRequestMode {
+    #[default]
+    Initial,
+    Replan,
+}
+
 /// What the user asked for (§4). Carries a bounded, allowlisted context —
 /// never the filesystem, never secrets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +71,9 @@ pub struct PlannerRequest {
     pub workspace_id: String,
     pub context: PlannerContext,
     pub constraints: PlannerConstraints,
+    /// §11: Initial | Replan. Defaults to Initial for existing callers.
+    #[serde(default)]
+    pub mode: PlannerRequestMode,
 }
 
 /// Bounded constraints the planner must respect (§4, §12).

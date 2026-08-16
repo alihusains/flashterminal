@@ -315,6 +315,13 @@ impl AgentRegistry {
             "opencode" => Some(Arc::new(crate::adapters::opencode::OpenCodeAdapter::new())),
             "pi" => Some(Arc::new(crate::adapters::pi::PiAdapter::new())),
             "fake-agent" => Some(Arc::new(crate::adapters::fake::FakeAgentAdapter::new())),
+            // Demo aliases (desktop `--demo`): deterministic fake behavior
+            // (working/approval/completion/failure fixtures) under
+            // provider-looking names. Never used outside demo mode — no
+            // builtin definition uses the `demo-` prefix.
+            id if id.starts_with("demo-") => {
+                Some(Arc::new(crate::adapters::fake::FakeAgentAdapter::new()))
+            }
             _ => self.get(id).map(|def| {
                 Arc::new(GenericCliAdapter::for_definition(def.clone()))
                     as Arc<dyn AgentAdapterImpl>
@@ -835,6 +842,16 @@ impl AgentRuntime {
     /// plan validation consult the engine's authoritative registry).
     pub fn registry(&self) -> &AgentRegistry {
         &self.registry
+    }
+
+    /// Mutable registry access (definition registration — e.g. demo mode
+    /// registering provider-named definitions backed by fixtures). The
+    /// runtime is the registry's single owner (the engine moves it in at
+    /// construction and never clones it), so `Arc::get_mut` always hires.
+    pub fn registry_mut(&mut self) -> &mut AgentRegistry {
+        let inner = Arc::get_mut(&mut self.registry)
+            .expect("registry Arc is uniquely owned by the agent runtime");
+        inner
     }
 
     /// Provider ids the user may select for the planner (3b.md §35 — the

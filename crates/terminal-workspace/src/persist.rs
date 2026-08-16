@@ -17,7 +17,10 @@ use serde_json::Value;
 
 use crate::model::PersistedState;
 
-pub const CURRENT_VERSION: u32 = 1;
+/// v1: workspaces + orchestration + worktrees + artifacts + adaptive.
+/// v2 (Phase 4 §17/§25/§29): persisted audit trail + persisted policy
+/// state (network/secret/budget policy, budget ledger, pending approvals).
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Default on-disk location (overridable for tests).
 pub fn default_state_path() -> std::path::PathBuf {
@@ -45,10 +48,32 @@ pub fn save(state: &PersistedState, path: &std::path::Path) -> Result<()> {
 }
 
 /// Loads and migrates state. Unknown/newer versions return an explicit error
-/// so the caller can back up and start fresh (fail-safe, §36).
+/// so the caller can back up and start fresh (fail-safe, §36). Corrupt or
+/// truncated files are backed up to `<path>.corrupt-<unix>` and reported
+/// explicitly — never silently deserialized (§28).
 pub fn load(path: &std::path::Path) -> Result<PersistedState> {
-    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let value: Value = serde_json::from_str(&raw).context("parse state json")?;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("state file {} does not exist", path.display())
+        }
+        Err(e) => bail!("read {}: {e}", path.display()),
+    };
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            // §28: never blindly deserialize corrupted state — quarantine it
+            // and fail loudly with a recovery hint.
+            let backup = format!("{}.corrupt-{}", path.display(), now_unix());
+            if let Err(be) = std::fs::rename(path, &backup) {
+                tracing::warn!("quarantine {path:?} failed: {be}");
+            }
+            bail!(
+                "state file {} is corrupt or truncated: {e}\ncorrupted copy preserved at: {backup}",
+                path.display()
+            );
+        }
+    };
     let version = value.get("version").and_then(Value::as_u64).unwrap_or(0);
     if version > CURRENT_VERSION as u64 {
         bail!(
@@ -63,7 +88,14 @@ pub fn load(path: &std::path::Path) -> Result<PersistedState> {
     Ok(state)
 }
 
-/// Version migration chain. Currently v0 (missing version) → v1.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Version migration chain. Currently v0 (missing version) → v1 → v2.
 fn migrate(value: Value, version: u64) -> Result<Value> {
     let mut v = value;
     if version == 0 {
@@ -76,7 +108,16 @@ fn migrate(value: Value, version: u64) -> Result<Value> {
         }
     }
     if version == 1 {
-        // Future migrations chain here (v1 -> v2, ...).
+        // v1 → v2 (Phase 4 §29): audit + policy are optional serde(default)
+        // fields, so a v1 payload is already decodable as v2 — stamp the
+        // version so future migrations can depend on it.
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("version".into(), serde_json::json!(2));
+        }
+        v = migrate(v, 2)?;
+    }
+    if version == 2 {
+        // Future migrations chain here (v2 -> v3, ...).
     }
     Ok(v)
 }
@@ -101,11 +142,17 @@ mod tests {
         ws.active_tab = Some(tab_id);
         let ws_id = ws.id.clone();
         PersistedState {
-            version: 1,
+            version: crate::persist::CURRENT_VERSION,
             workspaces: vec![ws],
             active_workspace: Some(ws_id),
             tasks: None,
             worktrees: None,
+            artifacts: None,
+            review_reports: None,
+            replan_signals: None,
+            adaptive: None,
+            audit: None,
+            policy: None,
         }
     }
 
@@ -142,7 +189,80 @@ mod tests {
         let path: PathBuf = dir.join("state.json");
         std::fs::write(&path, r#"{"workspaces": [], "active_workspace": null}"#).unwrap();
         let back = load(&path).unwrap();
-        assert_eq!(back.version, 1);
+        assert_eq!(back.version, CURRENT_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_v1_to_current() {
+        // A real v1 payload (no audit/policy fields) must load as the
+        // current version with empty policy/audit — the permanent schema
+        // migration test (§29: old state → current version).
+        let dir = std::env::temp_dir().join(format!("ft-persist4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path: PathBuf = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"version": 1, "workspaces": [], "active_workspace": null}"#,
+        )
+        .unwrap();
+        let back = load(&path).unwrap();
+        assert_eq!(back.version, CURRENT_VERSION);
+        assert!(back.audit.is_none());
+        assert!(back.policy.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_state_is_quarantined_and_reported() {
+        // §28: truncated/corrupt JSON must fail explicitly, never
+        // silently parse; the broken file is preserved for recovery.
+        let dir = std::env::temp_dir().join(format!("ft-persist5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path: PathBuf = dir.join("state.json");
+        std::fs::write(&path, r#"{"version": 2, "workspaces": [{"id": "#).unwrap();
+        let err = load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("corrupt or truncated"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("preserved at"), "recovery hint missing: {err}");
+        // The original file must no longer sit at the state path.
+        assert!(!path.exists());
+        // A quarantined backup must exist.
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries.iter().any(|e| e.starts_with("state.json.corrupt-")),
+            "no quarantine backup in {entries:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn valid_policy_and_audit_survive_roundtrip() {
+        // §17/§25/§29: audit + policy persisted, restored.
+        let dir = std::env::temp_dir().join(format!("ft-persist6-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path: PathBuf = dir.join("state.json");
+        let mut s = sample_state();
+        s.audit = Some(vec![terminal_session::audit::AuditEvent::new(
+            terminal_session::audit::AuditEventKind::ActionAllowed,
+            "wf",
+            "cd /tmp",
+            "engine",
+        )
+        .with_risk(terminal_session::policy::RiskLevel::Low)]);
+        s.policy = Some(terminal_session::policy::PersistedPolicyState::from(
+            &terminal_session::policy::PolicyEngine::new(),
+        ));
+        save(&s, &path).unwrap();
+        let back = load(&path).unwrap();
+        assert_eq!(back.version, CURRENT_VERSION);
+        assert_eq!(back.audit.as_ref().map(|a| a.len()), Some(1));
+        assert!(back.policy.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

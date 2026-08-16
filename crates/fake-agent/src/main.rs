@@ -15,6 +15,9 @@
 //!   via `--write-file <relpath>` (content = `--set-content <text>` or a
 //!   deterministic default), then exits 0. Runs in the agent's cwd, so in
 //!   an isolated worktree it only ever touches that worktree.
+//! - `--scenario flood` : Deterministic self-generated flood — exactly
+//!   1000 lines/s for `--duration` (default 20 s); drains stdin so bench
+//!   writes never wedge it (Phase 3F §39 fixture)
 
 use std::io::{self, BufRead, Write};
 use std::path::Path;
@@ -47,6 +50,24 @@ fn main() {
             let mut v = Vec::new();
             let mut i = start + 1;
             while i < args.len() && args[i] != "--set-content" && args[i] != "--duration" {
+                v.push(args[i].clone());
+                i += 1;
+            }
+            v
+        })
+        .unwrap_or_default();
+    // Phase 3D: files to read (artifact consumption fixture).
+    let read_files: Vec<String> = args
+        .iter()
+        .position(|a| a == "--read-file")
+        .map(|start| {
+            let mut v = Vec::new();
+            let mut i = start + 1;
+            while i < args.len()
+                && args[i] != "--set-content"
+                && args[i] != "--duration"
+                && args[i] != "--write-file"
+            {
                 v.push(args[i].clone());
                 i += 1;
             }
@@ -124,6 +145,18 @@ fn main() {
             eprintln!("Error: Simulated agent failure");
             std::process::exit(1);
         }
+        // Phase 3E: deterministic test-failure fixture — the agent runs the
+        // tests, reports failures, and exits 1. The evaluator surfaces a
+        // TestsFailed replan signal (3e.md §7). The `$ cargo test` line is
+        // captured by the runtime's command observer so the engine can
+        // deterministically attribute the failure to tests.
+        "tests-failed" => {
+            println!("Running test suite...");
+            println!("$ cargo test");
+            println!("FAILED: 14 tests failed, 3 passed");
+            eprintln!("Error: test suite failed (14 failures)");
+            std::process::exit(1);
+        }
         "auth-failure" => {
             eprintln!("Error: Invalid API credentials");
             std::process::exit(2);
@@ -136,6 +169,31 @@ fn main() {
                 std::process::exit(3);
             }
             println!("Task completed successfully (attempt {attempt}).");
+            std::process::exit(0);
+        }
+        // Phase 3D: artifact-consumption fixture — reads a file the engine
+        // materialized into this agent's worktree (cross-worktree artifact
+        // handoff, 3d.md §11) and reports its content deterministically.
+        // `--read-file <relpath>`; missing/unreadable → exit 1.
+        "consume" => {
+            if read_files.is_empty() {
+                eprintln!("consume: no --read-file given");
+                std::process::exit(1);
+            }
+            for rel in &read_files {
+                if Path::new(rel).is_absolute() || rel.contains("..") || rel.contains("\\") {
+                    eprintln!("refusing unsafe path {rel}");
+                    std::process::exit(1);
+                }
+                match std::fs::read_to_string(rel) {
+                    Ok(content) => println!("CONSUMED {rel}: {}", content.trim_end()),
+                    Err(e) => {
+                        eprintln!("consume: cannot read {rel}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            println!("Consumption complete.");
             std::process::exit(0);
         }
         "modify" => {
@@ -197,6 +255,46 @@ fn main() {
                     thread::sleep(Duration::from_millis(5));
                 }
             }
+        }
+        "flood" => {
+            // §39 bench fixture: deterministic self-generated flood —
+            // exactly 1000 lines/s for `--duration` (default 20 s). Drain
+            // stdin non-blockingly so a bench-side write to our PTY can
+            // never wedge the process.
+            let deadline = duration_secs.map(|s| Instant::now() + Duration::from_secs(s));
+            let interval = Duration::from_micros(1_000); // 1000 lines/s
+            let mut next = Instant::now();
+            let mut step = 0u64;
+            while deadline.map(|d| Instant::now() < d).unwrap_or(true) {
+                let status = unsafe {
+                    let mut pfd = libc::pollfd {
+                        fd: 0,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    libc::poll(&mut pfd, 1, 0)
+                };
+                if status > 0 {
+                    let mut line = String::new();
+                    let got = io::stdin().read_line(&mut line).unwrap_or(0);
+                    if got == 0 {
+                        break;
+                    }
+                    if line.trim() == "exit" || line.trim() == "quit" {
+                        break;
+                    }
+                }
+                println!("flood-line {step} 0123456789abcdefghijklmnopqrstuvwxyz0123456789");
+                step += 1;
+                next += interval;
+                let now = Instant::now();
+                if now < next {
+                    thread::sleep(next - now);
+                } else {
+                    next = now; // never accumulate drift
+                }
+            }
+            println!("Flood agent finished ({} lines).", step);
         }
         "long-running" => {
             // Continuous work output until stdin closes (or --duration).

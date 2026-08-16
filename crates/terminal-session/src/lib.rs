@@ -20,12 +20,17 @@
 //! crate assumes a single session.
 
 pub mod adapters;
+pub mod adaptive;
 pub mod agent;
+pub mod artifacts;
+pub mod audit;
+pub mod collaboration;
 pub mod credential;
 pub mod execution;
 pub mod launch;
 pub mod orchestration;
 pub mod planning;
+pub mod policy;
 pub mod provider;
 pub mod redact;
 pub mod work;
@@ -60,6 +65,10 @@ pub struct SessionStats {
     pub events_read: AtomicU64,
     /// Batches (channel sends) forwarded to the UI thread.
     pub batches: AtomicU64,
+    /// Batches *applied* to the grid by the UI thread (incremented in
+    /// [`Session::drain`]). Lets a latency harness measure input→echo per
+    /// session instead of waiting on any pane's output (Phase 3F §12).
+    pub applied_batches: AtomicU64,
 }
 
 const CHANNEL_CAPACITY: usize = 1024;
@@ -186,6 +195,19 @@ impl Session {
                         Ok(ReadResult::Eof) => {
                             let _ = event_tx_reader.send(SessionEvent::Exited { code: None });
                             exited_reader.store(true, Ordering::SeqCst);
+                            // EOF sentinel through the raw-output tap: the
+                            // agent pump thread consumes the tap on a ~25ms
+                            // poll, so without this wakeup it could notice
+                            // the exit up to 25ms late. When two agents exit
+                            // in the same instant, their pump polls and the
+                            // engine's frame boundary can straddle — which
+                            // exit is observed first flips the scheduler
+                            // trace (3a §48 determinism). An empty chunk
+                            // wakes the pump immediately; `process_chunk`
+                            // treats it as a no-op (zero bytes, no lines).
+                            if let Some(tap) = &tap {
+                                tap(&[]);
+                            }
                             if let Some(w) = &wake {
                                 w();
                             }
@@ -248,6 +270,7 @@ impl Session {
                     for e in events {
                         state.apply_event(e);
                     }
+                    self.stats.applied_batches.fetch_add(1, Ordering::Relaxed);
                     changed = true;
                 }
                 SessionEvent::Exited { .. } => {

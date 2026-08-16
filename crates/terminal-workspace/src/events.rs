@@ -93,6 +93,29 @@ impl EventFilter {
             ApplicationEvent::AgentEvent { .. } => self.agent,
             ApplicationEvent::TaskEvent { .. } => self.task,
             ApplicationEvent::PlannerEvent { .. } => self.planner,
+            // Phase 3D collaboration events ride the task channel (they are
+            // workflow state) — metadata only, never payloads (§27).
+            ApplicationEvent::ArtifactCreated { .. }
+            | ApplicationEvent::ReviewFindingCreated { .. }
+            | ApplicationEvent::SynthesisStarted { .. }
+            | ApplicationEvent::SynthesisCompleted { .. }
+            | ApplicationEvent::ArtifactConsumed { .. }
+            | ApplicationEvent::WorkflowNeedsReplan { .. }
+            // Phase 3E adaptive events ride the task channel (workflow
+            // state) — metadata only (§39).
+            | ApplicationEvent::ReplanRequested { .. }
+            | ApplicationEvent::ReplanProposed { .. }
+            | ApplicationEvent::ReplanEdited { .. }
+            | ApplicationEvent::ReplanApproved { .. }
+            | ApplicationEvent::ReplanRejected { .. }
+            | ApplicationEvent::PlanSuperseded { .. }
+            | ApplicationEvent::TaskInvalidated { .. }
+            | ApplicationEvent::ArtifactInvalidated { .. }
+            | ApplicationEvent::BudgetRisk { .. }
+            | ApplicationEvent::HumanEscalation { .. }
+            // Phase 3F: global controls are workflow state changes.
+            | ApplicationEvent::WorkflowStopped { .. }
+            | ApplicationEvent::WorkflowPaused { .. } => self.task,
         }
     }
 }
@@ -130,6 +153,29 @@ fn is_critical(event: &ApplicationEvent) -> bool {
         // Planner events are low-frequency lifecycle transitions (approval
         // gates, execution start) — never dropped for a live subscriber.
         ApplicationEvent::PlannerEvent { .. } => true,
+        // Phase 3D: synthesis/replan signals are state changes; findings
+        // and consumption are high-frequency metadata (droppable).
+        ApplicationEvent::SynthesisCompleted { .. }
+        | ApplicationEvent::WorkflowNeedsReplan { .. } => true,
+        // Phase 3E: approval gates, supersession, invalidations and
+        // escalations are state changes — never dropped. Budget-risk
+        // warnings are state too (they gate continuation).
+        ApplicationEvent::ReplanProposed { .. }
+        | ApplicationEvent::ReplanEdited { .. }
+        | ApplicationEvent::ReplanApproved { .. }
+        | ApplicationEvent::ReplanRejected { .. }
+        | ApplicationEvent::PlanSuperseded { .. }
+        | ApplicationEvent::TaskInvalidated { .. }
+        | ApplicationEvent::ArtifactInvalidated { .. }
+        | ApplicationEvent::BudgetRisk { .. }
+        | ApplicationEvent::HumanEscalation { .. } => true,
+        ApplicationEvent::ReplanRequested { .. } => false,
+        ApplicationEvent::ArtifactCreated { .. }
+        | ApplicationEvent::ReviewFindingCreated { .. }
+        | ApplicationEvent::SynthesisStarted { .. }
+        | ApplicationEvent::ArtifactConsumed { .. } => false,
+        // Phase 3F: STOP ALL / PAUSE ALL are state changes — never dropped.
+        ApplicationEvent::WorkflowStopped { .. } | ApplicationEvent::WorkflowPaused { .. } => true,
     }
 }
 

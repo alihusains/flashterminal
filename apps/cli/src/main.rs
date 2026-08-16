@@ -174,12 +174,95 @@ fn main() -> Result<()> {
         "plan" => plan_cmd(&args[1..])?,
         // Phase 3C: `terminal worktree list|inspect|diff|merge|discard|cleanup|orphans|budget`.
         "worktree" | "worktrees" => worktree_cmd(&args[1..])?,
-        // §42 workflow commands: list = task list, validate = graph check.
+        // Phase 3D: `terminal artifact|review|synthesize|replan ...`.
+        "artifact" | "artifacts" => artifact_cmd(&args[1..])?,
+        "review" => review_cmd(&args[1..])?,
+        "synthesize" => Request::Synthesize {
+            task_ids: args[1..].to_vec(),
+            artifact_ids: Vec::new(),
+        },
+        // Phase 3E §41: `terminal replan list|show|approve|reject|edit …`.
+        "replan" => match args.get(1).map(|s| s.as_str()) {
+            Some("list") => Request::ReplanList,
+            Some("show") | Some("inspect") => {
+                let id = args.get(2).context("usage: terminal replan show <id>")?;
+                Request::ReplanInspect {
+                    replan_id: id.clone(),
+                }
+            }
+            Some("approve") => {
+                let id = args.get(2).context("usage: terminal replan approve <id>")?;
+                Request::ReplanApprove {
+                    replan_id: id.clone(),
+                }
+            }
+            Some("reject") => {
+                let id = args.get(2).context("usage: terminal replan reject <id> [reason]")?;
+                let reason = args.get(3).cloned().unwrap_or_else(|| "rejected".to_string());
+                Request::ReplanReject {
+                    replan_id: id.clone(),
+                    reason,
+                }
+            }
+            Some("edit") => bail!(
+                "usage: terminal replan edit is not yet wired to a concrete edit — use the plan edit surface"
+            ),
+            Some(goal) => Request::Replan { goal: goal.to_string() },
+            None => bail!("usage: terminal replan <goal>|list|show|approve|reject"),
+        },
+        "replan-signals" => Request::ReplanSignals,
+        // §40/§41: workflow history + interventions; §42 workflow list/validate.
         "workflow" => match args.get(1).map(|s| s.as_str()) {
             Some("list") => Request::TaskList,
             Some("validate") => Request::WorkflowValidate,
-            other => bail!("usage: terminal workflow list|validate (got {other:?})"),
+            Some("history") => Request::WorkflowHistory {
+                workflow_id: args.get(2).cloned().unwrap_or_default(),
+            },
+            Some("interventions") => Request::WorkflowInterventions {
+                workflow_id: args.get(2).cloned().unwrap_or_default(),
+            },
+            // Phase 3F §34: live state summary without opening a panel.
+            Some("summary") => Request::WorkflowSummary,
+            // Plan-version timeline (v1 → v2 → v3) with diffs.
+            Some("timeline") => Request::WorkflowHistory {
+                workflow_id: args.get(2).cloned().unwrap_or_default(),
+            },
+            // Structured replan signals behind those versions.
+            Some("replans") => Request::ReplanSignals,
+            other => bail!(
+                "usage: terminal workflow list|validate|history|summary|timeline|replans|interventions (got {other:?})"
+            ),
         },
+        // Phase 3F (§31–§33): global workflow controls + attention queue.
+        "control" => control_cmd(&args[1..])?,
+        "attention" => Request::AttentionItems,
+        // Phase 3E: adaptive status + explicit invalidations.
+        "adaptive" => Request::AdaptiveStatus,
+        "invalidate-task" => {
+            let task = args.get(1).context("usage: terminal invalidate-task <id> <reason>")?;
+            let reason = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "invalidated".to_string());
+            Request::InvalidateTask {
+                task_id: task.clone(),
+                reason,
+                evidence: Vec::new(),
+                approved: true,
+            }
+        }
+        "invalidate-artifact" => {
+            let art = args.get(1).context("usage: terminal invalidate-artifact <id> <reason>")?;
+            let reason = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "invalidated".to_string());
+            Request::InvalidateArtifact {
+                artifact_id: art.clone(),
+                reason,
+                evidence: Vec::new(),
+            }
+        }
         "help" | "--help" | "-h" => {
             print_help();
             return Ok(());
@@ -198,6 +281,20 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Phase 3F (§32–§33): `terminal control stop-all|pause-all|resume-all`
+/// — global workflow emergency controls.
+fn control_cmd(args: &[String]) -> Result<Request> {
+    let Some(cmd) = args.first() else {
+        bail!("usage: terminal control stop-all|pause-all|resume-all");
+    };
+    Ok(match cmd.as_str() {
+        "stop-all" | "stop" => Request::StopAll,
+        "pause-all" | "pause" => Request::PauseAll,
+        "resume-all" | "resume" => Request::ResumeAll,
+        other => bail!("unknown control command `{other}`"),
+    })
 }
 
 fn agent_cmd(args: &[String]) -> Result<Request> {
@@ -422,6 +519,41 @@ fn task_cmd(args: &[String]) -> Result<Request> {
         "policy" => Request::TaskPolicy,
         "scheduler" => Request::SchedulerStatus,
         other => bail!("unknown task command `{other}`"),
+    })
+}
+
+/// Phase 3D: `terminal artifact list|get|payload|lineage|select <task-id>`.
+fn artifact_cmd(args: &[String]) -> Result<Request> {
+    let Some(cmd) = args.first() else {
+        bail!("usage: terminal artifact list|get|payload|lineage|select");
+    };
+    Ok(match cmd.as_str() {
+        "list" | "ls" => Request::ArtifactList,
+        "get" => Request::ArtifactGet {
+            artifact_id: required(args, 1, "get <artifact-id>")?,
+        },
+        "payload" => Request::ArtifactPayload {
+            artifact_id: required(args, 1, "payload <artifact-id>")?,
+        },
+        "lineage" => Request::ArtifactLineage,
+        "select" => Request::ArtifactSelect {
+            task_id: args.get(1).cloned(),
+            max_results: 32,
+        },
+        other => bail!("unknown artifact command `{other}`"),
+    })
+}
+
+/// Phase 3D: `terminal review findings|consensus <task-id>`.
+fn review_cmd(args: &[String]) -> Result<Request> {
+    let Some(cmd) = args.first() else {
+        bail!("usage: terminal review findings|consensus <task-id>");
+    };
+    Ok(match cmd.as_str() {
+        "consensus" | "status" => Request::TaskReviewConsensus {
+            task_id: required(args, 1, "consensus <task-id>")?,
+        },
+        other => bail!("unknown review command `{other}`"),
     })
 }
 
@@ -1010,9 +1142,280 @@ fn print_response(resp: Response) {
         Response::WorktreeBudget { budget } => {
             println!("max_worktrees: {}", budget.max_worktrees);
         }
+        // --- Phase 3D printers (3d.md §46–§48, §29–§30) ---
+        Response::Artifacts { artifacts } => {
+            if artifacts.is_empty() {
+                println!("no artifacts");
+            }
+            for r in &artifacts {
+                let a = &r.artifact;
+                println!(
+                    "{} [{:?}] {} — {} (by {} · {} B payload)",
+                    a.id,
+                    a.kind,
+                    a.description,
+                    a.created_by_task.as_deref().unwrap_or("<none>"),
+                    a.created_by_agent.as_deref().unwrap_or("?"),
+                    r.payload_size()
+                );
+                if let Some(p) = &a.path {
+                    println!("    path: {p}");
+                }
+                if let Some(rev) = &a.revision {
+                    println!("    revision: {rev}");
+                }
+            }
+        }
+        Response::Artifact { artifact } => match artifact {
+            Some(r) => {
+                let a = &r.artifact;
+                println!(
+                    "{} [{:?}] {} — by {}",
+                    a.id,
+                    a.kind,
+                    a.description,
+                    a.created_by_agent.as_deref().unwrap_or("?")
+                );
+                if let Some(p) = &a.path {
+                    println!("  path: {p}");
+                }
+                if let Some(rev) = &a.revision {
+                    println!("  revision: {rev}");
+                }
+                println!("  payload: {} B", r.payload_size());
+            }
+            None => println!("artifact not found"),
+        },
+        Response::ArtifactPayload { payload, .. } => match payload {
+            Some(p) => print!("{}", String::from_utf8_lossy(&p)),
+            None => println!("no payload (metadata only)"),
+        },
+        Response::ArtifactLineage { lineage } => {
+            for (artifact, producer) in &lineage.producers {
+                println!("{producer} → artifact {artifact}");
+            }
+            for (artifact, consumers) in &lineage.consumers {
+                println!("artifact {artifact} ← {}", consumers.join(", "));
+            }
+        }
+        Response::ReviewConsensus { aggregation } => match aggregation {
+            Some(a) => {
+                println!("overall: {}", a.overall.label());
+                for (sev, n) in &a.severity_counts {
+                    println!("  {} {}", sev.label(), n);
+                }
+                for e in &a.explanations {
+                    println!("  why: {e}");
+                }
+            }
+            None => println!("no review reports recorded"),
+        },
+        Response::Synthesis { result } => {
+            println!("overall: {}", result.overall_status);
+            println!("{}", result.summary);
+            for w in &result.warnings {
+                println!("  warning: {w}");
+            }
+            for f in &result.failures {
+                println!("  failure: {f}");
+            }
+            println!(
+                "  artifacts: {} · inputs: {} task(s) · model: {}",
+                result.artifacts.len(),
+                result.provenance.input_task_ids.len(),
+                result
+                    .provenance
+                    .model
+                    .as_deref()
+                    .unwrap_or("deterministic")
+            );
+        }
+        Response::ReplanSignals { signals } => {
+            if signals.is_empty() {
+                println!("no replan signals");
+            }
+            for (cause, detail, at) in &signals {
+                println!("{cause}: {detail} (at {at})");
+            }
+        }
+        // Phase 3E: adaptive orchestration responses (§40–§41).
+        Response::ReplanList { proposals } => {
+            if proposals.is_empty() {
+                println!("no pending replans");
+            }
+            for p in &proposals {
+                println!(
+                    "{} [{}] {} — {} task(s), ${}.{:02}",
+                    p.id,
+                    p.triggers
+                        .iter()
+                        .map(|t| format!("{t:?}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    p.reason,
+                    p.new_tasks.len(),
+                    p.estimated_cost_cents.unwrap_or(0) / 100,
+                    p.estimated_cost_cents.unwrap_or(0) % 100
+                );
+            }
+        }
+        Response::ReplanInspect { proposal, version } => {
+            if let Some(p) = &proposal {
+                println!("replan: {}", p.id);
+                println!("  reason: {}", p.reason);
+                println!("  changes:");
+                for c in &p.changes {
+                    println!("    + {c}");
+                }
+                for (t, what) in &p.modified_tasks {
+                    println!("    ~ {t}: {what}");
+                }
+                for t in &p.removed_tasks {
+                    println!("    - {t}");
+                }
+                if let Some(d) = version.as_ref().and_then(|v| v.diff_from_previous.as_ref()) {
+                    println!("  diff:");
+                    for a in &d.added {
+                        println!("    + {a}");
+                    }
+                    for r in &d.removed {
+                        println!("    - {r}");
+                    }
+                    for m in &d.modified {
+                        println!("    ~ {m}");
+                    }
+                }
+            } else {
+                println!("no such replan");
+            }
+        }
+        Response::WorkflowHistory { versions } => {
+            for v in &versions {
+                println!(
+                    "v{} {} — {} step(s), approved={}, superseded_by={:?}, diff={}",
+                    v.version,
+                    v.plan_id,
+                    v.plan.steps.len(),
+                    v.approved,
+                    v.superseded_by,
+                    v.diff_from_previous
+                        .as_ref()
+                        .map(|d| format!(
+                            "+{} -{} ~{}",
+                            d.added.len(),
+                            d.removed.len(),
+                            d.modified.len()
+                        ))
+                        .unwrap_or_else(|| "-".to_string())
+                );
+            }
+        }
+        Response::WorkflowInterventions {
+            escalations,
+            task_invalidations,
+            artifact_invalidations,
+        } => {
+            for e in &escalations {
+                println!("escalation {}: {}", e.id, e.what_happened);
+                for a in &e.attempted {
+                    println!("  attempted: {a}");
+                }
+            }
+            for i in &task_invalidations {
+                println!(
+                    "task invalidated {}: {} (approved={})",
+                    i.task_id, i.reason, i.approved
+                );
+            }
+            for i in &artifact_invalidations {
+                println!("artifact invalidated {}: {}", i.artifact_id, i.reason);
+            }
+        }
+        Response::AdaptiveStatus {
+            limits,
+            limit_reached,
+            autonomy,
+            metrics,
+            quality,
+        } => {
+            println!("autonomy: {autonomy:?} (Automatic disabled in Phase 3E)");
+            println!(
+                "limits: max_replans={} cooldown={}s limit_reached={}",
+                limits.max_replans, limits.replan_cooldown_seconds, limit_reached
+            );
+            println!(
+                "replans: {} proposed, {} approved, {} rejected, {} edited — approval rate {:.0}%",
+                metrics.replan_count,
+                metrics.replan_approval_count,
+                metrics.replan_rejection_count,
+                metrics.replan_edit_count,
+                metrics.approval_rate() * 100.0
+            );
+            println!(
+                "planner quality: {} valid, {} invalid, {} edits, {} rejections",
+                quality.valid_replan_rate,
+                quality.invalid_replan_rate,
+                quality.human_edit_rate,
+                quality.human_rejection_rate
+            );
+        }
         Response::Subscribed { .. } => {
             // Only reachable through the streaming path; handled in
             // `agent_watch` before any roundtrip.
+        }
+        // --- Phase 3F printers (§31–§34) ---
+        Response::StopAll { report } => {
+            println!(
+                "STOP ALL: {} agent(s) stopped · {} task(s) stopped · {} human decision(s) preserved",
+                report.agents_stopped, report.tasks_stopped, report.preserved_decisions
+            );
+        }
+        Response::WorkflowSummary { summary } => {
+            println!(
+                "workflows: {} · running: {} · waiting: {} · needs you: {} · completed today: {} · failed: {} · est. cost: ${}.{:02}{}",
+                summary.workflows,
+                summary.running,
+                summary.waiting,
+                summary.needs_approval,
+                summary.completed_today,
+                summary.failed,
+                summary.estimated_cost_cents / 100,
+                summary.estimated_cost_cents % 100,
+                if summary.paused { " · PAUSED" } else { "" }
+            );
+        }
+        Response::AttentionItems { items } => {
+            if items.total == 0 {
+                println!("nothing needs you");
+                return;
+            }
+            println!("{} item(s) need a human decision:", items.total);
+            for a in &items.agents {
+                println!(
+                    "  agent {} [{}] — {}{}",
+                    a.execution_id,
+                    a.display_name,
+                    a.state,
+                    a.attention
+                        .as_ref()
+                        .map(|t| format!(" ({t})"))
+                        .unwrap_or_default()
+                );
+            }
+            for t in &items.review_tasks {
+                println!(
+                    "  task {} [{}] — {} needs review",
+                    t.task_id, t.title, t.state
+                );
+            }
+            for r in &items.replans {
+                println!(
+                    "  replan {} — {}{}",
+                    r.replan_id,
+                    r.reason,
+                    r.version.map(|v| format!(" (v{v})")).unwrap_or_default()
+                );
+            }
         }
     }
 }
@@ -1063,7 +1466,13 @@ fn print_help() {
          terminal task set-policy <max-parallel|max-agents|max-cost-cents|max-retries> <value>\n\
          terminal task scheduler\n\
          terminal task validate\n\
-         terminal workflow list|validate\n\
+         terminal workflow list|validate|history|interventions\n\
+         terminal workflow summary                # live state: running/needs-you/cost (§34)\n\
+         terminal workflow timeline                # plan version timeline (v1 → v2 → v3)\n\
+         terminal workflow replans                 # structured replan signals\n\
+         terminal control stop-all                 # stop every agent + cancel tasks (§32)\n\
+         terminal control pause-all|resume-all     # gate new work while state is kept (§33)\n\
+         terminal attention                        # everything that needs a human decision (§31)\n\
          terminal plan create <intent>          # LLM-planned workflow (validated, needs approval)\n\
          terminal plan status\n\
          terminal plan approve|reject\n\
@@ -1072,6 +1481,16 @@ fn print_help() {
          terminal plan metrics\n\
          terminal worktree list|orphans|cleanup|budget\n\
          terminal worktree inspect|diff|merge|discard <worktree-id>\n\
-         terminal task environment <task-id>     # execution-environment preview"
+         terminal task environment <task-id>     # execution-environment preview\n\
+         terminal artifact list|get|payload|lineage|select <task-id>\n\
+         terminal review consensus <task-id>\n\
+         terminal synthesize <task-id>...        # deterministic result synthesis\n\
+         terminal replan <goal>                  # human replan (new plan needs approval)\n\
+         terminal replan list|show <id>         # Phase 3E: proposals\n\
+         terminal replan approve|reject <id>    # Phase 3E: approve/reject (original stays intact)\n\
+         terminal adaptive                      # replan limits, autonomy, metrics\n\
+         terminal invalidate-task <id> <reason>\n\
+         terminal invalidate-artifact <id> <reason>\n\
+         terminal replan-signals"
     );
 }

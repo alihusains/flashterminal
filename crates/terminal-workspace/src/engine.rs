@@ -18,15 +18,30 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use chrono::Timelike;
 use pty::PtyManager;
 use terminal_core::{DirtyTracker, RenderSnapshot, TerminalState};
+use terminal_session::adaptive::{
+    ArtifactInvalidation, AutonomyPolicy, HumanEscalation, PlanVersion, PlannerQualityMetrics,
+    ProposedReplan, ReplanLimits, ReplanMetrics, ReplanSeverity, ReplanSignal, ReplanTrigger,
+    SignalRegistry, TaskInvalidation, WorkflowEvaluator, WorkflowSnapshot,
+};
 use terminal_session::agent::{AgentRegistry, AgentRuntime};
+use terminal_session::artifacts::{
+    ArtifactAccessPolicy, ArtifactLineage, ArtifactMaterializer, ArtifactRetentionPolicy,
+    ArtifactSelector, ArtifactStore,
+};
+use terminal_session::audit::{AuditEvent, AuditEventKind, AuditTrail};
+use terminal_session::collaboration::{
+    ResultSynthesizer, ReviewAggregation, ReviewAggregator, ReviewPolicy, ReviewReport,
+    SynthesisInput, SynthesisResult,
+};
 use terminal_session::credential::CredentialStore;
 use terminal_session::execution::{ExecutionId, ExecutionKind};
 use terminal_session::launch::AgentLaunchConfig;
 use terminal_session::orchestration::{
-    RuntimeAgentView, SchedulerCommand, SchedulerView, Task, TaskContext, TaskEvent, TaskGraph,
-    TaskGraphError, TaskId, TaskPolicy, TaskScheduler, TaskStatus,
+    Artifact, RuntimeAgentView, SchedulerCommand, SchedulerView, Task, TaskContext, TaskEvent,
+    TaskGraph, TaskGraphError, TaskId, TaskPolicy, TaskScheduler, TaskStatus,
 };
 use terminal_session::planning::{
     classify_intent, normalize_intent, AgentAvailability, AgentSummary, IntentDisposition,
@@ -34,6 +49,10 @@ use terminal_session::planning::{
     PlannerConfig, PlannerConstraints, PlannerContext, PlannerContextBuilder, PlannerContextInput,
     PlannerError, PlannerEvent, PlannerMetrics, PlannerPhase, PlannerProvider, PlannerRequest,
     PlannerState, PlannerStatus, TaskSummary,
+};
+use terminal_session::policy::{
+    Action, ApprovalError, ApprovalId, AutonomyLevel, FilesystemScope, NetworkPolicy,
+    PolicyContext, PolicyDecision, PolicyEngine, PolicyEvaluation,
 };
 use terminal_session::provider::ProviderRegistry;
 use terminal_session::worktrees::{
@@ -78,6 +97,28 @@ fn task_status_of_event(event: &TaskEvent) -> Option<TaskStatus> {
         TaskEvent::TaskInterrupted { .. } => Some(TaskStatus::Interrupted),
         TaskEvent::TaskArtifactCreated { .. } => None,
     }
+}
+
+/// Phase 3D: raw-path inputs keep their 3A semantics (resolved by the
+/// adapter); structured `artifact://` URIs and plain artifact ids go
+/// through the artifact store (§10).
+fn is_raw_path(s: &str) -> bool {
+    s.starts_with('/') || s.starts_with("./") || s.starts_with("../")
+}
+
+/// Resolves a declared input artifact reference to a store artifact id:
+/// plain ids pass through, `artifact://<task>/<id>` URIs are parsed (§10).
+fn resolve_artifact_ref(s: &str) -> Option<String> {
+    if is_raw_path(s) {
+        return None;
+    }
+    if let Some(r) = terminal_session::artifacts::ArtifactReference::parse(s) {
+        return Some(r.artifact_id);
+    }
+    if s.is_empty() {
+        return None;
+    }
+    Some(s.to_string())
 }
 
 /// Phase 2C: parses a snapshot state string back to an `AgentState`
@@ -265,6 +306,20 @@ pub struct Multiplexer {
     /// caller for worktree operations. The planner never touches git; the
     /// scheduler never creates worktrees (§44–§45).
     worktrees: WorktreeManager,
+    /// Phase 3D: authoritative artifact store (3d.md §3) — bounded payloads,
+    /// lineage, access policy, cross-worktree materialization. Large
+    /// payloads never ride the event bus (§27).
+    artifacts: ArtifactStore,
+    /// Phase 3D §44: structured replanning signals — never an autonomous
+    /// replan; surfaced for a human decision.
+    replan_signals: Vec<(String, String, u64)>, // (cause, detail, at_ms) — legacy surface
+    /// Dedup keys for auto-detected replan signals (`cause:task_id`).
+    replan_emitted: std::collections::HashSet<String>,
+    /// Phase 3E: adaptive orchestration state (§4–§37).
+    adaptive: AdaptiveState,
+    /// Phase 3D §18–§20: review reports per reviewed task (independent
+    /// reviewers — no reviewer can modify another's result, §19).
+    review_reports: HashMap<TaskId, Vec<ReviewReport>>,
     layout: LayoutEngine,
     pub notifications: NotificationCenter,
     pub events: EventBus,
@@ -279,6 +334,121 @@ pub struct Multiplexer {
     /// True until the first frame has been rendered; the first frame marks
     /// every pane all-dirty so fresh grids are drawn once instead of blank.
     first_render: bool,
+    /// Phase 3F §33: PAUSE ALL gate — blocks new work (task spawns, manual
+    /// agent spawns, replans) while preserving current state. Running PTY
+    /// processes keep running (an honest pause mechanism for arbitrary
+    /// child processes does not exist here; §33 "where technically
+    /// possible").
+    workflow_paused: bool,
+    /// Phase 4 §1–§16: central policy engine — deterministic risk
+    /// classification, dangerous-command protection, filesystem scope,
+    /// network/secret/budget policies, autonomy levels, approval store.
+    policy: PolicyEngine,
+    /// Phase 4 §17–§19: first-class audit trail (bounded, redacted,
+    /// persisted with the session state).
+    audit: AuditTrail,
+}
+
+/// Phase 3F §32: report of a STOP ALL action.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopAllReport {
+    /// Agent sessions terminated (STOP ALL stopped their process groups).
+    pub agents_stopped: usize,
+    /// Tasks cancelled (running + pending execution).
+    pub tasks_stopped: usize,
+    /// Tasks that were awaiting a human decision and were preserved.
+    pub preserved_decisions: usize,
+}
+
+/// Phase 3F §34: live workflow state summary — answers "what is running,
+/// what needs me, what did it cost" without opening any panel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSummary {
+    /// Distinct workspaces that own at least one task.
+    pub workflows: usize,
+    pub running: usize,
+    pub waiting: usize,
+    /// Tasks in NeedsReview + agents in NeedsApproval + open replans.
+    pub needs_approval: usize,
+    /// Tasks completed since local midnight.
+    pub completed_today: usize,
+    pub failed: usize,
+    /// Estimated cost in cents (completed task results + running agents).
+    pub estimated_cost_cents: u64,
+    pub paused: bool,
+}
+
+/// Phase 3F §31: everything that currently needs a human decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionItems {
+    /// Agents waiting on a permission decision.
+    pub agents: Vec<AttentionAgent>,
+    /// Completed tasks gated on review.
+    pub review_tasks: Vec<AttentionTask>,
+    /// Open replan proposals awaiting approval/rejection.
+    pub replans: Vec<AttentionReplan>,
+    /// `agents + review_tasks + replans` — the "NEEDS YOU" badge count.
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionAgent {
+    pub execution_id: ExecutionId,
+    pub display_name: String,
+    pub state: String,
+    pub attention: Option<String>,
+    pub estimated_cost_cents: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionTask {
+    pub task_id: TaskId,
+    pub title: String,
+    pub state: String,
+    pub estimated_cost_cents: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionReplan {
+    pub replan_id: String,
+    pub workflow_id: String,
+    pub reason: String,
+    pub version: Option<u32>,
+    pub estimated_cost_cents: Option<u64>,
+}
+
+/// Phase 3E adaptive orchestration state (3e.md §4–§37). Owns the
+/// deterministic replanning half of the engine: signals, plan versions,
+/// diffs, invalidations, escalation, limits, policy and metrics. The
+/// planner only ever proposes; this state + the human approval boundary
+/// decide what actually changes (§2).
+#[derive(Debug, Default)]
+struct AdaptiveState {
+    /// Formal replan signals (§4) — deduplicated + cooldown-gated.
+    signals: Vec<ReplanSignal>,
+    /// Dedup/cooldown registry (§8–§9).
+    registry: SignalRegistry,
+    /// Immutable plan versions (v1 → v2 → v3, §13).
+    plan_versions: Vec<PlanVersion>,
+    /// Open replan proposals awaiting human decision (§12, §15).
+    proposals: Vec<ProposedReplan>,
+    /// Task invalidations (§19).
+    task_invalidations: Vec<TaskInvalidation>,
+    /// Artifact invalidations (§20) — old records preserved for lineage.
+    artifact_invalidations: Vec<ArtifactInvalidation>,
+    /// Human escalations (§33).
+    escalations: Vec<HumanEscalation>,
+    /// Autonomy policy (§34–§37). Automatic is disabled in Phase 3E.
+    autonomy: AutonomyPolicy,
+    /// Workflow-level replan limits (§9, §31).
+    limits: ReplanLimits,
+    /// Replan metrics (§24).
+    metrics: ReplanMetrics,
+    /// Planner-quality metrics (§25) — tracked separately.
+    quality: PlannerQualityMetrics,
+    /// Whether the replan limit was reached (§32) — workflow enters
+    /// Blocked/human-intervention state.
+    limit_reached: bool,
 }
 
 impl Multiplexer {
@@ -312,6 +482,11 @@ impl Multiplexer {
             planner_provider: None,
             plan_task_ids: Vec::new(),
             worktrees: WorktreeManager::new(),
+            artifacts: ArtifactStore::new(),
+            replan_signals: Vec::new(),
+            replan_emitted: std::collections::HashSet::new(),
+            adaptive: AdaptiveState::default(),
+            review_reports: HashMap::new(),
             layout: LayoutEngine::new(),
             notifications: NotificationCenter::new(),
             events: EventBus::new(),
@@ -320,6 +495,9 @@ impl Multiplexer {
             notified_attention: HashMap::new(),
             wake: wake_arc,
             first_render: true,
+            workflow_paused: false,
+            policy: PolicyEngine::default(),
+            audit: AuditTrail::new(),
         })
     }
 
@@ -1084,6 +1262,10 @@ impl Multiplexer {
         cols: u16,
         rows: u16,
     ) -> Result<ExecutionId> {
+        // Phase 3F §33: PAUSE ALL blocks new work from starting.
+        if self.workflow_paused {
+            anyhow::bail!("all workflows are paused — resume before spawning agents");
+        }
         let (eid, session) = self.agent_runtime.spawn(launch, cols, rows)?;
         let state = TerminalState::new(cols, rows);
         self.terminal_sessions.insert(eid.clone(), session);
@@ -1120,6 +1302,553 @@ impl Multiplexer {
     /// exists — no fake capability surfaces).
     pub fn pause_agent_session(&mut self, execution_id: &ExecutionId) -> Result<()> {
         self.agent_runtime.pause(execution_id)
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3F §32–§34: global controls + workflow state summary
+    // ------------------------------------------------------------------
+
+    /// §33 PAUSE ALL — blocks new work from starting (scheduler spawns,
+    /// manual agent spawns, replans) while preserving current state.
+    /// Running PTY processes are NOT stopped (honest limitation); agents
+    /// mid-work finish or are stopped individually.
+    pub fn set_workflow_paused(&mut self, paused: bool) {
+        if self.workflow_paused == paused {
+            return;
+        }
+        self.workflow_paused = paused;
+        self.events.publish(ApplicationEvent::WorkflowPaused {
+            paused,
+            workflow_id: self.active_workspace().id.clone(),
+        });
+        self.audit_kind(
+            if paused {
+                AuditEventKind::PauseAll
+            } else {
+                AuditEventKind::WorkflowResumed
+            },
+            self.active_workspace().id.clone(),
+            if paused {
+                "PAUSE ALL — new work blocked; running processes continue honestly"
+            } else {
+                "workflow resumed"
+            },
+            "user",
+        );
+    }
+
+    pub fn workflow_paused(&self) -> bool {
+        self.workflow_paused
+    }
+
+    /// §32 STOP ALL — stops every running agent session (process groups
+    /// terminated), cancels running + pending tasks, and preserves state:
+    /// records, artifacts, plan versions and human-pending decisions all
+    /// survive. Nothing ever auto-resumes.
+    pub fn stop_all(&mut self) -> StopAllReport {
+        let mut report = StopAllReport::default();
+        // 1. Every live agent session (task-bound or manual).
+        let eids: Vec<ExecutionId> = self.agent_runtime.execution_ids();
+        for eid in eids {
+            if self.agent_runtime.stop(&eid).is_ok() {
+                report.agents_stopped += 1;
+            }
+        }
+        // 2. Active/pending tasks (human-pending states are preserved).
+        let task_ids: Vec<TaskId> = self.tasks.graph().list_task_ids();
+        for tid in task_ids {
+            let status = self.tasks.graph().get_task(&tid).map(|t| t.status);
+            let active = matches!(
+                status,
+                Some(
+                    TaskStatus::Pending
+                        | TaskStatus::Ready
+                        | TaskStatus::Running
+                        | TaskStatus::Waiting
+                        | TaskStatus::Blocked
+                )
+            );
+            if active {
+                if self.tasks.cancel(&tid).is_ok() {
+                    report.tasks_stopped += 1;
+                }
+            } else if matches!(status, Some(TaskStatus::NeedsReview)) {
+                report.preserved_decisions += 1;
+            }
+        }
+        // 3. Open replan proposals stay open (a decision was pending).
+        report.preserved_decisions += self.adaptive.proposals.len();
+        self.step_tasks();
+        self.publish_task_events();
+        self.events.publish(ApplicationEvent::WorkflowStopped {
+            workflow_id: self.active_workspace().id.clone(),
+        });
+        self.audit.record_kind(
+            AuditEventKind::StopAll,
+            self.active_workspace().id.clone(),
+            format!(
+                "stopped {} agents and {} tasks ({} decisions preserved)",
+                report.agents_stopped, report.tasks_stopped, report.preserved_decisions
+            ),
+            "user",
+        );
+        report
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 4: policy engine + audit trail (§1–§19)
+    // ------------------------------------------------------------------
+
+    /// Immutable policy state (autonomy, scopes, budgets, approvals).
+    pub fn policy_state(&self) -> &PolicyEngine {
+        &self.policy
+    }
+
+    /// Mutable policy access — restricted to user-facing configuration
+    /// (never planner-facing; the planner only proposes).
+    pub fn policy_state_mut(&mut self) -> &mut PolicyEngine {
+        &mut self.policy
+    }
+
+    /// Evaluates an action against policy and records the evaluation in
+    /// the audit trail (§2, §17). The caller decides what to do with the
+    /// decision (execute / block / request approval).
+    pub fn evaluate_action(&mut self, action: &Action, ctx: &PolicyContext) -> PolicyEvaluation {
+        let ev = self.policy.evaluate(action, ctx);
+        // Specific denied kinds (§17): FilesystemDenied / NetworkDenied /
+        // SecretDenied make the audit trail answer "why was this blocked?"
+        // without needing to re-derive the category from the action
+        // description.
+        let kind = match (&ev.decision, action) {
+            (PolicyDecision::Deny, Action::Filesystem { .. }) => AuditEventKind::FilesystemDenied,
+            (PolicyDecision::Deny, Action::Network { .. }) => AuditEventKind::NetworkDenied,
+            (PolicyDecision::Deny, Action::Secret { .. }) => AuditEventKind::SecretDenied,
+            (PolicyDecision::Deny, _) => AuditEventKind::ActionDenied,
+            (PolicyDecision::Allow, _) => AuditEventKind::ActionAllowed,
+            (PolicyDecision::RequireApproval, _) => AuditEventKind::ActionRequiredApproval,
+        };
+        self.audit.record(
+            AuditEvent::new(kind, ctx.workflow_id.clone(), ev.action.clone(), "policy")
+                .with_risk(ev.risk)
+                .with_task(ctx.task_id.clone().unwrap_or_default())
+                .with_agent(ctx.agent_id.clone().unwrap_or_default())
+                .with_detail(ev.reasons.join("; "))
+                .with_result(match ev.decision {
+                    PolicyDecision::Deny => {
+                        terminal_session::audit::AuditResult::Denied(ev.reasons.join("; "))
+                    }
+                    _ => terminal_session::audit::AuditResult::Success,
+                }),
+        );
+        ev
+    }
+
+    /// Low-level audit recording (for existing engine paths).
+    pub fn audit_kind(
+        &mut self,
+        kind: AuditEventKind,
+        workflow_id: impl Into<String>,
+        action: impl Into<String>,
+        source: impl Into<String>,
+    ) -> String {
+        self.audit.record_kind(kind, workflow_id, action, source)
+    }
+
+    pub fn audit_trail(&self) -> &AuditTrail {
+        &self.audit
+    }
+
+    pub fn audit_records(&self) -> &[AuditEvent] {
+        self.audit.all()
+    }
+
+    /// "Why did FlashTerminal do this?" (§18).
+    pub fn audit_explain(&self, id: &str) -> Option<String> {
+        self.audit.explain(id)
+    }
+
+    pub fn audit_latest(&self, kind: AuditEventKind) -> Option<String> {
+        self.audit.explain_latest(kind)
+    }
+
+    /// Requests an approval for a RequireApproval decision (§15).
+    /// Records ApprovalRequested in the audit trail.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_policy_approval(
+        &mut self,
+        evaluation: &PolicyEvaluation,
+        ctx: &PolicyContext,
+        action_hash: &str,
+    ) -> ApprovalId {
+        let id = self.policy.request_approval(
+            evaluation,
+            ctx,
+            action_hash,
+            terminal_session::policy::Approval::DEFAULT_TTL_MS,
+        );
+        self.audit.record(
+            AuditEvent::new(
+                AuditEventKind::ApprovalRequested,
+                ctx.workflow_id.clone(),
+                evaluation.action.clone(),
+                format!("agent {}", ctx.agent_id.clone().unwrap_or_default()),
+            )
+            .with_task(ctx.task_id.clone().unwrap_or_default())
+            .with_agent(ctx.agent_id.clone().unwrap_or_default())
+            .with_risk(evaluation.risk)
+            .with_detail(format!("approval {id}; {}", evaluation.reasons.join("; "))),
+        );
+        id
+    }
+
+    /// Grants a pending approval (§15). Records ApprovalGranted.
+    pub fn grant_policy_approval(&mut self, id: &str, actor: &str) -> Result<(), ApprovalError> {
+        let wf = self
+            .policy
+            .approvals
+            .get(id)
+            .map(|a| a.workflow_id.clone())
+            .unwrap_or_default();
+        self.policy.approvals.grant(id, actor)?;
+        if !wf.is_empty() {
+            self.audit.record_kind(
+                AuditEventKind::ApprovalGranted,
+                wf,
+                format!("approval {id} granted by {actor}"),
+                "user",
+            );
+        }
+        Ok(())
+    }
+
+    /// Rejects a pending approval. Records ApprovalRejected.
+    pub fn reject_policy_approval(&mut self, id: &str) -> Result<(), ApprovalError> {
+        let wf = self
+            .policy
+            .approvals
+            .get(id)
+            .map(|a| a.workflow_id.clone())
+            .unwrap_or_default();
+        self.policy.approvals.reject(id)?;
+        if !wf.is_empty() {
+            self.audit.record_kind(
+                AuditEventKind::ApprovalRejected,
+                wf,
+                format!("approval {id} rejected"),
+                "user",
+            );
+        }
+        Ok(())
+    }
+
+    /// Honors a granted approval for execution (§15) — verifies workflow,
+    /// agent, freshness and action hash; consumes on success.
+    pub fn honor_policy_approval(
+        &mut self,
+        id: &str,
+        workflow_id: &str,
+        agent_id: Option<&str>,
+        action_hash: &str,
+    ) -> Result<(), ApprovalError> {
+        self.policy
+            .approvals
+            .honor(id, workflow_id, agent_id, action_hash)
+    }
+
+    /// Pending approvals for a workflow (approval center UX).
+    pub fn pending_approvals(&self, workflow_id: &str) -> Vec<terminal_session::policy::Approval> {
+        self.policy
+            .approvals
+            .pending(workflow_id)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Sets the autonomy level (§14). Audited; agents can never change
+    /// their own autonomy (the engine only accepts human UI calls).
+    pub fn set_autonomy_level(&mut self, level: AutonomyLevel) {
+        let prev = self.policy.autonomy;
+        if prev == level {
+            return;
+        }
+        self.policy.autonomy = level;
+        self.audit_kind(
+            AuditEventKind::PolicyEvaluated,
+            self.active_workspace().id.clone(),
+            format!("autonomy level changed: {:?} → {:?}", prev, level),
+            "user",
+        );
+    }
+
+    pub fn autonomy_level(&self) -> AutonomyLevel {
+        self.policy.autonomy
+    }
+
+    /// Sets the filesystem scope (§7). Audited.
+    pub fn set_filesystem_scope(&mut self, scope: FilesystemScope) {
+        let prev = self.policy.filesystem.as_str().to_string();
+        self.policy.filesystem = scope;
+        self.audit_kind(
+            AuditEventKind::PolicyEvaluated,
+            self.active_workspace().id.clone(),
+            format!(
+                "filesystem scope: {prev} → {}",
+                self.policy.filesystem.as_str()
+            ),
+            "user",
+        );
+    }
+
+    pub fn filesystem_scope(&self) -> &FilesystemScope {
+        &self.policy.filesystem
+    }
+
+    /// Sets the network policy (§10). The planner cannot change this —
+    /// only the user UI path calls here.
+    pub fn set_network_policy(&mut self, policy: NetworkPolicy) {
+        let prev = self.policy.network.as_str().to_string();
+        self.policy.network = policy;
+        self.audit_kind(
+            AuditEventKind::PolicyEvaluated,
+            self.active_workspace().id.clone(),
+            format!("network policy: {prev} → {}", self.policy.network.as_str()),
+            "user",
+        );
+    }
+
+    pub fn network_policy(&self) -> &NetworkPolicy {
+        &self.policy.network
+    }
+
+    /// Grants a secret allowance for a workflow (§11). `human_granted`
+    /// must come from the user UI (the planner cannot self-authorize).
+    pub fn grant_secret_allowance(
+        &mut self,
+        workflow_id: &str,
+        path_prefix: &str,
+        human_granted: bool,
+    ) {
+        self.policy
+            .secrets
+            .allowances
+            .push(terminal_session::policy::SecretAllowance::new(
+                workflow_id,
+                path_prefix,
+                human_granted,
+            ));
+        self.audit_kind(
+            AuditEventKind::PolicyEvaluated,
+            workflow_id,
+            format!("secret allowance granted (human={human_granted}): {path_prefix}"),
+            "user",
+        );
+    }
+
+    /// Budget increase (§13): only honored with `authorized=true` (human
+    /// approval or a policy-level configuration call). Audited.
+    pub fn increase_budget(
+        &mut self,
+        dimension: terminal_session::policy::BudgetDimension,
+        new_cap: u64,
+        authorized: bool,
+    ) -> Result<(), String> {
+        let mut policy = self.policy.budget_policy.clone();
+        self.policy
+            .budget
+            .authorize_increase(&mut policy, dimension, new_cap, authorized)?;
+        self.policy.budget_policy = policy;
+        self.audit_kind(
+            AuditEventKind::BudgetIncreased,
+            self.active_workspace().id.clone(),
+            format!("budget increased: {} → {new_cap}", dimension.label()),
+            if authorized {
+                "user"
+            } else {
+                "attempted-change"
+            },
+        );
+        Ok(())
+    }
+
+    pub fn budget_exceeded(&self) -> Vec<(terminal_session::policy::BudgetDimension, u64, u64)> {
+        self.policy.budget_exceeded()
+    }
+
+    /// Records budget consumption (engine internal + tests).
+    pub fn record_budget(&mut self, dim: terminal_session::policy::BudgetDimension, delta: u64) {
+        self.policy.record_budget(dim, delta);
+    }
+
+    /// §30: revert the workflow to a previous plan version. Safe subset:
+    /// the reverted plan becomes a *new proposal* gated behind approval —
+    /// filesystem changes are never silently reverted.
+    pub fn revert_workflow_to(&mut self, version: u32) -> Result<String, String> {
+        let target = self
+            .adaptive
+            .plan_versions
+            .iter()
+            .find(|v| v.version == version)
+            .cloned()
+            .ok_or_else(|| format!("no plan version {version} exists"))?;
+        let current = self
+            .adaptive
+            .plan_versions
+            .iter()
+            .filter(|v| v.superseded_by.is_none())
+            .max_by_key(|v| v.version);
+        if current.map(|c| c.version) == Some(version) {
+            return Err("already at this plan version".into());
+        }
+        let next_version = self
+            .adaptive
+            .plan_versions
+            .iter()
+            .map(|v| v.version)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let approved = current.map(|c| c.approved).unwrap_or(false);
+        let mut reverted = terminal_session::adaptive::PlanVersion::new(
+            next_version,
+            target.plan.clone(),
+            current,
+            false,
+        );
+        reverted.approved = approved;
+        reverted.approved_at = Some(terminal_session::planning::now_ms());
+        reverted.diff_from_previous = Some(terminal_session::adaptive::PlanDiff {
+            added: Vec::new(),
+            removed: Vec::new(),
+            modified: vec![format!("revert to plan v{version}")],
+            changed_agents: Vec::new(),
+            changed_dependencies: Vec::new(),
+            changed_budget: None,
+        });
+        // v(N-1) chain: mark the current version superseded by the revert.
+        if let Some(c) = self.adaptive.plan_versions.last_mut() {
+            c.superseded_by = Some(next_version);
+        }
+        self.adaptive.plan_versions.push(reverted);
+        self.audit_kind(
+            AuditEventKind::WorkflowReverted,
+            self.active_workspace().id.clone(),
+            format!("revert proposed to plan v{version} as v{next_version}"),
+            "user",
+        );
+        // The revert does not touch tasks/graphs by itself — a human
+        // approves and executes the proposal via plan_execute.
+        Ok(format!("plan-v{next_version}"))
+    }
+
+    /// §34: live workflow state summary (counts + estimated cost).
+    pub fn workflow_summary(&self) -> WorkflowSummary {
+        let mut sum = WorkflowSummary::default();
+        let mut ws_with_tasks = std::collections::HashSet::new();
+        let now = chrono::Local::now();
+        let midnight_ms = terminal_session::planning::now_ms()
+            .saturating_sub(now.num_seconds_from_midnight() as u64 * 1000);
+        for t in self.tasks.graph().list_tasks() {
+            ws_with_tasks.insert(t.workspace_id.clone());
+            match t.status {
+                TaskStatus::Running => sum.running += 1,
+                TaskStatus::Waiting | TaskStatus::Blocked => sum.waiting += 1,
+                TaskStatus::NeedsReview => sum.needs_approval += 1,
+                TaskStatus::Failed | TaskStatus::Cancelled => sum.failed += 1,
+                TaskStatus::Completed => {
+                    if t.completed_at_ms.map(|m| m >= midnight_ms).unwrap_or(false) {
+                        sum.completed_today += 1;
+                    }
+                    if let Some(r) = &t.result {
+                        sum.estimated_cost_cents = sum
+                            .estimated_cost_cents
+                            .saturating_add(r.estimated_cost_cents.unwrap_or(0));
+                    }
+                }
+                _ => {}
+            }
+        }
+        sum.workflows = ws_with_tasks.len();
+        for snap in self.agent_runtime.list_sessions() {
+            if snap.state == "NeedsApproval" {
+                sum.needs_approval += 1;
+            }
+            if let Some(c) = self
+                .agent_runtime
+                .estimated_cost_cents(&ExecutionId(snap.execution_id))
+            {
+                sum.estimated_cost_cents = sum.estimated_cost_cents.saturating_add(c);
+            }
+        }
+        sum.needs_approval += self.adaptive.proposals.len();
+        // Waiting = task-granularity view; agents mid-work that are neither
+        // running tasks nor tasks at all are not double counted.
+        sum.paused = self.workflow_paused;
+        sum
+    }
+
+    /// §31: every object that currently needs a human decision.
+    pub fn attention_items(&self) -> AttentionItems {
+        let mut items = AttentionItems::default();
+        for snap in self.agent_runtime.list_sessions() {
+            if snap.state == "NeedsApproval" {
+                items.agents.push(AttentionAgent {
+                    execution_id: ExecutionId(snap.execution_id.clone()),
+                    display_name: snap.display_name.clone(),
+                    state: snap.state.clone(),
+                    attention: snap.attention.map(|a| match a {
+                        terminal_session::work::AttentionReason::PermissionRequested => {
+                            "awaiting permission".to_string()
+                        }
+                        terminal_session::work::AttentionReason::NeedsInput => {
+                            "awaiting input".to_string()
+                        }
+                        terminal_session::work::AttentionReason::ErrorIntervention => {
+                            "error — needs intervention".to_string()
+                        }
+                        terminal_session::work::AttentionReason::Ambiguous => {
+                            "ambiguous decision".to_string()
+                        }
+                    }),
+                    estimated_cost_cents: self
+                        .agent_runtime
+                        .estimated_cost_cents(&ExecutionId(snap.execution_id)),
+                });
+            }
+        }
+        for t in self.tasks.graph().list_tasks() {
+            if t.status == TaskStatus::NeedsReview {
+                items.review_tasks.push(AttentionTask {
+                    task_id: t.id.clone(),
+                    title: t.title.clone(),
+                    state: "Needs review".to_string(),
+                    estimated_cost_cents: t.result.as_ref().and_then(|r| r.estimated_cost_cents),
+                });
+            }
+        }
+        for p in &self.adaptive.proposals {
+            let version = self
+                .adaptive
+                .plan_versions
+                .iter()
+                .rev()
+                .find(|v| {
+                    p.plan
+                        .steps
+                        .iter()
+                        .any(|s| format!("v{}", v.version) == s.id)
+                })
+                .map(|v| v.version);
+            items.replans.push(AttentionReplan {
+                replan_id: p.id.clone(),
+                workflow_id: p.workflow_id.clone(),
+                reason: p.reason.clone(),
+                version,
+                estimated_cost_cents: p.estimated_cost_cents,
+            });
+        }
+        items.total = items.agents.len() + items.review_tasks.len() + items.replans.len();
+        items
     }
 
     pub fn agent_runtime(&self) -> &AgentRuntime {
@@ -1234,6 +1963,24 @@ impl Multiplexer {
             return Err(TaskGraphError::UnknownTask(task_id.clone()));
         };
         task.environment = pairs.to_vec();
+        Ok(())
+    }
+
+    /// Phase 3D §8/§40: declares an explicit input-artifact grant — the
+    /// strongest access grant. The scheduler validates existence before
+    /// execution (§9) and the engine materializes it into the task's
+    /// worktree (§11).
+    pub fn task_add_input_artifact(
+        &mut self,
+        task_id: &TaskId,
+        artifact_ref: &str,
+    ) -> Result<(), TaskGraphError> {
+        let Some(task) = self.tasks.graph_mut().get_task_mut(task_id) else {
+            return Err(TaskGraphError::UnknownTask(task_id.clone()));
+        };
+        if !task.input_artifacts.iter().any(|a| a == artifact_ref) {
+            task.input_artifacts.push(artifact_ref.to_string());
+        }
         Ok(())
     }
 
@@ -1360,12 +2107,37 @@ impl Multiplexer {
 
     /// §22 explicit merge — only ever from `Approved`; conflicts surface as
     /// [`MergeOutcome::Conflict`] without data loss (§23). Never automatic.
+    /// 3e §22: a conflict generates a `ReplanSignal` (MergeConflict) with
+    /// evidence — the planner may then propose remediation; automatic
+    /// conflict resolution stays disabled.
     pub fn worktree_merge(
         &mut self,
         id: &str,
         target_branch: &str,
     ) -> Result<MergeOutcome, WorktreeError> {
-        self.worktrees.merge(id, target_branch)
+        let outcome = self.worktrees.merge(id, target_branch)?;
+        if let MergeOutcome::Conflict(conflict) = &outcome {
+            let task_id = self
+                .worktrees
+                .get(id)
+                .and_then(|r| r.task_id.clone())
+                .unwrap_or_default();
+            let signal = ReplanSignal::new(
+                self.active_workspace().id.clone(),
+                Some(task_id.clone()),
+                ReplanTrigger::MergeConflict,
+                ReplanSeverity::Warning,
+                format!(
+                    "merge conflict in {} on {} files: {}",
+                    task_id,
+                    conflict.files.len(),
+                    conflict.files.join(", ")
+                ),
+                conflict.files.clone(),
+            );
+            self.record_replan_signal(signal);
+        }
+        Ok(outcome)
     }
 
     /// §30 discard (explicit user action — never automatic).
@@ -1409,6 +2181,778 @@ impl Multiplexer {
 
     pub fn set_worktree_cleanup_policy(&mut self, p: CleanupPolicy) {
         self.worktrees.set_cleanup_policy(p);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3D: collaboration (3d.md §3–§22, §39–§45) — artifacts, review
+    // findings, synthesis, replan signals. All data is deterministic,
+    // bounded, and secret-free (§35, §38).
+    // ------------------------------------------------------------------
+
+    /// §3: all artifacts in the store (metadata — never payloads, §27).
+    pub fn artifact_list(&self) -> Vec<terminal_session::artifacts::ArtifactRecord> {
+        self.artifacts.metadata_snapshot()
+    }
+
+    pub fn artifact_get(&self, id: &str) -> Option<terminal_session::artifacts::ArtifactRecord> {
+        self.artifacts.get(id).cloned()
+    }
+
+    /// Bounded, redacted payload of an artifact.
+    pub fn artifact_payload(&self, id: &str) -> Option<Vec<u8>> {
+        self.artifacts.payload(id).map(|p| p.to_vec())
+    }
+
+    /// §5/§6: deterministic selection (task, kind, workspace, reference).
+    pub fn artifact_select(
+        &self,
+        selector: &ArtifactSelector,
+    ) -> Vec<terminal_session::artifacts::ArtifactRecord> {
+        selector
+            .select(&self.artifacts, self.tasks.graph())
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// §5: lineage (producers, consumers, task outputs).
+    pub fn artifact_lineage(&self) -> ArtifactLineage {
+        ArtifactLineage::build(&self.artifacts, self.tasks.graph())
+    }
+
+    /// §37: retention policy (default Keep — never delete work results).
+    pub fn artifact_retention(&self) -> ArtifactRetentionPolicy {
+        self.artifacts.retention()
+    }
+
+    pub fn set_artifact_retention(&mut self, p: ArtifactRetentionPolicy) {
+        self.artifacts.set_retention(p);
+    }
+
+    /// §18: records a reviewer's report for a task. Findings become
+    /// first-class artifacts (§18) and the aggregated consensus is
+    /// returned (§20) — deterministic, policy-driven.
+    pub fn record_review_report(
+        &mut self,
+        task_id: &TaskId,
+        report: &ReviewReport,
+    ) -> ReviewAggregation {
+        let policy = ReviewPolicy::default();
+        let mut reports: Vec<ReviewReport> = self
+            .review_reports
+            .get(task_id)
+            .cloned()
+            .unwrap_or_default();
+        for finding in &report.findings {
+            let art = terminal_session::orchestration::Artifact {
+                id: finding.id.clone(),
+                kind: terminal_session::orchestration::ArtifactType::Document,
+                path: finding.file.clone(),
+                description: format!("review finding ({})", finding.severity.label()),
+                created_by_task: finding
+                    .created_by_task
+                    .clone()
+                    .or_else(|| Some(task_id.clone())),
+                metadata: vec![
+                    ("finding".to_string(), finding.finding.clone()),
+                    ("severity".to_string(), finding.severity.label().to_string()),
+                ],
+                created_by_agent: Some("reviewer".to_string()),
+                workspace_id: self
+                    .tasks
+                    .graph()
+                    .get_task(task_id)
+                    .map(|t| t.workspace_id.clone()),
+                worktree: None,
+                revision: None,
+                created_at_ms: terminal_session::planning::now_ms(),
+            };
+            self.artifacts
+                .register(art, None, terminal_session::planning::now_ms());
+            self.events.publish(ApplicationEvent::ReviewFindingCreated {
+                finding: finding.clone(),
+            });
+        }
+        reports.push(report.clone());
+        let aggregation = ReviewAggregator::aggregate(&reports, &policy);
+        self.review_reports.insert(task_id.clone(), reports);
+        aggregation
+    }
+
+    /// §20: aggregated consensus for a task (all recorded reports).
+    pub fn task_review_consensus(&self, task_id: &TaskId) -> Option<ReviewAggregation> {
+        let reports = self.review_reports.get(task_id)?;
+        Some(ReviewAggregator::aggregate(
+            reports,
+            &ReviewPolicy::default(),
+        ))
+    }
+
+    pub fn review_reports(&self, task_id: &TaskId) -> Vec<ReviewReport> {
+        self.review_reports
+            .get(task_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// §14–§15: deterministic synthesis over explicitly selected task
+    /// results + artifacts. Never receives the whole project history, and
+    /// never references artifacts it was not given (§54).
+    pub fn synthesize(
+        &mut self,
+        plan_id: Option<String>,
+        workflow_id: Option<String>,
+        task_ids: &[TaskId],
+        artifact_ids: &[String],
+    ) -> Result<SynthesisResult, String> {
+        let synthesis_id = format!("synthesis:{}", uuid::Uuid::new_v4());
+        self.events.publish(ApplicationEvent::SynthesisStarted {
+            synthesis_id: synthesis_id.clone(),
+            task_ids: task_ids.to_vec(),
+        });
+        let mut results = Vec::new();
+        for id in task_ids {
+            let task = self
+                .tasks
+                .graph()
+                .get_task(id)
+                .ok_or_else(|| format!("unknown task {id}"))?;
+            let r = task
+                .result
+                .clone()
+                .ok_or_else(|| format!("task {id} has no result"))?;
+            results.push(r);
+        }
+        let mut artifacts = Vec::new();
+        for id in artifact_ids {
+            let a = self
+                .artifacts
+                .artifact(id)
+                .cloned()
+                .ok_or_else(|| format!("unknown artifact {id}"))?;
+            artifacts.push(a);
+        }
+        let input = SynthesisInput {
+            task_results: results,
+            artifacts,
+            plan_id,
+            workflow_id,
+        };
+        let provider = self
+            .planner_provider_id()
+            .map(|p| (p.clone(), self.planner_config.model.clone()));
+        let result = ResultSynthesizer::synthesize(
+            &input,
+            provider.as_ref().map(|(p, m)| (p.as_str(), m.as_str())),
+        )?;
+        self.events.publish(ApplicationEvent::SynthesisCompleted {
+            result: Box::new(result.clone()),
+        });
+        Ok(result)
+    }
+
+    /// §44/3e §4: records a formal replan signal — never an autonomous
+    /// replan. Deduplicated + cooldown-gated (§8–§9) and persisted (§42).
+    /// `cause`/`detail` remain the legacy surface (`replan_signals`),
+    /// mirrored as a ManualUserRequest signal in the formal registry.
+    pub fn signal_replan(&mut self, cause: &str, detail: &str) {
+        let at = terminal_session::planning::now_ms();
+        self.replan_signals
+            .push((cause.to_string(), detail.to_string(), at));
+        self.replan_emitted.insert(format!("manual:{cause}"));
+        let signal = ReplanSignal::new(
+            self.active_workspace().id.clone(),
+            None,
+            ReplanTrigger::ManualUserRequest,
+            ReplanSeverity::Info,
+            format!("{cause}: {detail}"),
+            Vec::new(),
+        );
+        self.adaptive.metrics.replan_trigger_count += 1;
+        self.events.publish(ApplicationEvent::ReplanRequested {
+            signal_id: signal.id.clone(),
+            workflow_id: self.active_workspace().id.clone(),
+            trigger: signal.trigger.as_str().to_string(),
+            severity: signal.severity.label().to_string(),
+        });
+        self.events.publish(ApplicationEvent::WorkflowNeedsReplan {
+            workflow_id: self.active_workspace().id.clone(),
+            cause: cause.to_string(),
+            detail: detail.to_string(),
+        });
+        self.adaptive.signals.push(signal);
+    }
+
+    /// Legacy surface: pending replanning signals (cause, detail, at_ms).
+    pub fn replan_signals(&self) -> Vec<(String, String, u64)> {
+        self.replan_signals.clone()
+    }
+
+    /// Formal signals (§4) — the Phase 3E surface.
+    pub fn adaptive_signals(&self) -> Vec<ReplanSignal> {
+        self.adaptive.signals.clone()
+    }
+
+    /// §44/3e §6: deterministic replan triggers the engine observes from its
+    /// own state — task failures, missing artifacts, critical review
+    /// findings, merge conflicts, budget risk, test failures. Deduplicated
+    /// (§8) + cooldown-gated (§9).
+    fn detect_replan_signals(&mut self) {
+        let workflow_id = self.active_workspace().id.clone();
+        let mut snapshot = WorkflowSnapshot {
+            workflow_id: workflow_id.clone(),
+            ..Default::default()
+        };
+        for task in self.tasks.graph().list_tasks() {
+            snapshot
+                .tasks
+                .push(terminal_session::adaptive::TaskObservation {
+                    task_id: task.id.clone(),
+                    status: task.status,
+                    failed: task.status == TaskStatus::Failed,
+                    retries: task.attempt_count,
+                });
+            // Test failures from the agent's observed commands (§7) — a
+            // failed task whose work shows a test run is attributed to
+            // TestsFailed (deterministic, never a guess).
+            if task.status == TaskStatus::Failed {
+                if let Some(eid) = &task.agent_execution_id {
+                    if let Some(w) = self.agent_runtime.get_work(eid) {
+                        let ran_tests = w.commands.iter().any(|c| {
+                            let l = c.to_ascii_lowercase();
+                            l.contains("test") && !l.contains("dist-test")
+                        });
+                        if ran_tests {
+                            snapshot.test_failures.push((task.id.clone(), 1));
+                        }
+                    }
+                }
+            }
+            if task.status == TaskStatus::Blocked {
+                // Blocked with an artifact error → ArtifactMissing;
+                // otherwise a dependency/readiness gap.
+                let is_artifact = task
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.contains("artifact"))
+                    .unwrap_or(false);
+                if is_artifact {
+                    snapshot
+                        .missing_artifacts
+                        .push((task.id.clone(), "input artifact".into()));
+                }
+            }
+            if task.attempt_count >= 3 && task.status == TaskStatus::Failed {
+                snapshot
+                    .retries_exhausted
+                    .push((task.id.clone(), task.attempt_count));
+            }
+        }
+        // Review findings → critical trigger (§27).
+        for reports in self.review_reports.values() {
+            for r in reports {
+                for f in &r.findings {
+                    snapshot.findings.push(f.clone());
+                }
+            }
+        }
+        // Merge conflicts are surfaced by the worktree merge path (§22) —
+        // the evaluator does not re-derive them from records.
+        // Budget (§23).
+        snapshot.budget = self.budget_observation();
+        let evaluator = WorkflowEvaluator;
+        for signal in evaluator.evaluate(&snapshot) {
+            self.record_replan_signal(signal);
+        }
+    }
+
+    /// §23: budget observation from the authoritative scheduler policy +
+    /// agent runtime estimates.
+    fn budget_observation(&self) -> Option<terminal_session::adaptive::BudgetObservation> {
+        let budget = self.tasks.policy().max_cost_cents?;
+        let mut spent = 0u64;
+        let mut remaining = 0u64;
+        for t in self.tasks.graph().list_tasks() {
+            if let Some(r) = &t.result {
+                spent = spent.saturating_add(r.estimated_cost_cents.unwrap_or(0));
+            }
+            if let Some(eid) = &t.agent_execution_id {
+                remaining = remaining
+                    .saturating_add(self.agent_runtime.estimated_cost_cents(eid).unwrap_or(0));
+            }
+        }
+        Some(terminal_session::adaptive::BudgetObservation {
+            spent_cents: spent,
+            budget_cents: Some(budget),
+            estimated_remaining_cents: Some(remaining),
+        })
+    }
+
+    /// Records one signal through the dedup/cooldown gate (§8–§9) and
+    /// publishes the ReplanRequested event (§39). Manual signals bypass the
+    /// cooldown (a human explicitly asked).
+    fn record_replan_signal(&mut self, signal: ReplanSignal) {
+        let manual = signal.trigger == ReplanTrigger::ManualUserRequest;
+        if !manual {
+            let cooldown = self.adaptive.limits.replan_cooldown_seconds;
+            if !self.adaptive.registry.admit(&signal, cooldown) {
+                return;
+            }
+        }
+        // §31–§32: loop protection — once the limit is reached, further
+        // signals escalate to a human instead of looping.
+        if self.adaptive.metrics.replan_count >= self.adaptive.limits.max_replans
+            && !self.adaptive.limit_reached
+        {
+            self.adaptive.limit_reached = true;
+            self.escalate_human(
+                "replan limit reached",
+                format!(
+                    "workflow hit its replan limit ({}) — cannot safely continue automatically",
+                    self.adaptive.limits.max_replans
+                ),
+                vec!["replan limit reached".to_string()],
+                vec![
+                    "increase replan limit".to_string(),
+                    "manual intervention".to_string(),
+                ],
+            );
+            return;
+        }
+        let severity = signal.severity;
+        let trigger = signal.trigger;
+        let signal_id = signal.id.clone();
+        *self
+            .adaptive
+            .metrics
+            .trigger_counts
+            .entry(trigger.as_str().to_string())
+            .or_insert(0) += 1;
+        self.adaptive.metrics.replan_trigger_count += 1;
+        // Legacy mirror (Phase 3D surface).
+        self.replan_signals.push((
+            trigger.as_str().to_string(),
+            signal.reason.clone(),
+            signal.created_at,
+        ));
+        self.replan_emitted.insert(signal.dedupe_key());
+        self.events.publish(ApplicationEvent::ReplanRequested {
+            signal_id: signal_id.clone(),
+            workflow_id: self.active_workspace().id.clone(),
+            trigger: trigger.as_str().to_string(),
+            severity: severity.label().to_string(),
+        });
+        self.events.publish(ApplicationEvent::WorkflowNeedsReplan {
+            workflow_id: self.active_workspace().id.clone(),
+            cause: trigger.as_str().to_string(),
+            detail: signal.reason.clone(),
+        });
+        self.adaptive.signals.push(signal);
+    }
+
+    /// §33: human escalation — what happened, what was attempted, evidence,
+    /// options. Never hides uncertainty.
+    fn escalate_human(
+        &mut self,
+        what_happened: impl Into<String>,
+        attempted: impl Into<String>,
+        evidence: Vec<String>,
+        options: Vec<String>,
+    ) {
+        let esc = HumanEscalation::new(
+            self.active_workspace().id.clone(),
+            what_happened,
+            vec![attempted.into()],
+            evidence,
+            options,
+        );
+        self.events.publish(ApplicationEvent::HumanEscalation {
+            escalation_id: esc.id.clone(),
+            workflow_id: self.active_workspace().id.clone(),
+            reason: esc.what_happened.clone(),
+        });
+        self.adaptive.escalations.push(esc);
+    }
+
+    /// §45/3e §12: human replan — constructs a ReplanContext + formal
+    /// replan request (mode=Replan), runs the planner, and records a
+    /// `ProposedReplan` + `PlanVersion` + `PlanDiff` (§12–§14). The new
+    /// plan goes through the normal pipeline and requires approval (never
+    /// silently rewrites a running workflow).
+    pub fn replan_workflow(&mut self, goal: &str) -> Result<String, PlannerError> {
+        if self.planner_provider.is_none() {
+            return Err(PlannerError::NoProvider);
+        }
+        // Phase 3F §33: PAUSE ALL blocks new work, replans included.
+        if self.workflow_paused {
+            return Err(PlannerError::NotAllowed {
+                reason: "all workflows are paused — resume before replanning".to_string(),
+            });
+        }
+        // Signals addressed by this replan are cleared (§45) — the legacy
+        // mirror too, so the 3D surface reflects what the replan handled.
+        self.replan_signals.clear();
+        self.adaptive.signals.clear();
+        // §31: loop protection — no new replans past the limit.
+        if self.adaptive.metrics.replan_count >= self.adaptive.limits.max_replans {
+            if !self.adaptive.limit_reached {
+                self.adaptive.limit_reached = true;
+                self.escalate_human(
+                    "replan limit reached",
+                    "replan requested but the workflow replan limit is exhausted",
+                    vec!["replan limit reached".to_string()],
+                    vec![
+                        "increase replan limit".to_string(),
+                        "manual intervention".to_string(),
+                    ],
+                );
+            }
+            return Err(PlannerError::NotAllowed {
+                reason: "replan limit reached — workflow requires human intervention".to_string(),
+            });
+        }
+        let ws_id = self.active_workspace().id.clone();
+        let context = PlannerContextBuilder::new(self.planner_context_input()).build();
+        // Fold current task results + artifacts into the (bounded) context
+        // so the planner can reference them (§43) without raw payloads.
+        let mut summaries = Vec::new();
+        for t in self.task_list() {
+            if let Some(r) = &t.result {
+                summaries.push(format!(
+                    "{}: {} ({} files, {} warnings)",
+                    t.title,
+                    r.summary,
+                    r.files_changed.len(),
+                    r.warnings.len()
+                ));
+            }
+        }
+        let pending_triggers: Vec<ReplanTrigger> =
+            self.adaptive.signals.iter().map(|s| s.trigger).collect();
+        let replan_context = self.build_replan_context();
+        let request = PlannerRequest {
+            request_id: format!("replan-{}", terminal_session::planning::now_ms()),
+            intent: format!(
+                "{goal} | current state: {} | replan context: {}",
+                summaries.join("; "),
+                replan_context.to_request_fragment()
+            ),
+            workspace_id: ws_id.clone(),
+            context,
+            constraints: self.planner_constraints(),
+            mode: terminal_session::planning::PlannerRequestMode::Replan,
+        };
+        self.planner.begin_request(
+            &request.request_id,
+            &request.intent,
+            &self.planner_config.provider,
+            &self.planner_config.model,
+        )?;
+        self.publish_planner_event(PlannerEvent::PlanningStarted {
+            request_id: request.request_id.clone(),
+            intent: request.intent.clone(),
+        });
+        let provider = self.planner_provider.as_ref().unwrap();
+        let result = provider.generate(&request, &self.planner_config);
+        for event in self.planner.on_provider_result(result, 0) {
+            self.publish_planner_event(event);
+        }
+        match self.planner.phase() {
+            PlannerPhase::NeedsApproval => self.plan_validate()?,
+            PlannerPhase::Failed => {
+                self.adaptive.quality.invalid_replan_rate += 1;
+                return Err(self.planner.last_error().cloned().unwrap_or(
+                    PlannerError::NotAllowed {
+                        reason: "replanning failed".to_string(),
+                    },
+                ));
+            }
+            _ => {}
+        }
+        // §12: wrap the planner output into a formal proposal + version.
+        let Some(plan) = self.planner.plan().cloned() else {
+            return Err(PlannerError::NotAllowed {
+                reason: "no plan produced".to_string(),
+            });
+        };
+        let proposal = ProposedReplan::from_plan(
+            ws_id.clone(),
+            format!("replan requested: {goal}"),
+            plan.clone(),
+            pending_triggers,
+        );
+        let version = self.record_plan_version(plan);
+        self.adaptive.quality.valid_replan_rate += 1;
+        self.events.publish(ApplicationEvent::ReplanProposed {
+            replan_id: proposal.id.clone(),
+            workflow_id: ws_id.clone(),
+            version,
+            reason: proposal.reason.clone(),
+        });
+        self.adaptive.proposals.push(proposal);
+        self.adaptive.metrics.replan_count += 1;
+        Ok(self.adaptive.proposals.last().unwrap().id.clone())
+    }
+
+    /// §13: appends an immutable plan version (v1 → v2 → v3), linking the
+    /// previous version as superseded and computing the PlanDiff (§14).
+    fn record_plan_version(&mut self, plan: terminal_session::planning::ProposedPlan) -> u32 {
+        let next = self.adaptive.plan_versions.len() as u32 + 1;
+        let prev = self.adaptive.plan_versions.last().cloned();
+        let version = PlanVersion::new(next, plan, prev.as_ref(), false);
+        if let Some(mut p) = prev {
+            let superseded = p.version;
+            p.superseded_by = Some(next);
+            if let Some(idx) = self
+                .adaptive
+                .plan_versions
+                .iter()
+                .position(|v| v.version == superseded)
+            {
+                self.adaptive.plan_versions[idx] = p;
+            }
+            self.events.publish(ApplicationEvent::PlanSuperseded {
+                superseded_version: superseded,
+                new_version: next,
+            });
+        }
+        self.adaptive.plan_versions.push(version);
+        next
+    }
+
+    /// §10: bounded replan context for the planner.
+    fn build_replan_context(&self) -> terminal_session::adaptive::ReplanContext {
+        let wf = WorkflowSnapshot {
+            workflow_id: self.active_workspace().id.clone(),
+            tasks: self
+                .tasks
+                .graph()
+                .list_tasks()
+                .iter()
+                .map(|t| terminal_session::adaptive::TaskObservation {
+                    task_id: t.id.clone(),
+                    status: t.status,
+                    failed: t.status == TaskStatus::Failed,
+                    retries: t.attempt_count,
+                })
+                .collect(),
+            budget: self.budget_observation(),
+            ..Default::default()
+        };
+        terminal_session::adaptive::ReplanContextBuilder::new().build(&wf)
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3E: adaptive orchestration public surface (3e.md §15–§42)
+    // ------------------------------------------------------------------
+
+    /// §40/§41: replan proposals awaiting human decision.
+    pub fn replan_list(&self) -> Vec<ProposedReplan> {
+        self.adaptive.proposals.clone()
+    }
+
+    /// §40/§41: inspect one proposal (full plan + diff vs previous).
+    pub fn replan_get(&self, id: &str) -> Option<ProposedReplan> {
+        self.adaptive.proposals.iter().find(|p| p.id == id).cloned()
+    }
+
+    /// §13: immutable plan version history (v1 → v2 → v3).
+    pub fn workflow_history(&self) -> Vec<PlanVersion> {
+        self.adaptive.plan_versions.clone()
+    }
+
+    /// §33: human intervention records (escalations + invalidations).
+    pub fn workflow_interventions(&self) -> Vec<HumanEscalation> {
+        self.adaptive.escalations.clone()
+    }
+
+    /// §19: task invalidations.
+    pub fn task_invalidations(&self) -> Vec<TaskInvalidation> {
+        self.adaptive.task_invalidations.clone()
+    }
+
+    /// §20: artifact invalidations (old records preserved).
+    pub fn artifact_invalidations(&self) -> Vec<ArtifactInvalidation> {
+        self.adaptive.artifact_invalidations.clone()
+    }
+
+    /// §19: explicit task invalidation — requires reason + evidence and is
+    /// gated behind human approval (the planner can never silently
+    /// invalidate completed work). Returns the invalidation id.
+    pub fn invalidate_task(
+        &mut self,
+        task_id: &TaskId,
+        reason: &str,
+        evidence: Vec<String>,
+        approved: bool,
+    ) -> Result<String, String> {
+        if self.tasks.graph().get_task(task_id).is_none() {
+            return Err(format!("unknown task {task_id}"));
+        }
+        let inv = TaskInvalidation::new(task_id.clone(), reason, evidence);
+        let inv = if approved {
+            let mut inv = inv;
+            inv.approved = true;
+            inv.approved_at = Some(terminal_session::planning::now_ms());
+            // Revert the completed task to a state that reflects the
+            // invalidation: it can be re-run by a future plan, but its
+            // result is no longer trusted. We keep the record + result
+            // (auditability) and mark it `Failed` with the reason.
+            let _ = self.tasks.graph_mut().get_task_mut(task_id).map(|t| {
+                if matches!(t.status, TaskStatus::Completed | TaskStatus::NeedsReview) {
+                    let _ = t.transition(TaskStatus::Failed);
+                }
+                t.error = Some(terminal_session::orchestration::TaskError::new(
+                    terminal_session::orchestration::TaskErrorKind::Unknown,
+                    terminal_session::orchestration::FailureClass::Unknown,
+                    format!("task invalidated: {reason}"),
+                ));
+            });
+            self.events.publish(ApplicationEvent::TaskInvalidated {
+                task_id: task_id.clone(),
+                reason: reason.to_string(),
+            });
+            inv
+        } else {
+            inv
+        };
+        self.adaptive.task_invalidations.push(inv.clone());
+        Ok(inv.task_id)
+    }
+
+    /// §20: explicit artifact invalidation. The old artifact record is
+    /// **preserved** for lineage — never deleted.
+    pub fn invalidate_artifact(
+        &mut self,
+        artifact_id: &str,
+        reason: &str,
+        evidence: Vec<String>,
+    ) -> Result<(), String> {
+        if self.artifacts.get(artifact_id).is_none() {
+            return Err(format!("unknown artifact {artifact_id}"));
+        }
+        let inv = ArtifactInvalidation::new(artifact_id, reason, evidence);
+        self.events.publish(ApplicationEvent::ArtifactInvalidated {
+            artifact_id: artifact_id.to_string(),
+            reason: reason.to_string(),
+        });
+        self.adaptive.artifact_invalidations.push(inv);
+        Ok(())
+    }
+
+    /// §15/§16/§17: approve a replan — the ONLY path that applies it.
+    /// Completes the approval gate, marks the plan version approved, and
+    /// re-validates before the user executes (same pipeline as initial
+    /// plans, §21). Completed historical work is preserved (§18) unless
+    /// explicitly invalidated (§19).
+    pub fn replan_approve(&mut self, id: &str) -> Result<(), PlannerError> {
+        let proposal = self
+            .adaptive
+            .proposals
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .ok_or_else(|| PlannerError::NotAllowed {
+                reason: format!("unknown replan {id}"),
+            })?;
+        // The proposal's plan must already be in the planner (it is —
+        // replan_workflow left it awaiting approval). Approve + validate.
+        self.plan_approve()?;
+        // Record approval on the matching plan version (the latest).
+        if let Some(v) = self.adaptive.plan_versions.last_mut() {
+            v.approved = true;
+            v.approved_at = Some(terminal_session::planning::now_ms());
+        }
+        self.adaptive.metrics.replan_approval_count += 1;
+        self.adaptive.metrics.time_to_replan_ms +=
+            proposal.plan.estimated_duration_min.unwrap_or(0) as u64;
+        self.adaptive.metrics.additional_cost_cents += proposal.estimated_cost_cents.unwrap_or(0);
+        self.events.publish(ApplicationEvent::ReplanApproved {
+            replan_id: proposal.id.clone(),
+            workflow_id: self.active_workspace().id.clone(),
+            version: self.adaptive.plan_versions.len() as u32,
+        });
+        Ok(())
+    }
+
+    /// §15/§28: reject a replan — the original workflow remains intact, no
+    /// new tasks execute, nothing is destroyed.
+    pub fn replan_reject(&mut self, id: &str, reason: &str) -> Result<(), PlannerError> {
+        let idx = self
+            .adaptive
+            .proposals
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or_else(|| PlannerError::NotAllowed {
+                reason: format!("unknown replan {id}"),
+            })?;
+        let proposal = self.adaptive.proposals.remove(idx);
+        self.adaptive.metrics.replan_rejection_count += 1;
+        self.adaptive.quality.human_rejection_rate += 1;
+        // The planner's pending proposal is also rejected so its phase is
+        // consistent (the graph was never touched).
+        let _ = self.planner.reject(reason);
+        self.events.publish(ApplicationEvent::ReplanRejected {
+            replan_id: proposal.id.clone(),
+            workflow_id: self.active_workspace().id.clone(),
+            reason: reason.to_string(),
+        });
+        Ok(())
+    }
+
+    /// §16/§29: edit a proposed replan (add/remove task, change agent,
+    /// change dependency). The edited plan is re-validated before
+    /// execution — never executed without re-validation.
+    pub fn replan_edit(
+        &mut self,
+        id: &str,
+        changes: &[PlanEditChange],
+    ) -> Result<(), PlannerError> {
+        if !self.adaptive.proposals.iter().any(|p| p.id == id) {
+            return Err(PlannerError::NotAllowed {
+                reason: format!("unknown replan {id}"),
+            });
+        }
+        for change in changes {
+            self.planner.edit(change)?;
+        }
+        self.adaptive.metrics.replan_edit_count += 1;
+        self.adaptive.quality.human_edit_rate += 1;
+        self.events.publish(ApplicationEvent::ReplanEdited {
+            replan_id: id.to_string(),
+            workflow_id: self.active_workspace().id.clone(),
+            version: self.adaptive.plan_versions.len() as u32,
+        });
+        // §16: never execute an edited plan without re-validation.
+        self.plan_validate()?;
+        Ok(())
+    }
+
+    /// §31–§32: current replan limits + loop-protection status.
+    pub fn replan_limits(&self) -> (ReplanLimits, bool) {
+        (self.adaptive.limits.clone(), self.adaptive.limit_reached)
+    }
+
+    /// §34–§37: autonomy policy (Automatic disabled in Phase 3E).
+    pub fn autonomy_policy(&self) -> AutonomyPolicy {
+        self.adaptive.autonomy
+    }
+
+    /// §24: replan metrics.
+    pub fn replan_metrics(&self) -> ReplanMetrics {
+        self.adaptive.metrics.clone()
+    }
+
+    /// §25: planner-quality metrics (tracked separately from execution).
+    pub fn planner_quality_metrics(&self) -> PlannerQualityMetrics {
+        self.adaptive.quality.clone()
+    }
+
+    /// §9/§31: configuration (cooldown, max replans, autonomy policy).
+    /// The planner cannot raise its own limits (§38) — deterministic config.
+    pub fn set_adaptive_policy(&mut self, limits: ReplanLimits, autonomy: AutonomyPolicy) {
+        self.adaptive.limits = limits;
+        self.adaptive.autonomy = autonomy;
     }
 
     /// §29: the execution-environment preview for a task — repository,
@@ -1496,8 +3040,21 @@ impl Multiplexer {
             let Some(state) = self.agent_runtime.raw_state(&eid) else {
                 continue;
             };
+            // Exited = the reader thread observed EOF *or* the process is
+            // gone (authoritative `try_wait`). The reader observes EOF on
+            // its own schedule, which under load can lag a full frame behind
+            // the actual process exit (3a §48 determinism); `try_wait`
+            // reports the child as dead immediately, so the scheduler's
+            // deferral fires as soon as a co-started sibling's process is
+            // gone even while its reader/pump still settle.
+            let exited = self.agent_runtime.has_exited(&eid)
+                || self
+                    .pty
+                    .try_wait(&eid.0)
+                    .map(|s| s.is_some())
+                    .unwrap_or(false);
             view.running.insert(
-                task_id,
+                task_id.clone(),
                 RuntimeAgentView {
                     state,
                     exit_code: self
@@ -1506,10 +3063,42 @@ impl Multiplexer {
                         .and_then(|s| s.exit_code),
                     work: self.agent_runtime.get_work(&eid),
                     estimated_cost_cents: self.agent_runtime.estimated_cost_cents(&eid),
+                    exited,
                 },
             );
         }
-        let cmds = self.tasks.step(&view);
+        // Phase 3D §9: artifact readiness — a Ready task whose declared
+        // input artifact is unavailable is Blocked (never silently
+        // continued). The store is authoritative; raw path inputs keep
+        // their 3A semantics.
+        for task_id in self.tasks.graph().list_task_ids() {
+            let Some(task) = self.tasks.graph().get_task(&task_id) else {
+                continue;
+            };
+            if task.status != TaskStatus::Ready {
+                continue;
+            }
+            let missing: Vec<String> = task
+                .input_artifacts
+                .iter()
+                .filter_map(|a| {
+                    let id = resolve_artifact_ref(a)?;
+                    if self.artifacts.get(&id).is_none() {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !missing.is_empty() {
+                let reason = format!(
+                    "required input artifact(s) unavailable: {}",
+                    missing.join(", ")
+                );
+                view.artifact_blocked.insert(task_id.clone(), reason);
+            }
+        }
+        let cmds = self.tasks.step(&view, !self.workflow_paused);
         self.execute_commands(cmds);
         self.publish_task_events();
     }
@@ -1517,10 +3106,17 @@ impl Multiplexer {
     fn execute_commands(&mut self, cmds: Vec<SchedulerCommand>) {
         for cmd in cmds {
             match cmd {
-                SchedulerCommand::SpawnTask { task_id } => match self.spawn_task_agent(&task_id) {
-                    Ok(eid) => self.tasks.note_spawned(&task_id, &eid),
-                    Err(e) => self.tasks.note_spawn_failed(&task_id, e),
-                },
+                SchedulerCommand::SpawnTask { task_id } => {
+                    // Phase 3F §33: PAUSE ALL — pending tasks stay Ready and
+                    // nothing new starts; Resume re-runs the same commands.
+                    if self.workflow_paused {
+                        continue;
+                    }
+                    match self.spawn_task_agent(&task_id) {
+                        Ok(eid) => self.tasks.note_spawned(&task_id, &eid),
+                        Err(e) => self.tasks.note_spawn_failed(&task_id, e),
+                    }
+                }
                 SchedulerCommand::StopTask {
                     task_id,
                     execution_id,
@@ -1563,6 +3159,10 @@ impl Multiplexer {
                 TaskEvent::TaskCompleted { task_id, .. }
                 | TaskEvent::TaskNeedsReview { task_id } => {
                     self.capture_worktree_result(task_id);
+                    // Phase 3D §3: register the task's output artifacts in
+                    // the store (redacted, bounded payloads) so dependent
+                    // tasks can consume them cross-worktree (§11).
+                    self.register_task_artifacts(task_id);
                 }
                 TaskEvent::TaskFailed { task_id, .. } | TaskEvent::TaskCancelled { task_id } => {
                     self.preserve_worktree(task_id);
@@ -1572,6 +3172,8 @@ impl Multiplexer {
             self.events.publish(ApplicationEvent::TaskEvent { event });
         }
         self.maybe_finish_plan();
+        // Phase 3D §44: deterministic replan signals (deduplicated).
+        self.detect_replan_signals();
     }
 
     /// Detects plan completion from the authoritative scheduler state
@@ -1756,6 +3358,7 @@ impl Multiplexer {
             workspace_id: ws.id.clone(),
             context: PlannerContextBuilder::new(self.planner_context_input()).build(),
             constraints: self.planner_constraints(),
+            mode: terminal_session::planning::PlannerRequestMode::Initial,
         };
         self.planner.begin_request(
             &request.request_id,
@@ -2009,6 +3612,46 @@ impl Multiplexer {
         // tasks get a dedicated worktree; the launch cwd is the env's
         // working directory.
         let env = self.resolve_execution_environment(task_id)?;
+        // Phase 3D §11: cross-worktree artifact consumption — materialize
+        // the task's explicitly granted input artifacts into its own
+        // worktree before the agent starts. Never assumes a shared
+        // filesystem; access is enforced by the policy (§39–§40).
+        if let Some(e) = &env {
+            let input_refs: Vec<String> = self
+                .tasks
+                .graph()
+                .get_task(task_id)
+                .map(|t| t.input_artifacts.clone())
+                .unwrap_or_default();
+            for input in &input_refs {
+                let Some(art_id) = resolve_artifact_ref(input) else {
+                    continue;
+                };
+                if !ArtifactAccessPolicy::can_access(task_id, &art_id, self.tasks.graph()) {
+                    continue;
+                }
+                match ArtifactMaterializer::materialize(
+                    &self.artifacts,
+                    &art_id,
+                    &e.working_directory,
+                ) {
+                    Ok(Some(_)) => {
+                        self.events.publish(ApplicationEvent::ArtifactConsumed {
+                            task_id: task_id.clone(),
+                            artifact_id: art_id.clone(),
+                        });
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "task {task_id}: input artifact {art_id} has no materializable payload"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!("task {task_id}: materializing {art_id} failed: {err}");
+                    }
+                }
+            }
+        }
         let launch = {
             let graph = self.tasks.graph();
             let task = graph
@@ -2240,8 +3883,140 @@ impl Multiplexer {
                 result.branch = branch;
                 result.worktree = worktree_path;
                 result.diff_summary = Some(Box::new(diff.clone()));
-                if !result.files_changed.is_empty() {
-                    result.files_changed = diff.files_changed.clone();
+                result.files_changed = diff.files_changed.clone();
+            }
+        }
+    }
+
+    /// Phase 3D §3–§4: registers a completed task's output artifacts in the
+    /// authoritative store — metadata is engine-stamped (agent, workspace,
+    /// worktree, revision, timestamp), payloads are bounded and redacted
+    /// (§38: artifacts must never become a secret-leak path). Emits
+    /// metadata-only events (§27).
+    fn register_task_artifacts(&mut self, task_id: &TaskId) {
+        let Some(task) = self.tasks.graph().get_task(task_id).cloned() else {
+            return;
+        };
+        let Some(result) = &task.result else {
+            return;
+        };
+        let worktree_path = task
+            .worktree_id
+            .as_ref()
+            .and_then(|w| self.worktrees.get(w))
+            .map(|r| r.path.clone());
+        let now = terminal_session::planning::now_ms();
+        // Repository artifacts from the deterministic diff (git, never the
+        // agent's claim) — the scheduler's observed-file artifacts may be
+        // empty when the agent exited before observation caught up.
+        let mut diff_files: Vec<String> = Vec::new();
+        if let Some(d) = &result.diff_summary {
+            diff_files.extend(d.files_changed.iter().cloned());
+            diff_files.extend(d.files_created.iter().cloned());
+            diff_files.extend(d.files_deleted.iter().cloned());
+        }
+        diff_files.sort();
+        diff_files.dedup();
+        let mut registered: Vec<String> = Vec::new();
+        for rel in diff_files {
+            if task
+                .output_artifacts
+                .iter()
+                .any(|a| a.path.as_deref() == Some(rel.as_str()))
+            {
+                continue;
+            }
+            let artifact = terminal_session::orchestration::Artifact {
+                id: terminal_session::orchestration::new_artifact_id(),
+                kind: terminal_session::orchestration::ArtifactType::CodeChange,
+                path: Some(rel.clone()),
+                description: "git diff change".to_string(),
+                created_by_task: Some(task.id.clone()),
+                metadata: vec![("auto".to_string(), "true".to_string())],
+                created_by_agent: Some(task.assigned_agent.clone()),
+                workspace_id: Some(task.workspace_id.clone()),
+                worktree: worktree_path.clone(),
+                revision: result.result_revision.clone(),
+                created_at_ms: now,
+            };
+            let payload = worktree_path.as_ref().and_then(|wt| {
+                let src = std::path::Path::new(wt).join(&rel);
+                if !src.is_file() {
+                    return None;
+                }
+                let bytes = std::fs::read(&src).ok()?;
+                if bytes.len() > self.artifacts.max_payload_bytes() {
+                    return None;
+                }
+                Some(
+                    terminal_session::redact::Redactor::redact(&String::from_utf8_lossy(&bytes))
+                        .into_bytes(),
+                )
+            });
+            let meta = self.artifacts.register(artifact, payload, now);
+            self.events.publish(ApplicationEvent::ArtifactCreated {
+                artifact_id: meta.id.clone(),
+                task_id: Some(task.id.clone()),
+                kind: format!("{:?}", meta.kind),
+                description: meta.description.clone(),
+            });
+            registered.push(meta.id);
+        }
+        for art in &task.output_artifacts {
+            if self.artifacts.get(&art.id).is_some() {
+                registered.push(art.id.clone());
+                continue;
+            }
+            let mut artifact = art.clone();
+            artifact.created_by_agent = Some(task.assigned_agent.clone());
+            artifact.workspace_id = Some(task.workspace_id.clone());
+            artifact.worktree = worktree_path.clone();
+            artifact.revision = result.result_revision.clone();
+            artifact.created_at_ms = now;
+            // Bounded, redacted payload read from the producer worktree.
+            let payload = art.path.as_ref().and_then(|rel| {
+                let src = std::path::Path::new(&worktree_path.as_ref()?).join(rel);
+                if !src.is_file() {
+                    return None;
+                }
+                let bytes = std::fs::read(&src).ok()?;
+                if bytes.len() > self.artifacts.max_payload_bytes() {
+                    return None;
+                }
+                Some(
+                    terminal_session::redact::Redactor::redact(&String::from_utf8_lossy(&bytes))
+                        .into_bytes(),
+                )
+            });
+            let meta = self.artifacts.register(artifact, payload, now);
+            self.events.publish(ApplicationEvent::ArtifactCreated {
+                artifact_id: meta.id.clone(),
+                task_id: Some(task.id.clone()),
+                kind: format!("{:?}", meta.kind),
+                description: meta.description.clone(),
+            });
+            registered.push(meta.id);
+        }
+        // §5: lineage is driven by the task's declared outputs — stamp the
+        // registered ids onto the task so `ArtifactLineage` maps producers.
+        if !registered.is_empty() {
+            if let Some(task_mut) = self.tasks.graph_mut().get_task_mut(task_id) {
+                for id in registered {
+                    if !task_mut.output_artifacts.iter().any(|a| a.id == id) {
+                        task_mut.output_artifacts.push(Artifact {
+                            id,
+                            kind: terminal_session::orchestration::ArtifactType::CodeChange,
+                            path: None,
+                            description: String::new(),
+                            created_by_task: Some(task_id.clone()),
+                            metadata: Vec::new(),
+                            created_by_agent: None,
+                            workspace_id: None,
+                            worktree: None,
+                            revision: None,
+                            created_at_ms: 0,
+                        });
+                    }
                 }
             }
         }
@@ -2497,6 +4272,30 @@ impl Multiplexer {
             active_workspace: active,
             tasks: Some(self.tasks.export_persisted()),
             worktrees: Some(self.worktree_list()),
+            artifacts: Some(self.artifacts.metadata_snapshot()),
+            review_reports: Some(self.review_reports.clone()),
+            replan_signals: Some(self.replan_signals.clone()),
+            adaptive: Some(terminal_session::adaptive::PersistedAdaptiveState {
+                signals: self.adaptive.signals.clone(),
+                plan_versions: self.adaptive.plan_versions.clone(),
+                proposals: self.adaptive.proposals.clone(),
+                task_invalidations: self.adaptive.task_invalidations.clone(),
+                artifact_invalidations: self.adaptive.artifact_invalidations.clone(),
+                escalations: self.adaptive.escalations.clone(),
+                autonomy: self.adaptive.autonomy,
+                limits: self.adaptive.limits.clone(),
+                metrics: self.adaptive.metrics.clone(),
+                quality: self.adaptive.quality.clone(),
+                limit_reached: self.adaptive.limit_reached,
+            }),
+            // Phase 4 §17: audit trail survives restarts. Redacted at write
+            // time; bounded by AuditTrail's RAM cap (§39).
+            audit: Some(self.audit.persisted()),
+            // Phase 4 §25: policy (autonomy, scope, network/secret/budget,
+            // ledger, pending approvals) survives restarts. Credentials
+            // never enter this struct. Pending approvals are re-verified
+            // (identity/hash/expiry) at honor time after a restart.
+            policy: Some((&self.policy).into()),
         }
     }
 
@@ -2681,6 +4480,65 @@ impl Multiplexer {
                 .filter_map(|t| t.worktree_id.as_ref().map(|w| (w.clone(), t.id.clone())))
                 .collect();
             self.worktrees.scan(&ownership);
+        }
+        // Phase 3D §35–§36: artifact metadata, review reports and replan
+        // signals survive restarts (payloads re-read from worktrees on
+        // demand; running synthesis is never silently resumed).
+        if let Some(records) = state.artifacts {
+            self.artifacts = ArtifactStore::from_metadata(records);
+        }
+        if let Some(reports) = state.review_reports {
+            self.review_reports = reports;
+        }
+        if let Some(signals) = state.replan_signals {
+            self.replan_signals = signals;
+        }
+        if let Some(p) = state.adaptive {
+            self.adaptive.signals = p.signals;
+            self.adaptive.plan_versions = p.plan_versions;
+            self.adaptive.proposals = p.proposals;
+            self.adaptive.task_invalidations = p.task_invalidations;
+            self.adaptive.artifact_invalidations = p.artifact_invalidations;
+            self.adaptive.escalations = p.escalations;
+            self.adaptive.autonomy = p.autonomy;
+            self.adaptive.limits = p.limits;
+            self.adaptive.metrics = p.metrics;
+            self.adaptive.quality = p.quality;
+            self.adaptive.limit_reached = p.limit_reached;
+        }
+        // Phase 4 §17: restore the (redacted, bounded) audit trail. The
+        // writer re-redacts defensively on restore, so a persisted trail
+        // cannot smuggle secrets into history (§40).
+        if let Some(events) = state.audit {
+            self.audit = terminal_session::audit::AuditTrail::from_events(events);
+            self.audit.record_kind(
+                terminal_session::audit::AuditEventKind::WorkflowResumed,
+                self.active_workspace().id.clone(),
+                "application restarted — audit trail restored",
+                "engine",
+            );
+        }
+        // Phase 4 §25: restore policy — autonomy, filesystem scope,
+        // network/secret/budget policy, budget ledger and pending
+        // approvals. Pending approvals are surfaced to the user again
+        // (never auto-executed); a planner cannot change this state.
+        if let Some(p) = state.policy {
+            let restored = terminal_session::policy::PolicyEngine::from(p);
+            let pending = restored.approvals.pending_count();
+            tracing::info!(
+                "restored policy: autonomy={:?} pending_approvals={}",
+                restored.autonomy,
+                pending
+            );
+            if pending > 0 {
+                self.audit.record_kind(
+                    terminal_session::audit::AuditEventKind::ApprovalRequested,
+                    self.active_workspace().id.clone(),
+                    format!("{pending} pending approval(s) restored after restart"),
+                    "engine",
+                );
+            }
+            self.policy = restored;
         }
         failed
     }
