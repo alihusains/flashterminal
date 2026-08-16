@@ -72,8 +72,10 @@ Every significant Pull Request must pass the performance gate. The `ci.yml` work
 | Startup Time | +10 ms |
 | Idle RAM | +2 MB |
 | 10 Panes RAM | +5 MB |
-| Input Latency (p95) | +1 ms |
+| Input Latency (p95) — implemented mechanism | `current > baseline × 5` (see `docs/performance-benchmark-audit.md`) |
 | Binary Size | +0.5 MB |
+
+Input Latency (p95)'s implemented gate is baseline-relative, not a flat `+1ms`, since the actual measurement (`benchmarks/src/main.rs::measure_input_p95`) runs at nanosecond scale — see the audit doc for why and the evidence behind the 5× multiplier. This section's original `+1ms` framing described the intended *shape* (baseline-relative, not absolute) correctly; only the concrete number was wrong for the metric's real scale. Also note this metric currently measures isolated VT-parse-apply cost only, not the full "keypress to pixel" pipeline described at the top of this document — see the audit doc's Metric Definition section.
 
 ### 3.3 PR Reporting
 The CI bot will comment on the PR with a summary:
