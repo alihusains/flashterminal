@@ -7,9 +7,14 @@ CI repair in this phase. See `docs/ci.md` for the resulting design.
 **Outcome: run `31944416318` (commit `5d6b9d2`) is the first fully green
 GitHub Actions run in this repository's history** — Check, Test, Rustfmt,
 Clippy, Release Build, Desktop Build, and Performance Check all passed
-(`4m8s` total). It took five root causes across four pushes to get there;
+(`4m8s` total). It took four root causes across four pushes to get there;
 each is documented below in the order it was found, since each failure
 only became reachable once the one before it was fixed.
+
+**A follow-up rerun of the same commit surfaced a fifth, distinct issue**
+(below, "Root cause, part 4") in an orchestration test file the suite had
+never reached before in this repository's history. Unlike the first four,
+this one is **not fixed** in this phase — see that section for why.
 
 ## GitHub run history (last 11 runs, all on `main`, all `push`)
 
@@ -189,6 +194,47 @@ job is the correct scope: it makes the *test environment* match what any
 real interactive shell session already provides, without touching
 `crates/pty` or `crates/terminal-session` at all. Fixed: `ci.yml`'s
 top-level `env:` now sets `TERM: xterm-256color`.
+
+## Root cause, part 4: orchestration event-coalescing races (found, NOT fixed — out of scope)
+
+After the `TERM` fix landed and one full green run was confirmed
+(`31944416318`), a docs-only follow-up commit (`0740cda`, no code change)
+triggered a fresh run that failed again — this time in
+`crates/terminal-workspace/tests/phase3d/main.rs`, a file the `Test` job
+had *never reached* in any prior run (every earlier run died in
+`agent_runtime.rs` or `phase051.rs` first). Rerunning the identical commit
+a second time failed a *different* test in the same file
+(`access_control_denies_unrelated_tasks`, then `cross_worktree_consumption`
+on the next attempt) — genuinely intermittent, not deterministic.
+
+Both failing tests share a shape: they subscribe to `EventBus`, drive a
+task through the fake-agent to completion, call `events.flush()` once,
+then `rx.try_iter()` to collect all delivered `AgentEvent::Output` text and
+assert it contains an expected substring (e.g. `"cannot read secret.txt"`).
+`EventBus::publish` (`crates/terminal-workspace/src/events.rs`) explicitly
+**coalesces** `Output` events: it keeps only the *latest* event per
+execution id in a `pending_output` map, replacing whatever was there
+before, and only actually enqueues it to the subscriber on the next
+`flush()` — deliberate, documented behavior ("a burst of output from one
+agent becomes one subscriber message"). If the fake-agent's stdout
+producing the assertable line and a later line both arrive before the
+engine's next per-frame flush, the coalescing map overwrites the earlier
+line and it never reaches any subscriber — a genuine race between I/O
+chunk boundaries (how the reader thread happens to split the child's
+output across syscalls) and the engine's flush cadence, both of which are
+CPU-scheduling-dependent and therefore differ between this development
+machine and GitHub's runner.
+
+**Not fixed in this phase.** A correct fix here means changing how
+`AgentEvent::Output` coalescing works (e.g. concatenating text across a
+flush window instead of replacing) — that's a change to the orchestration
+engine's event-delivery architecture, not a CI script, benchmark, or test
+fixture. The repair spec for this phase is explicit: don't modify terminal
+architecture, don't start Phase 5. This is real, and it's the correct kind
+of thing this audit should surface — but it belongs to a dedicated
+investigation into `EventBus` output-coalescing semantics, not a
+workflow-level CI fix. Flagged here for that follow-up; not patched around
+with a test change that would just paper over the same underlying race.
 
 ## `malformed_bytes_through_pty` — initial local-only observation, later explained
 
