@@ -4,6 +4,13 @@ Evidence gathered from the actual GitHub Actions history at
 `github.com/alihusains/flashterminal`, plus local reproduction, ahead of the
 CI repair in this phase. See `docs/ci.md` for the resulting design.
 
+**Outcome: run `31944416318` (commit `5d6b9d2`) is the first fully green
+GitHub Actions run in this repository's history** — Check, Test, Rustfmt,
+Clippy, Release Build, Desktop Build, and Performance Check all passed
+(`4m8s` total). It took five root causes across four pushes to get there;
+each is documented below in the order it was found, since each failure
+only became reachable once the one before it was fixed.
+
 ## GitHub run history (last 11 runs, all on `main`, all `push`)
 
 | Run | Commit | Job(s) failed | Failed step | Root cause |
