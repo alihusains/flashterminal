@@ -63,18 +63,21 @@ fn pipeline_ms(lines: usize, colored: bool) -> f64 {
     best
 }
 
-/// Time to apply one event while the grid is under streaming load (p95).
+/// Synthetic in-memory VT-parse-then-apply throughput, p95 of one isolated
+/// `apply_event` call (`t0` resets before every call — see
+/// `docs/performance-benchmark-audit.md` § Metric Definition for why a
+/// prior per-batch reset made this measure batch-cumulative time instead).
 ///
-/// Isolated per-event latency: `t0` resets before every `apply_event` call.
-/// A prior version reset `t0` once per 200-line batch instead of per event,
-/// so a sample was actually "cumulative time since this batch's first
-/// event, including every earlier event's apply cost in the same batch" —
-/// later-in-batch events were structurally biased toward higher recorded
-/// values regardless of their own cost, which inflated the aggregate p95
-/// with a batch-position artifact rather than genuine per-input latency.
-/// See docs/performance-benchmark-audit.md § Metric Definition.
-fn measure_input_p95() -> f64 {
+/// **This is not input latency.** No PTY, no keypress, no render — a
+/// microbenchmark of `TerminalState::apply_event`'s own cost, useful for
+/// state-engine/CPU regression detection but structurally incapable of
+/// answering "how fast does a keypress become visible" (see
+/// `docs/performance-benchmarking.md` § Metric Taxonomy). For that, see
+/// `measure_input_to_apply_p95` and `measure_shell_echo_p95` below, which
+/// exercise the real PTY path this function never touches.
+fn measure_batch_apply_p95() -> (f64, f64) {
     let mut lat = Vec::new();
+    let t_start = Instant::now();
     for _ in 0..200 {
         let mut parser = Parser::new();
         let mut state = TerminalState::new(120, 40);
@@ -86,8 +89,174 @@ fn measure_input_p95() -> f64 {
             lat.push(t0.elapsed().as_nanos() as f64 / 1000.0); // µs
         }
     }
+    let events_per_second = lat.len() as f64 / t_start.elapsed().as_secs_f64();
     lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    lat[(lat.len() as f64 * 0.95) as usize] / 1000.0 // ms
+    (
+        lat[(lat.len() as f64 * 0.95) as usize] / 1000.0,
+        events_per_second,
+    ) // ms
+}
+
+/// Real input-latency metric (§4/§5 of the perf-benchmark audit): a live
+/// PTY-backed shell session, one `session.write(b"a")` per sample, timing
+/// three real pipeline boundaries with monotonic clocks —
+/// `session.write` → the reader thread observing the echoed byte (a raw
+/// [`terminal_session::OutputTap`] fires there, upstream of any parsing) →
+/// `TerminalState` reflecting it (`session.stats().applied_batches`
+/// incrementing). No render/GPU/frame-present stage is included — that
+/// cannot be measured headlessly in CI; see
+/// `docs/performance-benchmarking.md` § input_to_visible for why that gap
+/// is documented rather than silently proxied.
+///
+/// Returns `(input_to_apply_p95_ms, write_to_pty_read_p95_ms,
+/// read_to_apply_p95_ms)`. `n` samples; `f64::NAN` for all three if no
+/// shell/PTY is available (e.g. a locked-down sandbox).
+fn measure_input_to_apply_p95(n: u32) -> (f64, f64, f64) {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    let Ok(pty) = pty::PtyManager::new() else {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    };
+    let pty = Arc::new(pty);
+    let Some(shell) = ["/bin/zsh", "/bin/bash", "/bin/sh"]
+        .iter()
+        .find(|s| std::path::Path::new(s).exists())
+    else {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    };
+
+    let read_marks: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let read_marks_tap = Arc::clone(&read_marks);
+    let tap: terminal_session::OutputTap = Box::new(move |_chunk: &[u8]| {
+        read_marks_tap.lock().unwrap().push(Instant::now());
+    });
+
+    let Ok((session, _pid)) = terminal_session::Session::spawn_with_options(
+        Arc::clone(&pty),
+        shell,
+        &[],
+        &std::env::temp_dir().to_string_lossy(),
+        &[],
+        120,
+        40,
+        None,
+        Some(tap),
+    ) else {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    };
+    let mut state = TerminalState::new(120, 40);
+
+    for _ in 0..30 {
+        session.drain(&mut state);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    read_marks.lock().unwrap().clear();
+
+    let mut write_to_apply_ms = Vec::with_capacity(n as usize);
+    let mut write_to_read_ms = Vec::with_capacity(n as usize);
+    let mut read_to_apply_ms = Vec::with_capacity(n as usize);
+
+    for _ in 0..n {
+        read_marks.lock().unwrap().clear();
+        let before = session.stats().applied_batches.load(Ordering::Relaxed);
+        let t_write = Instant::now();
+        session.write(b"a");
+        let deadline = t_write + Duration::from_millis(200);
+        let (t_apply, t_read) = loop {
+            session.drain(&mut state);
+            let applied = session.stats().applied_batches.load(Ordering::Relaxed) > before;
+            let read_at = read_marks.lock().unwrap().first().copied();
+            if applied {
+                break (Some(Instant::now()), read_at);
+            }
+            if Instant::now() > deadline {
+                break (None, read_at);
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        };
+        if let (Some(t_apply), Some(t_read)) = (t_apply, t_read) {
+            write_to_apply_ms.push(t_apply.duration_since(t_write).as_secs_f64() * 1e3);
+            write_to_read_ms.push(t_read.duration_since(t_write).as_secs_f64() * 1e3);
+            read_to_apply_ms.push(t_apply.duration_since(t_read).as_secs_f64() * 1e3);
+        }
+        std::thread::sleep(Duration::from_micros(500));
+    }
+    session.terminate();
+
+    fn p95(mut v: Vec<f64>) -> f64 {
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[((v.len() - 1) as f64 * 0.95).round() as usize]
+    }
+    (
+        p95(write_to_apply_ms),
+        p95(write_to_read_ms),
+        p95(read_to_apply_ms),
+    )
+}
+
+/// Real shell-echo round trip (§6): write a unique token, wait for the
+/// shell to echo it back into the terminal grid. Heavier than
+/// `measure_input_to_apply_p95` (includes real shell tty-echo processing,
+/// not just our own PTY read), so it's a distinct, complementary metric —
+/// see `benchmarks/src/bin/echo_probe.rs` for a standalone, higher-sample
+/// version of the same measurement used for deeper investigation.
+fn measure_shell_echo_p95(n: u32) -> f64 {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let Ok(pty) = pty::PtyManager::new() else {
+        return f64::NAN;
+    };
+    let pty = Arc::new(pty);
+    let Some(shell) = ["/bin/zsh", "/bin/bash", "/bin/sh"]
+        .iter()
+        .find(|s| std::path::Path::new(s).exists())
+    else {
+        return f64::NAN;
+    };
+    let Ok((session, _pid)) =
+        terminal_session::Session::spawn(Arc::clone(&pty), shell, ".", 120, 40)
+    else {
+        return f64::NAN;
+    };
+    let mut state = TerminalState::new(120, 40);
+
+    for _ in 0..30 {
+        session.drain(&mut state);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut lats = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let before = session.stats().applied_batches.load(Ordering::Relaxed);
+        session.write(b"a");
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_millis(200);
+        loop {
+            session.drain(&mut state);
+            if session.stats().applied_batches.load(Ordering::Relaxed) > before {
+                lats.push(t0.elapsed().as_secs_f64() * 1e3);
+                break;
+            }
+            if Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+    session.terminate();
+
+    if lats.is_empty() {
+        return f64::NAN;
+    }
+    lats.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    lats[((lats.len() - 1) as f64 * 0.95).round() as usize]
 }
 
 /// Building the render input: N full-grid reads through the snapshot view.
@@ -237,7 +406,20 @@ struct Report {
     startup_ms: f64,
     idle_ram_mb: f64,
     ten_panes_ram_mb: f64,
-    input_latency_apply_p95_ms: f64,
+    /// Renamed from `input_latency_apply_p95_ms` — see
+    /// `docs/performance-benchmark-audit.md` and
+    /// `docs/performance-benchmarking.md` § Metric Taxonomy. Not input
+    /// latency; a synthetic VT-parse+apply throughput microbenchmark.
+    batch_apply_p95_ms: f64,
+    events_per_second: f64,
+    /// Real PTY write→read→apply latency — the actual input-latency metric,
+    /// gated against the 8ms engineering target.
+    input_to_apply_p95_ms: f64,
+    write_to_pty_read_p95_ms: f64,
+    read_to_apply_p95_ms: f64,
+    /// Real shell tty-echo round trip — heavier than `input_to_apply`
+    /// (includes the shell's own echo processing), also gated at 8ms.
+    shell_echo_p95_ms: f64,
     parse_1m_lines_ms: f64,
     parse_10m_lines_ms: f64,
     grid_10m_cells_mb: f64,
@@ -249,25 +431,26 @@ struct Report {
     scrollback_10k_rows_ms: f64,
 }
 
-/// Regression multiplier for `input_latency_apply_p95_ms` (see
-/// `docs/performance-benchmark-audit.md`). After fixing the batch-position
-/// timing bug, this metric measures true isolated per-event apply cost —
-/// nanoseconds, not milliseconds — so an absolute 8ms cutoff has zero
-/// discriminating power at its real scale (it would pass even a 100,000×
-/// regression). A flat `+1ms` absolute margin (the shape `docs/performance.md`
-/// §3.2 originally specified) is equally meaningless at nanosecond scale.
-/// Measured evidence: 30 independent local runs clustered tightly
-/// (coefficient of variation ~1-2% excluding one OS-scheduling-stall
-/// outlier), and 3 runs under deliberate heavy CPU contention (14
-/// oversubscribed busy-loops on a 12-core machine) reproduced the *exact
-/// same* value as an unloaded run — the fix made the metric robust to a
-/// single corrupted sample among the ~800,000 accumulated per run. A 5×
-/// baseline-relative threshold is therefore a sensitive regression
-/// detector without being flaky against measured real-world noise.
-const INPUT_LATENCY_REGRESSION_FACTOR: f64 = 5.0;
+/// Regression multiplier for `batch_apply_p95_ms` (formerly
+/// `input_latency_apply_p95_ms` — see `docs/performance-benchmark-audit.md`).
+/// This metric measures true isolated per-event apply cost — nanoseconds,
+/// not milliseconds — so an absolute cutoff has zero discriminating power
+/// at its real scale (it would pass even a 100,000× regression). Measured
+/// evidence: 30 independent local runs clustered tightly (coefficient of
+/// variation ~1-2% excluding one OS-scheduling-stall outlier), and 3 runs
+/// under deliberate heavy CPU contention (14 oversubscribed busy-loops on a
+/// 12-core machine) reproduced the *exact same* value as an unloaded run.
+/// A 5× baseline-relative threshold is a sensitive regression detector
+/// without being flaky against measured real-world noise.
+const BATCH_APPLY_REGRESSION_FACTOR: f64 = 5.0;
 /// Floor below which a relative comparison is meaningless (clock
 /// resolution / sub-microsecond jitter), not a real regression.
-const INPUT_LATENCY_FLOOR_MS: f64 = 0.001;
+const BATCH_APPLY_FLOOR_MS: f64 = 0.001;
+/// The product's real "keypress to state applied" engineering target
+/// (`docs/performance.md`). Applied to `input_to_apply_p95_ms` and
+/// `shell_echo_p95_ms` — the metrics that actually exercise a PTY —
+/// unchanged by this audit; see `docs/performance-audit-reconciliation.md`.
+const INPUT_LATENCY_ENGINEERING_BUDGET_MS: f64 = 8.0;
 
 /// Hard budgets from the Phase 0.5 spec (§31). A breach fails the run.
 fn budget_table(r: &Report) -> Vec<(String, f64, f64, f64, String, bool)> {
@@ -293,27 +476,48 @@ fn budget_table(r: &Report) -> Vec<(String, f64, f64, f64, String, bool)> {
     }
     add!("idle_ram_mb", r.idle_ram_mb, 40.0, "MB");
     add!("ten_panes_ram_mb", r.ten_panes_ram_mb, 80.0, "MB");
-    // Baseline-relative regression gate, not the flat 8ms absolute cutoff
-    // used before this audit — see the constant doc comments above. The
-    // 8ms figure remains documented as the product's engineering budget
-    // (docs/performance.md) — that number is unchanged; only the CI
-    // regression-detection mechanism for this specific metric is.
+    // Baseline-relative regression gate for the synthetic batch-throughput
+    // metric — not the real input-latency budget (that's applied to
+    // input_to_apply_p95_ms/shell_echo_p95_ms below, which actually
+    // exercise a PTY). See the constant doc comments above.
     {
         let base = baseline
             .as_ref()
-            .and_then(|b| b.metric("input_latency_apply_p95_ms"))
-            .unwrap_or(r.input_latency_apply_p95_ms);
-        let threshold = (base * INPUT_LATENCY_REGRESSION_FACTOR).max(INPUT_LATENCY_FLOOR_MS);
-        let breached = r.input_latency_apply_p95_ms > threshold;
+            .and_then(|b| b.metric("batch_apply_p95_ms"))
+            .unwrap_or(r.batch_apply_p95_ms);
+        let threshold = (base * BATCH_APPLY_REGRESSION_FACTOR).max(BATCH_APPLY_FLOOR_MS);
+        let breached = r.batch_apply_p95_ms > threshold;
         rows.push((
-            "input_latency_apply_p95_ms".to_string(),
-            r.input_latency_apply_p95_ms,
+            "batch_apply_p95_ms".to_string(),
+            r.batch_apply_p95_ms,
             base,
             threshold,
             "ms".to_string(),
             breached,
         ));
     }
+    add!("events_per_second", r.events_per_second, 0.0, "ev/s");
+    // Real input-latency metrics — the actual 8ms engineering target
+    // applies here, not to the synthetic batch metric above.
+    add!(
+        "input_to_apply_p95_ms",
+        r.input_to_apply_p95_ms,
+        INPUT_LATENCY_ENGINEERING_BUDGET_MS,
+        "ms"
+    );
+    add!(
+        "shell_echo_p95_ms",
+        r.shell_echo_p95_ms,
+        INPUT_LATENCY_ENGINEERING_BUDGET_MS,
+        "ms"
+    );
+    add!(
+        "write_to_pty_read_p95_ms",
+        r.write_to_pty_read_p95_ms,
+        0.0,
+        "ms"
+    );
+    add!("read_to_apply_p95_ms", r.read_to_apply_p95_ms, 0.0, "ms");
     add!("parse_1m_lines_ms", r.parse_1m_lines_ms, 0.0, "ms");
     add!("parse_10m_lines_ms", r.parse_10m_lines_ms, 0.0, "ms");
     add!("snapshot_frame_us", r.snapshot_frame_us, 0.0, "µs");
@@ -389,7 +593,10 @@ fn main() {
 
     let parse_1m = pipeline_ms(1_000_000, true);
     let parse_10m = pipeline_ms(10_000_000, true);
-    let input_p95 = measure_input_p95();
+    let (batch_apply_p95, events_per_second) = measure_batch_apply_p95();
+    let (input_to_apply_p95, write_to_read_p95, read_to_apply_p95) =
+        measure_input_to_apply_p95(300);
+    let shell_echo_p95 = measure_shell_echo_p95(300);
     let snapshot_us = snapshot_frame_us();
     let render_prep = render_prep_10k_rows_ms();
     let glyph_us = glyph_raster_us_per_glyph();
@@ -434,7 +641,12 @@ fn main() {
         startup_ms: 0.0, // measured by the desktop harness (window creation)
         idle_ram_mb: idle,
         ten_panes_ram_mb: ten_panes,
-        input_latency_apply_p95_ms: input_p95,
+        batch_apply_p95_ms: batch_apply_p95,
+        events_per_second,
+        input_to_apply_p95_ms: input_to_apply_p95,
+        write_to_pty_read_p95_ms: write_to_read_p95,
+        read_to_apply_p95_ms: read_to_apply_p95,
+        shell_echo_p95_ms: shell_echo_p95,
         parse_1m_lines_ms: parse_1m,
         parse_10m_lines_ms: parse_10m,
         grid_10m_cells_mb,

@@ -364,6 +364,12 @@ Measured by the validation harness, scrollback suite, and `multiplex_bench`
 
 - **Report generator** (`benchmarks/src/main.rs`): full pipeline + RAM with
   real sessions; writes `docs/performance-report.md` + `baseline.json`.
+  Tracks a corrected metric taxonomy (`docs/performance-benchmarking.md`):
+  real PTY-backed `input_to_apply_p95_ms`/`shell_echo_p95_ms` gated against
+  the 8ms input-latency engineering budget, and `batch_apply_p95_ms` (a
+  renamed, no-PTY synthetic VT-parse-apply throughput microbenchmark,
+  formerly mislabeled `input_latency_apply_p95_ms`) gated baseline-relative
+  for CPU regression detection.
 - **Validation harness** (`validate.rs`): PTY backpressure, end-to-end
   latency, memory breakdown, stress A–E, input priority, coalescing, atlas.
 - **Scrollback suite**: `scrollback_bench`, `raw_throughput`, `paste_bench`,

@@ -1,0 +1,11 @@
+{
+  "_comment": "Versioned baseline snapshot (perf-benchmark-audit §21) covering only the corrected/new metric taxonomy — see docs/performance-benchmarking.md. benchmarks/baseline.json remains the live file CI actually compares against (all metrics, updated in place per-run, never overwritten by --ci); this file is a clearly-labeled point-in-time record of the new metrics' first real measurement, for anyone auditing the rename/redesign later.",
+  "commit": "0.1.0",
+  "date": "2026-08-16 16:44:50 UTC",
+  "input_to_apply_p95_ms": 0.680708,
+  "write_to_pty_read_p95_ms": 0.610042,
+  "read_to_apply_p95_ms": 0.131333,
+  "shell_echo_p95_ms": 1.387333,
+  "batch_apply_p95_ms": 0.000042000000000000004,
+  "events_per_second": 18742002.574117955
+}

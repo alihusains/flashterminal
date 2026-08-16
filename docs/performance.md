@@ -72,10 +72,16 @@ Every significant Pull Request must pass the performance gate. The `ci.yml` work
 | Startup Time | +10 ms |
 | Idle RAM | +2 MB |
 | 10 Panes RAM | +5 MB |
-| Input Latency (p95) — implemented mechanism | `current > baseline × 5` (see `docs/performance-benchmark-audit.md`) |
+| `batch_apply_p95_ms` (synthetic throughput, formerly mislabeled "Input Latency") | `current > baseline × 5` (see `docs/performance-benchmark-audit.md`) |
+| `input_to_apply_p95_ms` / `shell_echo_p95_ms` (real input latency) | flat `<= 8 ms` (the engineering budget itself — see below) |
 | Binary Size | +0.5 MB |
 
-Input Latency (p95)'s implemented gate is baseline-relative, not a flat `+1ms`, since the actual measurement (`benchmarks/src/main.rs::measure_input_p95`) runs at nanosecond scale — see the audit doc for why and the evidence behind the 5× multiplier. This section's original `+1ms` framing described the intended *shape* (baseline-relative, not absolute) correctly; only the concrete number was wrong for the metric's real scale. Also note this metric currently measures isolated VT-parse-apply cost only, not the full "keypress to pixel" pipeline described at the top of this document — see the audit doc's Metric Definition section.
+**Two metrics now cover what "Input Latency (p95)" used to name ambiguously** — see `docs/performance-benchmarking.md` § Metric Taxonomy for the full picture:
+
+- `input_to_apply_p95_ms` / `shell_echo_p95_ms`: real, PTY-backed measurements of the actual "keypress to state applied" pipeline this section's 8ms budget describes. Gated directly against that 8ms budget (measured ~0.7–2ms, wide real margin).
+- `batch_apply_p95_ms`: the metric formerly named `input_latency_apply_p95_ms`. It measures isolated VT-parse-apply cost only — no PTY, no keypress, no render — and was never actually the "keypress to pixel" pipeline this document describes, regardless of its old name. Renamed to stop implying otherwise; still tracked (baseline-relative, `current > baseline × 5`) for state-engine/CPU regression detection, just no longer compared against the 8ms input-latency budget. See `docs/performance-benchmark-audit.md` and `docs/performance-audit-reconciliation.md` for the full history.
+
+`input_to_visible_ms` (input → actual pixel presentation) remains unmeasured — no headless-GUI-capable CI runner exists to submit and observe a real GPU frame. `input_to_apply_p95_ms` is the closest defensible proxy for the 8ms budget and is labeled as exactly that, not as "input to visible."
 
 ### 3.3 PR Reporting
 The CI bot will comment on the PR with a summary:

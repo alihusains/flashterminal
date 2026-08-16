@@ -17,6 +17,8 @@ count > 8.0ms budget: 1/30
 
 **Deliberate CPU-contention test** (pre-fix code, 3 runs each): unloaded → 3.72/3.73/3.73ms; with 14 CPU-bound busy-loops oversubscribing all 12 cores → 7.32/9.00/9.97ms — a reproducible ~2–2.7× inflation under sustained contention, independent of the rare catastrophic-stall event above. Two distinct noise mechanisms coexist: mild sustained contention inflates the metric proportionally; a rare severe scheduler stall produces a discrete, extreme outlier.
 
+**Independent reproduction** (per-audit-note-§13 "reproduce, don't just quote"): a second, independently-run 30-run batch (same machine, this metric, post-fix code — renamed `batch_apply_p95_ms` by the follow-up audit below) produced `min=3.708 p50=3.741 p95=3.847 p99=712.791 mean=27.381 stdev=127.277` — the same tight 3.71–3.85ms cluster, and the *same* discrete ~712ms outlier recurring at essentially the same magnitude. This is not a coincidence of one lucky/unlucky run; the distribution shape (tight cluster + rare severe stall) is a stable, repeatable property of this measurement on this machine.
+
 ## CI Measurements
 
 See the companion investigation (triggered concurrently, GitHub Actions `Performance Check` job history and hosted-runner environment comparison) for the available GitHub-side run distribution. Locally observed CI values before this fix: `5.99ms`, `8.44ms`, `10.93ms` on identical code across three consecutive-ish runs — consistent in shape (and worse in degree) with the contention sensitivity reproduced above; GitHub's hosted `macos-latest` runner is materially more resource-constrained than this development machine (Apple M4 Pro, 12 cores, 24GB) and should be expected to show more contention-driven variance, not less.

@@ -289,3 +289,15 @@ from disk).
 
 Verified via `gh api repos/<org>/<repo>/contents/action.yml?ref=<tag>` for
 each new tag before adopting it (all four `runs.using: node24`).
+
+## Performance Check reliability audit (separate phase)
+
+The intermittent `input_latency_apply_p95_ms` failures noted informally
+during this CI repair (`5.99ms`/`8.44ms`/`10.93ms` swings against the 8ms
+budget on unchanged code) turned out to be a distinct, deeper issue from
+anything fixed above — a measurement-methodology defect in the benchmark
+itself (a batch-cumulative timing bug, plus a metric that never actually
+measured input latency at all despite its name). Full investigation,
+metric rename/redesign, and CI gate redesign:
+`docs/performance-benchmark-audit.md`, `docs/performance-audit-reconciliation.md`,
+`docs/performance-benchmarking.md`.
