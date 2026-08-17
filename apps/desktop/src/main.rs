@@ -1580,8 +1580,17 @@ impl App {
             CHROME_BORDER,
         );
 
+        // Product identity mark — a bare sidebar with no branding reads as
+        // a debug panel, not a product (Phase 5 §33: fast/native/premium,
+        // not generic). Kept to one line, no logo asset needed (this
+        // renderer draws text + rects only — no image/SVG pipeline exists,
+        // so identity/icons are expressed through glyphs and color, not
+        // bitmaps).
+        renderer.chrome_text(10.0, 14.0, "⚡ FLASHTERMINAL", CHROME_ACCENT);
+        renderer.chrome_rect(10.0, 34.0, w - 20.0, 1.0, CHROME_BORDER);
+
         let active_ws = eng.active_workspace();
-        let mut y = 14.0_f32;
+        let mut y = 46.0_f32;
         renderer.chrome_text(10.0, y, "WORKSPACES", CHROME_FG_DIM);
         y += cell_h + 6.0;
         for ws in eng.workspaces() {
@@ -1590,30 +1599,31 @@ impl App {
             } else {
                 CHROME_FG
             };
-            renderer.chrome_text(14.0, y, &ws.name, accent);
+            renderer.chrome_text(10.0, y, "●", accent);
+            renderer.chrome_text(24.0, y, &ws.name, accent);
             y += cell_h + 4.0;
         }
         y += cell_h * 1.6;
         renderer.chrome_rect(10.0, y - cell_h * 0.7, w - 20.0, 1.0, CHROME_BORDER);
         renderer.chrome_text(10.0, y, "TABS", CHROME_FG_DIM);
         y += cell_h + 6.0;
-        for tab in &active_ws.tabs {
+        for (idx, tab) in active_ws.tabs.iter().enumerate() {
+            // Never surface the raw internal pane id (a developer concept,
+            // not a product one — Phase 5's mental-model rule) — a tab
+            // without a real title is just "Terminal N" by position.
             let title = if tab.title.is_empty() {
-                format!("tab {}", &tab.id[..tab.id.len().min(6)])
+                format!("Terminal {}", idx + 1)
             } else {
                 tab.title.clone()
             };
             let focused = active_ws.active_tab.as_deref() == Some(&tab.id);
-            renderer.chrome_text(
-                14.0,
-                y,
-                &title,
-                if focused {
-                    CHROME_ACCENT
-                } else {
-                    CHROME_FG_DIM
-                },
-            );
+            let (glyph, color) = if focused {
+                ("▸", CHROME_ACCENT)
+            } else {
+                ("·", CHROME_FG_DIM)
+            };
+            renderer.chrome_text(10.0, y, glyph, color);
+            renderer.chrome_text(24.0, y, &title, color);
             y += cell_h + 2.0;
         }
 
@@ -1638,6 +1648,14 @@ impl App {
                 ),
                 CHROME_FG_DIM,
             );
+            y += cell_h + 4.0;
+        } else if agents.is_empty() {
+            // An empty section with no explanation reads as broken, not
+            // calm — give the user something to do (Phase 5 §"empty
+            // states work").
+            renderer.chrome_text(10.0, y, "No agents running yet.", CHROME_FG_DIM);
+            y += cell_h + 2.0;
+            renderer.chrome_text(10.0, y, "⌘K → Create Task", CHROME_FG_DIM);
             y += cell_h + 4.0;
         }
         for (pane_id, eid) in agents {
