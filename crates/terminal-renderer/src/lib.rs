@@ -491,6 +491,14 @@ pub struct Renderer {
     rows: u16,
     /// Instance-buffer capacity in cells (max single grid or Σ pane cells).
     capacity: usize,
+    /// Per-viewport-slot (origin, instance base, cols, rows) from the last
+    /// frame, indexed positionally. A pane's dirty tracker only knows about
+    /// *content* changes — it has no idea its `pane_base` offset into the
+    /// shared instance buffer shifted because a sibling pane resized. When
+    /// that happens, only-dirty-rows uploads would leave stale bytes from
+    /// whatever used to occupy that buffer range, which is exactly the
+    /// ghost-text-after-resize bug this field exists to prevent.
+    last_viewport_layout: Vec<(f32, f32, u32, u16, u16)>,
 
     cursor_style: CursorStyle,
     blink_epoch: Instant,
@@ -769,6 +777,7 @@ impl Renderer {
             cols: 0,
             rows: 0,
             capacity: 0,
+            last_viewport_layout: Vec::new(),
             cursor_style: CursorStyle::Block,
             blink_epoch: Instant::now(),
             atlas_generation: 0,
@@ -925,13 +934,28 @@ impl Renderer {
         self.glyph_misses = 0;
 
         let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(viewports.len());
+        let mut new_layout: Vec<(f32, f32, u32, u16, u16)> = Vec::with_capacity(viewports.len());
         let mut base: u32 = 0;
-        for v in viewports {
+        for (i, v) in viewports.iter().enumerate() {
             let n = v.snapshot.cols as u32 * v.snapshot.rows as u32;
-            self.render_grid_to(v.snapshot, v.dirty, v.origin, base, &frame);
+            let layout = (
+                v.origin.0,
+                v.origin.1,
+                base,
+                v.snapshot.cols,
+                v.snapshot.rows,
+            );
+            // A layout shift (this pane's slot in the shared instance buffer
+            // moved or resized since last frame — e.g. a sibling pane was
+            // resized) invalidates every byte at the new offset, not just
+            // the rows this pane's own dirty tracker thinks changed.
+            let force_full = self.last_viewport_layout.get(i) != Some(&layout);
+            self.render_grid_to(v.snapshot, v.dirty, v.origin, base, &frame, force_full);
             ranges.push((base, n));
+            new_layout.push(layout);
             base += n;
         }
+        self.last_viewport_layout = new_layout;
 
         // Rebuild the bind group if the atlas grew (texture view changed).
         if self.atlas.generation != self.atlas_generation {
@@ -962,6 +986,7 @@ impl Renderer {
         origin: (f32, f32),
         pane_base: u32,
         frame: &FrameCtx,
+        force_full: bool,
     ) {
         let (cell_w, cell_h) = self.cell_size();
         let (ox, oy) = origin;
@@ -970,7 +995,7 @@ impl Renderer {
         self.cols = cols;
         self.rows = rows;
 
-        let full = dirty.full_redraw || dirty.scroll_delta != 0;
+        let full = force_full || dirty.full_redraw || dirty.scroll_delta != 0;
         let row_list: Vec<u16> = if full {
             (0..rows).collect()
         } else {
