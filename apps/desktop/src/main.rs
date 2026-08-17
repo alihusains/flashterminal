@@ -93,6 +93,16 @@ const CHROME_FG_DIM: [f32; 4] = [0.392, 0.455, 0.545, 1.0]; // #64748B
 /// Sidebar/terminal divider — subtle, not a hard line.
 const CHROME_BORDER: [f32; 4] = [0.145, 0.180, 0.247, 1.0]; // #253040
 const FOCUS_BORDER: [f32; 4] = [0.35, 0.65, 1.0, 0.9];
+/// Selected-row fill — a translucent accent wash behind the active
+/// workspace/tab row. Text-color-only selection (the previous approach)
+/// reads as a bare list; a real filled row plus a left accent bar is what
+/// actually separates an "app" sidebar from a debug panel (Warp, VSCode,
+/// Cmux all do this — none of them mark selection with color alone).
+const SELECTION_ROW_BG: [f32; 4] = [0.231, 0.510, 0.965, 0.14];
+/// Depth cue for agent rows — a faint card surface, one step lighter than
+/// the sidebar, so agent entries read as distinct list items instead of
+/// bare stacked text lines.
+const AGENT_ROW_BG: [f32; 4] = [1.0, 1.0, 1.0, 0.035];
 
 /// Agent state badge colors (§16) — one per terminal state. Starting
 /// (amber) and Needs-Approval (orange) were previously close enough in
@@ -1594,14 +1604,16 @@ impl App {
         renderer.chrome_text(10.0, y, "WORKSPACES", CHROME_FG_DIM);
         y += cell_h + 6.0;
         for ws in eng.workspaces() {
-            let accent = if ws.id == active_ws.id {
-                CHROME_ACCENT
-            } else {
-                CHROME_FG
-            };
+            let selected = ws.id == active_ws.id;
+            let accent = if selected { CHROME_ACCENT } else { CHROME_FG };
+            let row_h = cell_h + 4.0;
+            if selected {
+                renderer.chrome_rect(1.0, y - 3.0, w - 2.0, row_h, SELECTION_ROW_BG);
+                renderer.chrome_rect(1.0, y - 3.0, 2.0, row_h, CHROME_ACCENT);
+            }
             renderer.chrome_text(10.0, y, "●", accent);
             renderer.chrome_text(24.0, y, &ws.name, accent);
-            y += cell_h + 4.0;
+            y += row_h;
         }
         y += cell_h * 1.6;
         renderer.chrome_rect(10.0, y - cell_h * 0.7, w - 20.0, 1.0, CHROME_BORDER);
@@ -1622,9 +1634,14 @@ impl App {
             } else {
                 ("·", CHROME_FG_DIM)
             };
+            let row_h = cell_h + 2.0;
+            if focused {
+                renderer.chrome_rect(1.0, y - 2.0, w - 2.0, row_h, SELECTION_ROW_BG);
+                renderer.chrome_rect(1.0, y - 2.0, 2.0, row_h, CHROME_ACCENT);
+            }
             renderer.chrome_text(10.0, y, glyph, color);
             renderer.chrome_text(24.0, y, &title, color);
-            y += cell_h + 2.0;
+            y += row_h;
         }
 
         // Agent sessions of the active tab — state badge + info panel.
@@ -1672,6 +1689,14 @@ impl App {
                 .as_ref()
                 .map(|s| agent_state_color(&s.state))
                 .unwrap_or(CHROME_FG_DIM);
+            // Card surface behind the whole two-line entry — a flat list of
+            // stacked text lines reads as a log, not a roster of distinct
+            // agents. The left accent bar echoes the state dot so the
+            // card's color reads as belonging to that state at a glance.
+            let card_top = y - 3.0;
+            let card_h = 2.0 * cell_h + 2.0;
+            renderer.chrome_rect(1.0, card_top, w - 2.0, card_h, AGENT_ROW_BG);
+            renderer.chrome_rect(1.0, card_top, 2.0, card_h, color);
             renderer.chrome_rect(10.0, y + 3.0, 8.0, 8.0, color);
             renderer.chrome_text(
                 24.0,
@@ -1688,17 +1713,17 @@ impl App {
                     s.state_source,
                 );
                 renderer.chrome_text(24.0, y, &truncate(&line, 24), CHROME_FG_DIM);
-                y += cell_h + 1.0;
+                y += cell_h + 5.0;
             } else {
-                y += cell_h + 1.0;
+                y += cell_h + 5.0;
             }
             agent_hits.push((
                 pane_id.clone(),
                 Rect {
                     x: 0,
-                    y: (y - cell_h * 2.0) as i32,
+                    y: card_top as i32,
                     width: w as u32,
-                    height: (cell_h * 2.0 + 4.0) as u32,
+                    height: card_h as u32,
                 },
             ));
         }
