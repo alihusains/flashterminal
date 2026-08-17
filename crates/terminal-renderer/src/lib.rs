@@ -130,6 +130,23 @@ pub fn resolve_color(c: Color, default: Rgba, bold: bool) -> Rgba {
     }
 }
 
+/// Y position (down from the cell top) of a rasterized glyph's bitmap.
+///
+/// `ascent` is the baseline's distance down from the cell top. `bearing_y`
+/// is fontdue's `ymin` — the bitmap's *bottom* edge offset from the
+/// baseline, negative for descenders (g/j/p/q/y extend below the
+/// baseline), positive/zero otherwise. The bitmap's top sits
+/// `bearing_y + height` px above the baseline, so its position from the
+/// cell top is `ascent - (bearing_y + height)`.
+///
+/// Pure function so the sign relationship is unit-testable without a GPU
+/// — a previous version added `bearing_y` here instead of subtracting it,
+/// which rendered every descender well above the baseline instead of
+/// straddling it (confirmed bug: see docs/phase5-ui-audit.md).
+fn glyph_top_y(ascent: f32, bearing_y: i32, height: u32) -> f32 {
+    ascent - bearing_y as f32 - height as f32
+}
+
 /// Blends `fg` over `bg` with the given alpha (for selection tinting).
 fn blend_over(bg: Rgba, fg: Rgba, alpha: f32) -> Rgba {
     [
@@ -1012,8 +1029,11 @@ impl Renderer {
                                 inst.uv = entry.uv(self.atlas.size);
                                 inst.pos = [
                                     bx + g.metrics.bearing_x as f32,
-                                    by + frame.ascent + g.metrics.bearing_y as f32
-                                        - g.metrics.height as f32,
+                                    by + glyph_top_y(
+                                        frame.ascent,
+                                        g.metrics.bearing_y,
+                                        g.metrics.height,
+                                    ),
                                 ];
                                 inst.attrs = attribute_bits(cell.attribute());
                             }
@@ -1103,7 +1123,7 @@ impl Renderer {
                     self.chrome_glyph.push(GlyphInstance {
                         pos: [
                             cx + g.metrics.bearing_x as f32,
-                            y + ascent + g.metrics.bearing_y as f32 - g.metrics.height as f32,
+                            y + glyph_top_y(ascent, g.metrics.bearing_y, g.metrics.height),
                         ],
                         uv: entry.uv(self.atlas.size),
                         fg: color,
@@ -1294,6 +1314,48 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the confirmed "descenders render above the
+    /// baseline" bug (docs/phase5-ui-audit.md). A non-descender glyph's
+    /// bitmap sits entirely above the baseline; a descender's bitmap must
+    /// straddle it (bottom edge below, i.e. `top_y + height > ascent`).
+    #[test]
+    fn glyph_top_y_places_descenders_below_baseline() {
+        let ascent = 20.0;
+        // Non-descender (e.g. 'x'): bitmap bottom at/above baseline.
+        let non_descender_bearing_y = 0;
+        let height = 12;
+        let top = glyph_top_y(ascent, non_descender_bearing_y, height);
+        assert!(
+            top + height as f32 <= ascent,
+            "a non-descender's bitmap must not extend below the baseline"
+        );
+
+        // Descender (e.g. 'p'): fontdue's ymin is negative (bottom edge
+        // below baseline). Bitmap bottom must extend below the baseline.
+        let descender_bearing_y = -4;
+        let top = glyph_top_y(ascent, descender_bearing_y, height);
+        assert!(
+            top + height as f32 > ascent,
+            "a descender's bitmap must extend below the baseline, not float above it"
+        );
+    }
+
+    /// The buggy formula (`ascent + bearing_y - height`) placed descenders
+    /// *higher* than non-descenders — the opposite of correct. Pin the
+    /// actual direction: a deeper descender (more negative bearing_y)
+    /// must sit lower (larger top_y) on screen, not higher.
+    #[test]
+    fn deeper_descender_sits_lower_not_higher() {
+        let ascent = 20.0;
+        let height = 12;
+        let shallow = glyph_top_y(ascent, -2, height);
+        let deep = glyph_top_y(ascent, -6, height);
+        assert!(
+            deep > shallow,
+            "a deeper descender must render lower on screen (larger y), not higher"
+        );
+    }
 
     #[test]
     fn resolve_ansi_16() {

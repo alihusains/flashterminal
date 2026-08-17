@@ -259,7 +259,14 @@ pub struct GlyphMetrics {
     pub height: u32,
     /// x offset of the bitmap from the cell origin.
     pub bearing_x: i32,
-    /// y offset of the bitmap from the cell baseline (negative = above).
+    /// fontdue's `ymin`: offset of the *bottom* edge of the bitmap from
+    /// the baseline — negative when the glyph extends below the baseline
+    /// (descenders: g, j, p, q, y), positive/zero when it sits entirely
+    /// above (fontdue's own doc comment on `Metrics::ymin`, confirmed
+    /// against source — a previous version of this comment had the sign
+    /// backwards, which produced a real, confirmed rendering bug: every
+    /// descender rendered too high, looking like a raised/superscript
+    /// glyph. See docs/phase5-ui-audit.md § the "p renders as P" finding).
     pub bearing_y: i32,
     /// Horizontal advance in pixels (typically the cell width for monospace).
     pub advance: f32,
